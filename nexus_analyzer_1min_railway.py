@@ -761,12 +761,15 @@ def write_fingerprints_batch(conn, trades):
                     ON CONFLICT (trade_id) DO NOTHING
                 """, (
                     trade_id,
-                    t["symbol"], t["sector"], t["entry_ts"], t["exit_ts"], t["entry_price"],
-                    t["symbol_rsi"], t["macd_bullish"], t["above_ma20"],
-                    t["spy_rsi"], t["spy_momentum"], t["spy_bullish"], t["qqq_rsi"],
-                    t["sector_health"], t["hour_cdt"], t["day_of_week"], t["pdt_slots_used"],
-                    t["won"], t["pnl_pct"], t["exit_reason"], t["hold_time_min"],
-                    t["mfe"], t["mae"],
+                    t["symbol"], t["sector"], int(t["entry_ts"]), int(t["exit_ts"]),
+                    float(t["entry_price"]),
+                    float(t["symbol_rsi"]), bool(t["macd_bullish"]), bool(t["above_ma20"]),
+                    float(t["spy_rsi"]), float(t["spy_momentum"]), bool(t["spy_bullish"]),
+                    float(t["qqq_rsi"]),
+                    t["sector_health"], int(t["hour_cdt"]), int(t["day_of_week"]),
+                    int(t["pdt_slots_used"]),
+                    bool(t["won"]), float(t["pnl_pct"]), t["exit_reason"],
+                    int(t["hold_time_min"]), float(t["mfe"]), float(t["mae"]),
                 ))
                 inserted += 1
         conn.commit()
