@@ -1,1 +1,1 @@
-worker: python retrieve_results.py
+worker: python nexus_analyzer_1min_railway.py
