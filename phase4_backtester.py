@@ -534,6 +534,9 @@ class BotState:
         "bear_ext_trailing", "bear_ext_peak",
         "reversal_state",
         "trades",
+        # Diagnostic counters
+        "skip_bounce", "skip_tide", "skip_vol",
+        "skip_vix", "skip_avoid_hour", "score_checks",
     ]
     def __init__(self, symbol: str, cfg: dict):
         self.symbol        = symbol
