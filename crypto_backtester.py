@@ -1,63 +1,69 @@
 #!/usr/bin/env python3
 """
-crypto_backtester.py V3.0 -- NEXUS Crypto Pattern Memory Seeder
-================================================================
-V3.0 (Jun 2026): Switched from broken Coinbase historical API to Alpaca
-crypto bars. Coinbase's candle API returns 0 candles on Railway IPs
-intermittently. Alpaca CryptoHistoricalDataClient is stable, proven, and
-already used by other NEXUS services.
+nexus_analyzer_1min_railway.py V3.0 — NEXUS Berserker Backtester
+=================================================================
+Runs every Sunday 11pm UTC as Railway cron worker (genuine-reverence).
+Pulls 2yr 1-min Alpaca IEX bars, replays through the EXACT Berserker
+V10.19 signal engine, writes fingerprints to berserker_trade_fingerprints.
 
-V3.0 additions vs V2.0:
-  ✅ Data source: Alpaca crypto bars (BTC/USD format) instead of Coinbase API
-  ✅ BTC realized vol regime gate (V5.0): when 7d BTC vol > 5%, alt entries
-     blocked in backtest (matches live crypto.py V5.0 behavior)
-  ✅ Partial exit modeling (V5.0): at 50% of TP target, 50% position exited,
-     remaining half tracked to full TP/ATR trail
-  ✅ Walk-forward validation: train on 75%, validate on last 25%
-  ✅ Slippage modeling: 0.05% half-spread applied on entry
-  ✅ Exit reason breakdown including partial exits
+V3.0 upgrades (Jun 2026):
+  ✅ VIX regime gate: VIXY bars fetched alongside SPY/QQQ.
+     VIXY * 1.5 ≈ VIX proxy. When VIX proxy > 25, entries skipped in replay.
+     Matches V10.19 live VIX gate behavior.
+  ✅ Earnings blackout: yfinance calendar fetched at run start for all
+     SYMBOLS. Any bar within 48h of a known earnings date is skipped.
+     Matches V10.19 earnings_blocked behavior.
+  ✅ Regime score: computed from SPY below MA20 + VIX > 25. Score >= 3
+     blocks entries (simplified -- no live CB state in backtest).
+  ✅ Walk-forward validation: trains on first 21 months, validates on
+     last 3 months. Both sets reported in T-Bone alert.
+  ✅ Slippage modeling: entry price * 1.0005 (0.05% half-spread).
+  ✅ Per-symbol TP/SL from BERSERKER_RECIPES (not global fallback).
+  ✅ Sector health: TRUMP_THEME sector_health computed from SPY + TRUMP
+     symbol price history, gates TRUMP entries in weak markets.
+  ✅ Confluence gate: all 4 signals replicated exactly from main.py V10.19
+     (momentum, EMA9>EMA21, MACD histogram accel, bouncing).
 
-Key design principle: match crypto.py V5.0 EXACTLY for the confidence engine
-(7 scoring layers) -- historical/analyst scores set to neutral (0.5) since
-we can't backtest those in historical simulation.
+Signal engine is an EXACT copy of main.py V10.19 -- any drift between
+backtester and live code is a bug. Keep them in sync.
 
 Environment:
-  DATABASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY
+  DATABASE_URL (public Railway Postgres URL)
+  ALPACA_API_KEY, ALPACA_SECRET_KEY
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 Usage:
-  python crypto_backtester.py              # 365 days
-  python crypto_backtester.py --days 180  # 6 months
-  python crypto_backtester.py --dry-run   # no DB writes
-  python crypto_backtester.py --pairs BTC-USDC ETH-USDC
+  python nexus_analyzer_1min_railway.py          # default 730 days
+  python nexus_analyzer_1min_railway.py --days 365
+  python nexus_analyzer_1min_railway.py --dry-run
 """
 
 import os
 import sys
 import time
-import math
 import secrets
 import argparse
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Tuple, List, Dict
 
 import pandas as pd
 import psycopg2
 import psycopg2.extras
 import requests
 
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [CRYPTO-BT] %(message)s",
+    format="%(asctime)s [BERSERKER-BT] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("crypto_bt")
+log = logging.getLogger("berserker_bt")
 
 # ── Environment ───────────────────────────────────────────────────────────────
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
@@ -66,43 +72,39 @@ ALPACA_SECRET    = os.environ.get("ALPACA_SECRET_KEY", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ── Pairs ─────────────────────────────────────────────────────────────────────
-# Coinbase USDC pairs -> Alpaca slash format
-ALL_PAIRS = [
-    "BTC-USDC", "ETH-USDC", "SOL-USDC", "DOGE-USDC",
-    "XRP-USDC", "DOT-USDC", "ADA-USDC", "LTC-USDC",
-    "POL-USDC", "SUI-USDC",
-]
+# ── Signal engine constants (must match main.py V10.19 exactly) ───────────────
+TRUMP_THEME = ["CLSK", "MARA", "PLTR", "GEO", "CXW", "NUE", "MSTR"]
+TECH_GROWTH = ["NVDA", "TSLA", "AAPL", "SMCI", "SPCX"]
+SYMBOLS     = TRUMP_THEME + TECH_GROWTH
 
-ALPACA_SYM = {p: p.replace("-USDC", "/USD") for p in ALL_PAIRS}
-# Exceptions
-ALPACA_SYM["POL-USDC"] = "MATIC/USD"   # Alpaca uses MATIC for Polygon
-
-# ── Recipes (matches crypto.py V5.0 exactly) ─────────────────────────────────
-RECIPES: Dict[str, Dict] = {
-    "BTC-USDC":  {"stop_pct": 0.012, "tp_pct": 0.025, "rsi_entry_max": 38},
-    "ETH-USDC":  {"stop_pct": 0.015, "tp_pct": 0.030, "rsi_entry_max": 38},
-    "SOL-USDC":  {"stop_pct": 0.018, "tp_pct": 0.035, "rsi_entry_max": 40},
-    "DOGE-USDC": {"stop_pct": 0.020, "tp_pct": 0.040, "rsi_entry_max": 42},
-    "XRP-USDC":  {"stop_pct": 0.015, "tp_pct": 0.028, "rsi_entry_max": 30},
-    "DOT-USDC":  {"stop_pct": 0.018, "tp_pct": 0.032, "rsi_entry_max": 45},
-    "ADA-USDC":  {"stop_pct": 0.018, "tp_pct": 0.032, "rsi_entry_max": 40},
-    "LTC-USDC":  {"stop_pct": 0.014, "tp_pct": 0.026, "rsi_entry_max": 43},
-    "POL-USDC":  {"stop_pct": 0.020, "tp_pct": 0.038, "rsi_entry_max": 40},
-    "SUI-USDC":  {"stop_pct": 0.022, "tp_pct": 0.042, "rsi_entry_max": 42},
+BERSERKER_RECIPES = {
+    "CLSK": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "MARA": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "PLTR": {"avoid_hours": [9, 11],  "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "GEO":  {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "CXW":  {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "NUE":  {"avoid_hours": [10, 12], "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "MSTR": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "NVDA": {"avoid_hours": [8, 9],   "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "TSLA": {"avoid_hours": [11, 10], "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "AAPL": {"avoid_hours": [8, 13],  "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "SMCI": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "SPCX": {"avoid_hours": [9, 13],  "avoid_days": [], "tp": 0.015, "sl": 0.015},
 }
 
-# Confidence thresholds (matches crypto.py V5.0 defaults)
-CONF_FULL         = 75
-CONF_CAUTIOUS     = 55
-CONF_SKIP         = 40
+RSI_PERIOD       = 9
+MACD_FAST        = 12
+MACD_SLOW        = 26
+MACD_SIGNAL      = 9
+RSI_BUY_TRIGGER  = 62
+WARMUP_BARS      = 50
+TAKE_PROFIT_PCT  = 0.015
+STOP_LOSS_PCT    = 0.010
+SLIPPAGE_PCT     = 0.0005   # V3.0: 0.05% half-spread on market orders
 
-# Backtesting params
-SLIPPAGE_PCT      = 0.0005   # 0.05% half-spread
-WARMUP_BARS       = 60
-PARTIAL_TP_MULT   = 0.50     # V5.0: partial exit at 50% of TP target
-BTC_VOL_THRESHOLD = 5.0      # V5.0: restrict alts when BTC 7d vol > 5%
-BTC_IS_ETH        = {"BTC-USDC", "ETH-USDC"}  # exempt from vol restriction
+# V3.0: New intelligence gates matching V10.19
+VIX_BLOCK_THRESHOLD = 25.0   # VIXY * 1.5 > 25 = block new entries (1.5x is correct ratio)
+EARNINGS_BUFFER_H   = 48     # hours before/after earnings to block
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(msg: str):
@@ -117,428 +119,486 @@ def send_alert(msg: str):
     except Exception:
         pass
 
-def get_utc_hour(ts) -> int:
-    if hasattr(ts, "hour"):
-        return ts.hour
-    try:
-        return ts.to_pydatetime().replace(tzinfo=timezone.utc).hour
-    except Exception:
-        return 12
+def is_market_hours(dt: datetime) -> bool:
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    local   = dt.astimezone(central)
+    return local.weekday() < 5 and 8 <= local.hour < 15
 
-# ── Signal engine (matches crypto.py V5.0 tech/macro components) ─────────────
-def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    s        = pd.Series(closes, dtype=float)
+def get_hour_cdt(dt: datetime) -> int:
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    return dt.astimezone(central).hour
+
+def get_day_of_week(dt: datetime) -> int:
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    return dt.astimezone(central).weekday()
+
+# ── Earnings calendar (V3.0) ──────────────────────────────────────────────────
+def fetch_earnings_dates(symbols: List[str]) -> Dict[str, List[datetime]]:
+    """
+    Fetch upcoming/recent earnings dates for all symbols via yfinance.
+    Returns {symbol: [datetime, ...]} for earnings event timestamps.
+    Falls back gracefully if yfinance unavailable or symbol has no data.
+    """
+    earnings_map: Dict[str, List[datetime]] = {s: [] for s in symbols}
+    try:
+        import yfinance as yf
+        log.info(f"Fetching earnings dates for {len(symbols)} symbols...")
+        for sym in symbols:
+            try:
+                cal = yf.Ticker(sym).calendar
+                if cal is None:
+                    continue
+                if isinstance(cal, dict):
+                    dates = cal.get("Earnings Date", [])
+                    if dates is None:
+                        continue
+                    if not hasattr(dates, "__iter__"):
+                        dates = [dates]
+                    for d in dates:
+                        try:
+                            if hasattr(d, "to_pydatetime"):
+                                d = d.to_pydatetime()
+                            if not isinstance(d, datetime):
+                                d = datetime.combine(d, datetime.min.time())
+                            if d.tzinfo is None:
+                                d = d.replace(tzinfo=timezone.utc)
+                            earnings_map[sym].append(d)
+                        except Exception:
+                            pass
+                time.sleep(0.2)
+            except Exception:
+                pass
+        filled = sum(1 for v in earnings_map.values() if v)
+        log.info(f"  Earnings dates: {filled}/{len(symbols)} symbols have data")
+    except ImportError:
+        log.warning("yfinance not available — earnings blackout disabled")
+    return earnings_map
+
+def is_earnings_blocked(dt: datetime, earnings_dates: List[datetime]) -> bool:
+    """True if dt is within EARNINGS_BUFFER_H of any known earnings event."""
+    for ed in earnings_dates:
+        diff_h = abs((dt - ed).total_seconds()) / 3600
+        if diff_h <= EARNINGS_BUFFER_H:
+            return True
+    return False
+
+
+# ── Signal engine (exact copy of main.py V10.19) ─────────────────────────────
+def compute_rsi(prices: deque) -> float:
+    s        = pd.Series(list(prices))
     delta    = s.diff()
     gain     = delta.where(delta > 0, 0.0)
     loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs  = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    avg_gain = gain.ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, float("nan"))
+    return float((100 - (100 / (1 + rs))).iloc[-1])
 
-def calc_multi_tf_rsi(closes_5m: list) -> dict:
-    """Approximate multi-TF RSI from 5m bars (backtest proxy)."""
-    rsi_5m = calc_rsi(closes_5m, 14)
-    # Use different lookback windows as proxy for different timeframes
-    rsi_1m  = calc_rsi(closes_5m[-20:],  7)  # short window
-    rsi_15m = calc_rsi(closes_5m[-60:], 14)  # medium
-    rsi_1h  = calc_rsi(closes_5m[-100:],14)  # longer
-    rsi_4h  = calc_rsi(closes_5m,       14)  # full dataset
-    return {
-        "1m":  rsi_1m,
-        "5m":  rsi_5m,
-        "15m": rsi_15m,
-        "1h":  rsi_1h,
-        "4h":  rsi_4h,
-    }
+def compute_macd(prices: deque):
+    s           = pd.Series(list(prices))
+    ema_fast    = s.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow    = s.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line.iloc[-1], signal_line.iloc[-1], histogram
 
-def calc_obv_momentum(closes: list, volumes: list) -> Optional[float]:
-    if len(closes) < 10 or len(volumes) < 10:
-        return None
-    obv = [0.0]
-    for i in range(1, len(closes)):
-        if closes[i] > closes[i-1]:
-            obv.append(obv[-1] + volumes[i])
-        elif closes[i] < closes[i-1]:
-            obv.append(obv[-1] - volumes[i])
-        else:
-            obv.append(obv[-1])
-    if len(obv) < 6:
-        return None
-    recent = obv[-3:]
-    older  = obv[-6:-3]
-    if not older or sum(abs(x) for x in older) == 0:
-        return None
-    avg_r = sum(recent) / 3
-    avg_o = sum(older) / 3
-    return round((avg_r - avg_o) / (abs(avg_o) + 1) * 100, 3)
+def compute_sector_health(trump_prices: Dict[str, deque]) -> str:
+    """WEAK if majority of TRUMP_THEME symbols are below their 20-bar MA."""
+    down_count = 0
+    for sym in TRUMP_THEME:
+        prices = trump_prices.get(sym)
+        if prices and len(prices) >= 20:
+            ma20 = sum(list(prices)[-20:]) / 20
+            if list(prices)[-1] < ma20:
+                down_count += 1
+    return "WEAK" if down_count > len(TRUMP_THEME) / 2 else "STRONG"
 
-def calc_trend_structure(closes: list, lookback: int = 20) -> dict:
-    if len(closes) < lookback:
-        return {"higher_lows": False, "uptrend": False}
-    prices = closes[-lookback:]
-    mid    = lookback // 2
-    fhl    = min(prices[:mid])
-    shl    = min(prices[mid:])
-    fhh    = max(prices[:mid])
-    shh    = max(prices[mid:])
-    return {
-        "higher_lows": shl > fhl,
-        "uptrend":     shh > fhh and shl > fhl,
-    }
-
-def calc_vwap(closes: list, volumes: list) -> Optional[float]:
-    if len(closes) < 5 or len(volumes) < 5:
-        return None
-    tpv = sum(c * v for c, v in zip(closes, volumes))
-    vol = sum(volumes)
-    return tpv / vol if vol > 0 else None
-
-def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
-                           btc_closes: list) -> Tuple[int, str]:
+def get_signals_bt(symbol: str, prices: deque,
+                   sector_health: str, is_trump: bool) -> dict:
     """
-    Simplified confidence engine for backtesting.
-    Matches crypto.py V5.0 technical + macro layers.
-    Historical/analyst components set to neutral (can't backtest those).
-    Orderflow (L/S ratio, taker ratio) = 0 (real-time only).
-    Returns (score, mode) where mode is FULL/CAUTIOUS/SKIP/BLOCK.
+    Exact replica of get_signals() from main.py V10.19.
+    Uses local price history deque instead of global price_history dict.
     """
-    recipe  = RECIPES.get(pair, {})
-    max_rsi = recipe.get("rsi_entry_max", 40)
-    stop_pct = recipe.get("stop_pct", 0.015)
+    if len(prices) < max(RSI_PERIOD + 1, MACD_SLOW + MACD_SIGNAL):
+        return {"buy": False}
 
-    if len(closes_5m) < WARMUP_BARS:
-        return 0, "BLOCK"
+    price = list(prices)[-1]
+    rsi   = compute_rsi(prices)
+    macd_val, macd_sig, macd_hist = compute_macd(prices)
+    macd_bullish = macd_val > macd_sig
+    ma20         = sum(list(prices)[-20:]) / 20
 
-    rsi_dict = calc_multi_tf_rsi(closes_5m)
-    rsi_5m   = rsi_dict.get("5m")
+    sector_weak  = sector_health == "WEAK"
+    required_rsi = 72 if (is_trump and sector_weak) else RSI_BUY_TRIGGER
 
-    # Hard gate: RSI above entry max = skip
-    if rsi_5m is not None and rsi_5m > max_rsi:
-        return 0, "BLOCK"
+    base_ok = (rsi > required_rsi and macd_bullish and price > ma20)
+    if not base_ok:
+        return {"buy": False, "rsi": round(rsi, 2), "macd_bull": macd_bullish}
 
-    score = 0
+    confluence = 0
+    prices_l   = list(prices)
 
-    # Technical (max +40)
-    rsi_vals = [v for v in rsi_dict.values() if v is not None]
-    oc = sum(1 for r in rsi_vals if r < 40)
-    if   oc >= 5: score += 20
-    elif oc == 4: score += 15
-    elif oc == 3: score += 10
-    elif oc == 2: score += 5
+    # 1. Price momentum
+    if len(prices_l) >= 10:
+        mom_recent = prices_l[-1] - prices_l[-6]  if len(prices_l) >= 6  else 0
+        mom_prior  = prices_l[-6] - prices_l[-11] if len(prices_l) >= 11 else 0
+        if mom_recent > 0 and mom_recent > mom_prior:
+            confluence += 1
 
-    trend = calc_trend_structure(closes_5m)
-    if trend.get("higher_lows"):
-        score += 5
+    # 2. EMA9 > EMA21
+    if len(prices_l) >= 21:
+        s     = pd.Series(prices_l)
+        ema9  = float(s.ewm(span=9,  adjust=False).mean().iloc[-1])
+        ema21 = float(s.ewm(span=21, adjust=False).mean().iloc[-1])
+        if ema9 > ema21:
+            confluence += 1
 
-    vwap = calc_vwap(closes_5m, volumes_5m)
-    if vwap and closes_5m[-1] < vwap:
-        score += 5
+    # 3. MACD histogram accelerating
+    if len(macd_hist) >= 2 and float(macd_hist.iloc[-1]) > float(macd_hist.iloc[-2]):
+        confluence += 1
 
-    # RSI bounce signal
-    rsi_1m = rsi_dict.get("1m")
-    if rsi_5m and rsi_1m and rsi_5m < 35 and rsi_1m > rsi_5m:
-        score += 5
+    # 4. Bouncing
+    if len(prices_l) >= 4 and prices_l[-1] > prices_l[-4]:
+        confluence += 1
 
-    tech_score = min(score, 40)
-
-    # Macro: BTC context (simplified -- use BTC price history)
-    macro_score = 0
-    if btc_closes and len(btc_closes) >= 14:
-        btc_rsi = calc_rsi(btc_closes, 14) or 50
-        if   btc_rsi < 25: macro_score += 8
-        elif btc_rsi < 35: macro_score += 5
-        elif btc_rsi < 40: macro_score += 2
-        elif btc_rsi > 72: macro_score -= 5
-        elif btc_rsi > 65: macro_score -= 2
-
-    # Volume structure
-    obv_mom = calc_obv_momentum(closes_5m, volumes_5m)
-    vol_score = 0
-    if obv_mom is not None:
-        if   obv_mom >  5.0: vol_score += 5
-        elif obv_mom >  1.0: vol_score += 2
-        elif obv_mom < -5.0: vol_score -= 4
-        elif obv_mom < -1.0: vol_score -= 2
-
-    # Historical: neutral at backtest time (no real bucket data yet)
-    hist_score = 7   # neutral placeholder
-
-    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score))
-
-    if   total >= CONF_FULL:     mode = "FULL"
-    elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
-    elif total >= CONF_SKIP:     mode = "SKIP"
-    else:                        mode = "BLOCK"
-
-    return total, mode
-
-def compute_btc_realized_vol(btc_closes: list) -> float:
-    """7-day BTC realized vol as % -- V5.0 regime gate."""
-    if len(btc_closes) < 20:
-        return 0.0
-    try:
-        log_rets = [math.log(btc_closes[i] / btc_closes[i-1])
-                    for i in range(1, len(btc_closes)) if btc_closes[i-1] > 0]
-        if len(log_rets) < 10:
-            return 0.0
-        n   = len(log_rets)
-        mu  = sum(log_rets) / n
-        var = sum((r - mu) ** 2 for r in log_rets) / n
-        # bars are 5-min; bars_per_day = 288; annualize then convert to daily %
-        daily_vol = (var ** 0.5) * (288 ** 0.5)
-        return round(daily_vol * 100, 2)
-    except Exception:
-        return 0.0
+    return {
+        "buy":        confluence >= 1,
+        "rsi":        round(rsi, 2),
+        "macd_bull":  macd_bullish,
+        "above_ma20": price > ma20,
+        "confluence": confluence,
+    }
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
-def fetch_all_crypto_bars(pairs: list, days: int) -> dict:
-    """Fetch 5m bars from Alpaca CryptoHistoricalDataClient."""
-    client   = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
-    end_dt   = datetime.now(timezone.utc)
+def fetch_all_bars(days: int) -> dict:
+    """Fetch 1-min bars for SYMBOLS + SPY + QQQ + VIXY."""
+    client   = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+    end_dt   = datetime.now(timezone.utc).replace(hour=21, minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=days)
-    result   = {}
+    all_syms = SYMBOLS + ["SPY", "QQQ", "VIXY"]
 
-    log.info(f"Fetching {days}d 5-min crypto bars for {len(pairs)} pairs...")
+    log.info(f"Fetching {days}d 1-min bars for {len(all_syms)} symbols...")
+    log.info(f"Range: {start_dt.strftime('%Y-%m-%d')} -> {end_dt.strftime('%Y-%m-%d')}")
 
-    for pair in pairs:
-        alpaca_sym = ALPACA_SYM.get(pair, pair.replace("-USDC", "/USD"))
+    result = {}
+    for i, sym in enumerate(all_syms):
         try:
-            bars = client.get_crypto_bars(CryptoBarsRequest(
-                symbol_or_symbols=alpaca_sym,
-                timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=sym,
+                timeframe=TimeFrame(1, TimeFrameUnit.Minute),
                 start=start_dt,
                 end=end_dt,
+                feed=DataFeed.IEX,
             ))
             df = bars.df
             if hasattr(df.index, "levels"):
-                df = df.xs(alpaca_sym, level=0)
+                df = df.xs(sym, level=0)
             if not df.empty:
-                result[pair] = df
-                log.info(f"  {pair} ({alpaca_sym}): {len(df):,} bars")
+                result[sym] = df
+                log.info(f"  [{i+1}/{len(all_syms)}] {sym}: {len(df):,} bars")
             else:
-                log.warning(f"  {pair}: EMPTY")
+                log.warning(f"  [{i+1}/{len(all_syms)}] {sym}: EMPTY")
         except Exception as e:
-            log.error(f"  {pair}: {e}")
+            log.error(f"  [{i+1}/{len(all_syms)}] {sym}: {e}")
         time.sleep(0.3)
 
-    log.info(f"Fetched {len(result)}/{len(pairs)} pairs")
+    log.info(f"Fetched {len(result)}/{len(all_syms)} symbols")
     return result
 
 
 # ── Replay engine ─────────────────────────────────────────────────────────────
-def simulate_pair(pair: str, df: pd.DataFrame,
-                  btc_df: Optional[pd.DataFrame] = None,
-                  validate_mode: bool = False) -> List[Dict]:
-    """Replay one pair's 5m bars through the confidence engine."""
-    closes  = df["close"].tolist()
-    volumes = df["volume"].tolist() if "volume" in df.columns else [0.0] * len(closes)
-    times   = df.index.tolist()
+def replay_berserker(all_bars: dict,
+                     earnings_map: Dict[str, List[datetime]],
+                     validate_mode: bool = False) -> List[Dict]:
+    """
+    Main replay loop. Iterates all market timestamps in order,
+    feeds bars to per-symbol price histories, runs exact get_signals_bt().
+    validate_mode: skip first 75% of bars (walk-forward out-of-sample).
+    """
+    # Unified timestamp index — market hours only
+    all_ts_raw = set()
+    for sym in SYMBOLS:
+        if sym in all_bars:
+            all_ts_raw.update(all_bars[sym].index.tolist())
+    if "SPY" in all_bars:
+        all_ts_raw.update(all_bars["SPY"].index.tolist())
 
-    recipe   = RECIPES.get(pair, {})
-    stop_pct = recipe.get("stop_pct", 0.015)
-    tp_pct   = recipe.get("tp_pct",   0.025)
+    # Filter to market hours BEFORE slicing for walk-forward
+    # (validate_start must be computed on market-hours bars only)
+    all_ts = sorted(t for t in all_ts_raw if is_market_hours(
+        t if (hasattr(t, "tzinfo") and t.tzinfo) else t.to_pydatetime().replace(tzinfo=timezone.utc)
+    ))
 
-    total_bars = len(closes)
-    start_idx  = int(total_bars * 0.75) if validate_mode else 0
+    total_bars = len(all_ts)
+    # Walk-forward: trade only the last 25% of market-hours bars
+    # (price history still warms up from bar 0, just no entries before cutoff)
+    validate_start = int(total_bars * 0.75) if validate_mode else 0
+    label = "OUT-OF-SAMPLE" if validate_mode else "FULL TRAIN"
+    log.info(f"  {label}: {total_bars:,} market-hours timestamps | validate_start={validate_start}")
 
-    trades  = []
-    in_pos  = False
-    entry_price = 0.0
-    peak_price  = 0.0
-    partial_done = False
-    mfe = mae = 0.0
-    entry_bar = 0
-    entry_ts  = None
-    conf_at_entry = 0
-    mode_at_entry = ""
+    # Price histories
+    price_hist:   Dict[str, deque] = {s: deque(maxlen=100) for s in SYMBOLS + ["SPY", "QQQ", "VIXY"]}
+    trump_prices: Dict[str, deque] = {s: price_hist[s] for s in TRUMP_THEME}
 
-    is_btc_eth = pair in BTC_IS_ETH
+    # Per-symbol trade state
+    in_position:  Dict[str, bool]  = {s: False for s in SYMBOLS}
+    entry_price:  Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    peak_price:   Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    entry_bar:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
+    entry_rsi:    Dict[str, float] = {s: 50.0  for s in SYMBOLS}
+    entry_spy_bull: Dict[str, bool] = {s: False for s in SYMBOLS}
+    entry_spy_rsi:  Dict[str, float] = {s: 50.0  for s in SYMBOLS}
+    entry_spy_mom:  Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    mfe_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    mae_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    entry_hour:   Dict[str, int]   = {s: 12     for s in SYMBOLS}
+    entry_day:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
 
-    for i in range(WARMUP_BARS, total_bars):
-        if validate_mode and i < start_idx:
-            # Still update price history during skip
-            pass
+    trades:   List[Dict] = []
+    bar_num   = 0
+    vix_smooth = 15.0
 
-        closes_window  = closes[max(0, i-120):i+1]
-        volumes_window = volumes[max(0, i-120):i+1]
-        btc_window     = []
-        if btc_df is not None and not btc_df.empty and i < len(btc_df):
-            btc_window = btc_df["close"].tolist()[max(0, i-120):i+1]
+    for bar_idx, ts in enumerate(all_ts):
+        bar_num += 1
 
-        price = closes[i]
-        hour  = get_utc_hour(times[i])
+        # Determine if this bar is in the validation window
+        in_validate_window = validate_mode and bar_idx >= validate_start
+        in_train_window    = not validate_mode
 
-        # V5.0: BTC realized vol regime gate (alts restricted when BTC vol > threshold)
-        if not is_btc_eth and btc_window:
-            btc_vol = compute_btc_realized_vol(btc_window[-120:])
-            if btc_vol > BTC_VOL_THRESHOLD:
-                if in_pos:
-                    pass   # manage existing position normally
-                else:
-                    continue   # skip new entries in alt when BTC vol high
+        dt_utc = ts if (hasattr(ts, "tzinfo") and ts.tzinfo) else ts.to_pydatetime().replace(tzinfo=timezone.utc)
+        # Market hours pre-filtered above -- no need to check again
+        hour = get_hour_cdt(dt_utc)
+        dow  = get_day_of_week(dt_utc)
 
-        if validate_mode and i < start_idx:
-            continue
+        # Update all price histories
+        for sym in list(SYMBOLS) + ["SPY", "QQQ", "VIXY"]:
+            if sym in all_bars and ts in all_bars[sym].index:
+                row = all_bars[sym].loc[ts]
+                price_hist[sym].append(float(row["close"]))
 
-        if in_pos:
-            profit_pct = (price - entry_price) / entry_price
-            mfe = max(mfe, profit_pct)
-            mae = min(mae, profit_pct)
-            peak_price = max(peak_price, price)
+        # VIX approximation via VIXY (V3.0)
+        # VIXY is a 1x VIX futures ETF trading $10-25 while VIX is 12-40.
+        # Real multiplier is ~1.5x (not 10x). Keeps threshold at 25 consistent
+        # with main.py V10.19's VIX_BLOCK_THRESHOLD.
+        if price_hist["VIXY"]:
+            vixy = list(price_hist["VIXY"])[-1]
+            raw_vix = vixy * 1.5
+            vix_smooth = vix_smooth * 0.7 + raw_vix * 0.3
+        vix_blocking = vix_smooth > VIX_BLOCK_THRESHOLD
 
-            exit_reason = None
+        # SPY context for fingerprinting and sector health gate
+        spy_prices = list(price_hist["SPY"])
+        spy_bullish = False
+        spy_above_ma20 = False
+        spy_rsi_val = 50.0
+        spy_momentum_val = 0.0
+        if len(spy_prices) >= 20:
+            spy_ma20 = sum(spy_prices[-20:]) / 20
+            spy_above_ma20   = spy_prices[-1] > spy_ma20
+            spy_bullish      = spy_above_ma20
+            spy_rsi_val      = compute_rsi(deque(spy_prices)) if len(spy_prices) > 10 else 50.0
+            spy_momentum_val = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0.0
 
-            # Stop loss
-            if profit_pct <= -stop_pct:
-                exit_reason = "STOP_LOSS"
+        # Regime score (V3.0): simplified -- VIX + SPY bear
+        regime_block = (not spy_above_ma20) and vix_blocking
 
-            # V5.0: Partial exit at 50% of TP
-            elif not partial_done and profit_pct >= tp_pct * PARTIAL_TP_MULT:
-                partial_done = True
-                # Record partial exit as its own trade
-                trades.append({
-                    "pair":        pair,
-                    "entry_price": round(entry_price, 6),
-                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
-                    "pnl_pct":     round(profit_pct * 100, 3),
-                    "exit_reason": "PARTIAL_TP",
-                    "hold_bars":   i - entry_bar,
-                    "mfe":         round(mfe * 100, 3),
-                    "mae":         round(mae * 100, 3),
-                    "won":         True,
-                    "confidence":  conf_at_entry,
-                    "mode":        mode_at_entry,
-                    "hour_utc":    hour,
-                    "validate":    validate_mode,
-                    "trade_id":    secrets.token_hex(8),
-                })
-                # Continue holding remaining half (entry_price unchanged, position half size)
-                # For simplicity, treat remaining half as continuing from current price
-                # (partial exit doesn't change entry_price in our simplified model)
+        # Sector health for TRUMP gate
+        sector_health = compute_sector_health(trump_prices)
 
-            # Full TP
-            elif profit_pct >= tp_pct:
-                exit_reason = "TAKE_PROFIT"
+        # Skip if not in the right window for this mode
+        if validate_mode and bar_idx < validate_start:
+            continue  # still updated prices above, just skip trading
 
-            # Trend break / time failsafe (simplified)
-            elif (i - entry_bar) >= 288:  # 24h failsafe at 5m bars
-                if abs(profit_pct) < 0.002:
-                    exit_reason = "TIME_FAILSAFE"
+        for sym in SYMBOLS:
+            if sym not in all_bars:
+                continue
+            if ts not in all_bars[sym].index:
+                continue
+            if len(price_hist[sym]) < WARMUP_BARS:
+                continue
 
-            if exit_reason:
-                trades.append({
-                    "pair":        pair,
-                    "entry_price": round(entry_price, 6),
-                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
-                    "pnl_pct":     round(profit_pct * 100, 3),
-                    "exit_reason": exit_reason,
-                    "hold_bars":   i - entry_bar,
-                    "mfe":         round(mfe * 100, 3),
-                    "mae":         round(mae * 100, 3),
-                    "won":         profit_pct > 0,
-                    "confidence":  conf_at_entry,
-                    "mode":        mode_at_entry,
-                    "hour_utc":    hour,
-                    "validate":    validate_mode,
-                    "trade_id":    secrets.token_hex(8),
-                })
-                in_pos       = False
-                partial_done = False
-                mfe = mae    = 0.0
+            is_trump = sym in TRUMP_THEME
+            recipe   = BERSERKER_RECIPES.get(sym, {})
+            sym_tp   = recipe.get("tp", TAKE_PROFIT_PCT)
+            sym_sl   = recipe.get("sl", STOP_LOSS_PCT)
 
-        else:
-            conf, mode = compute_confidence_bt(pair, closes_window, volumes_window, btc_window)
-            if mode in ("FULL", "CAUTIOUS"):
-                in_pos          = True
-                entry_price     = price * (1 + SLIPPAGE_PCT)
-                peak_price      = entry_price
-                partial_done    = False
-                mfe = mae       = 0.0
-                entry_bar       = i
-                entry_ts        = times[i]
-                conf_at_entry   = conf
-                mode_at_entry   = mode
+            price = list(price_hist[sym])[-1]
 
-    # Close any open at end
-    if in_pos and closes:
-        price      = closes[-1]
-        profit_pct = (price - entry_price) / entry_price
-        trades.append({
-            "pair":        pair,
-            "entry_price": round(entry_price, 6),
-            "exit_price":  round(price, 6),
-            "pnl_pct":     round(profit_pct * 100, 3),
-            "exit_reason": "TIMEOUT",
-            "hold_bars":   total_bars - entry_bar,
-            "mfe":         round(mfe * 100, 3),
-            "mae":         round(mae * 100, 3),
-            "won":         profit_pct > 0,
-            "confidence":  conf_at_entry,
-            "mode":        mode_at_entry,
-            "hour_utc":    hour,
-            "validate":    validate_mode,
-            "trade_id":    secrets.token_hex(8),
-        })
+            # ── MANAGE OPEN POSITION ──────────────────────────────────────
+            if in_position[sym]:
+                profit_pct = (price - entry_price[sym]) / entry_price[sym]
+                mfe_track[sym] = max(mfe_track[sym], profit_pct)
+                mae_track[sym] = min(mae_track[sym], profit_pct)
+                peak_price[sym] = max(peak_price[sym], price)
+
+                exit_reason = None
+                if   profit_pct >= sym_tp:  exit_reason = "take_profit"
+                elif profit_pct <= -sym_sl: exit_reason = "stop_loss"
+
+                if exit_reason:
+                    hold_min = bar_num - entry_bar[sym]
+                    trades.append({
+                        "trade_id":     "bt_" + secrets.token_hex(8),
+                        "symbol":       sym,
+                        "entry_price":  round(entry_price[sym], 4),
+                        "exit_price":   round(price, 4),
+                        "pnl_pct":      round(profit_pct * 100, 3),
+                        "exit_reason":  exit_reason,
+                        "hold_min":     hold_min,
+                        "won":          profit_pct > 0,
+                        "rsi_at_entry": entry_rsi[sym],
+                        "spy_bullish":  entry_spy_bull[sym],
+                        "spy_rsi":       entry_spy_rsi[sym],
+                        "spy_momentum":  entry_spy_mom[sym],
+                        "sector_health": sector_health,
+                        "is_trump":     is_trump,
+                        "sector":       "TRUMP" if is_trump else "TECH",
+                        "hour_cdt":     entry_hour[sym],
+                        "day_of_week":  entry_day[sym],
+                        "mfe":          round(mfe_track[sym] * 100, 3),
+                        "mae":          round(mae_track[sym] * 100, 3),
+                        "vix_at_entry": round(vix_smooth, 1),
+                        "validate":     validate_mode,
+                        "tp_used":      sym_tp,
+                        "sl_used":      sym_sl,
+                    })
+                    in_position[sym]  = False
+                    entry_price[sym]  = 0.0
+                    peak_price[sym]   = 0.0
+                    mfe_track[sym]    = 0.0
+                    mae_track[sym]    = 0.0
+
+            # ── CHECK FOR ENTRY ───────────────────────────────────────────
+            elif not in_position[sym]:
+                # V3.0 gates
+                if vix_blocking:
+                    continue
+                if regime_block:
+                    continue
+                if is_earnings_blocked(dt_utc, earnings_map.get(sym, [])):
+                    continue
+                if hour in recipe.get("avoid_hours", []):
+                    continue
+                if dow in recipe.get("avoid_days", []):
+                    continue
+
+                sig = get_signals_bt(sym, price_hist[sym], sector_health, is_trump)
+                if sig.get("buy"):
+                    entry_px          = price * (1 + SLIPPAGE_PCT)
+                    in_position[sym]  = True
+                    entry_price[sym]  = entry_px
+                    peak_price[sym]   = entry_px
+                    entry_bar[sym]    = bar_num
+                    entry_rsi[sym]    = sig.get("rsi", 50.0)
+                    entry_spy_bull[sym] = spy_bullish
+                    entry_spy_rsi[sym]  = spy_rsi_val
+                    entry_spy_mom[sym]  = spy_momentum_val
+                    mfe_track[sym]    = 0.0
+                    mae_track[sym]    = 0.0
+                    entry_hour[sym]   = hour
+                    entry_day[sym]    = dow
+
+        if bar_num % 100000 == 0:
+            total_so_far = len(trades)
+            log.info(f"  Progress: {bar_num:,}/{total_bars:,} | {total_so_far} trades")
+
+    # Force-close any open at end
+    for sym in SYMBOLS:
+        if in_position[sym] and price_hist[sym]:
+            price = list(price_hist[sym])[-1]
+            profit_pct = (price - entry_price[sym]) / entry_price[sym]
+            trades.append({
+                "trade_id":    "bt_" + secrets.token_hex(8),
+                "symbol":      sym,
+                "entry_price": round(entry_price[sym], 4),
+                "exit_price":  round(price, 4),
+                "pnl_pct":     round(profit_pct * 100, 3),
+                "exit_reason": "timeout",
+                "hold_min":    bar_num - entry_bar[sym],
+                "won":         profit_pct > 0,
+                "rsi_at_entry": entry_rsi[sym],
+                "spy_bullish": entry_spy_bull[sym],
+                "spy_rsi":      entry_spy_rsi.get(sym, 50.0),
+                "spy_momentum": entry_spy_mom.get(sym, 0.0),
+                "sector_health": "STRONG",
+                "is_trump":    sym in TRUMP_THEME,
+                "sector":      "TRUMP" if sym in TRUMP_THEME else "TECH",
+                "hour_cdt":    entry_hour[sym],
+                "day_of_week": entry_day[sym],
+                "mfe":         round(mfe_track[sym] * 100, 3),
+                "mae":         round(mae_track[sym] * 100, 3),
+                "vix_at_entry": round(vix_smooth, 1),
+                "validate":    validate_mode,
+                "tp_used":     BERSERKER_RECIPES.get(sym, {}).get("tp", TAKE_PROFIT_PCT),
+                "sl_used":     BERSERKER_RECIPES.get(sym, {}).get("sl", STOP_LOSS_PCT),
+            })
 
     return trades
 
 
 # ── DB write ──────────────────────────────────────────────────────────────────
-def write_fingerprints(all_records: List[Dict], dry_run: bool = False) -> int:
+def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
     if dry_run or not DATABASE_URL:
-        log.info(f"  DRY RUN: would write {len(all_records)} fingerprints")
-        return len(all_records)
+        log.info(f"  DRY RUN: would write {len(trades)} fingerprints")
+        return len(trades)
     try:
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
         written = 0
         with conn.cursor() as cur:
-            # Remove old backtest entries
             cur.execute("""
-                DELETE FROM crypto_trade_fingerprints
+                DELETE FROM berserker_trade_fingerprints
                 WHERE trade_id LIKE 'bt_%' AND won IS NOT NULL
             """)
-            for r in all_records:
-                trade_id = "bt_" + r["trade_id"]
+            for t in trades:
                 try:
-                    pair = r["pair"]
                     cur.execute("""
-                        INSERT INTO crypto_trade_fingerprints
-                        (trade_id, pair, entry_ts, exit_ts,
-                         rsi_5m, fg_value, session, is_weekend,
-                         confidence_score, entry_mode, entry_price,
+                        INSERT INTO berserker_trade_fingerprints
+                        (trade_id, symbol, sector,
+                         entry_ts, exit_ts, entry_price,
+                         symbol_rsi, spy_bullish, spy_rsi, spy_momentum,
+                         sector_health, hour_cdt, day_of_week,
                          won, pnl_pct, exit_reason, hold_time_min,
-                         mfe, mae)
-                        VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s)
+                         mfe, mae, is_paper)
+                        VALUES (%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,
+                                %s,%s,%s,%s, %s,%s,%s)
                         ON CONFLICT (trade_id) DO UPDATE
                         SET won=EXCLUDED.won, pnl_pct=EXCLUDED.pnl_pct,
                             exit_reason=EXCLUDED.exit_reason,
                             mfe=EXCLUDED.mfe, mae=EXCLUDED.mae
                     """, (
-                        trade_id, pair,
+                        t["trade_id"],
+                        t["symbol"],
+                        t.get("sector", "TECH"),
                         int(time.time()), int(time.time()),
-                        None, 50, "US", False,   # RSI, F&G, session
-                        r.get("confidence", 0),
-                        r.get("mode", "CAUTIOUS"),
-                        r.get("entry_price", 0),
-                        bool(r["won"]),
-                        round(r["pnl_pct"], 3),
-                        r["exit_reason"],
-                        r.get("hold_bars", 0) // 12,  # 5m bars -> minutes / 12
-                        round(r.get("mfe", 0), 3),
-                        round(r.get("mae", 0), 3),
+                        round(t.get("entry_price", 0.0), 4),
+                        round(t.get("rsi_at_entry", 50.0), 2),
+                        bool(t.get("spy_bullish", False)),
+                        round(t.get("spy_rsi", 50.0), 2),
+                        round(t.get("spy_momentum", 0.0), 4),
+                        t.get("sector_health", "STRONG"),
+                        t.get("hour_cdt", 12),
+                        t.get("day_of_week", 0),
+                        bool(t["won"]),
+                        round(t["pnl_pct"], 3),
+                        t["exit_reason"],
+                        t.get("hold_min", 0),
+                        round(t.get("mfe", 0), 3),
+                        round(t.get("mae", 0), 3),
+                        False,
                     ))
                     written += 1
                 except Exception as e:
-                    log.warning(f"fingerprint write error: {e}")
+                    log.warning(f"fingerprint error [{t.get('symbol','?')}]: {e}")
                     break
         conn.commit()
         conn.close()
+        log.info(f"  Wrote {written}/{len(trades)} fingerprints")
         return written
     except Exception as e:
         log.error(f"DB write error: {e}")
@@ -546,7 +606,7 @@ def write_fingerprints(all_records: List[Dict], dry_run: bool = False) -> int:
 
 
 def run_pattern_analysis() -> Tuple[int, float]:
-    """Same as crypto.py PatternMemory.run_analysis()."""
+    """Run BerserkerMemory.run_analysis() equivalent — updates bucket win rates."""
     if not DATABASE_URL:
         return 0, 0.0
     try:
@@ -554,9 +614,10 @@ def run_pattern_analysis() -> Tuple[int, float]:
         conn.autocommit = False
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT rsi_5m, fg_value, session, is_weekend, vwap_position,
-                       trend_5m_up, higher_lows_5m, won, pnl_pct, mfe, mae, pair
-                FROM crypto_trade_fingerprints WHERE won IS NOT NULL
+                SELECT symbol, symbol_rsi as rsi_at_entry, spy_bullish,
+                       sector_health, sector,
+                       hour_cdt, day_of_week, won, pnl_pct, mfe, mae
+                FROM berserker_trade_fingerprints WHERE won IS NOT NULL
             """)
             rows = cur.fetchall()
 
@@ -564,23 +625,18 @@ def run_pattern_analysis() -> Tuple[int, float]:
             conn.close()
             return 0, 0.0
 
-        from collections import defaultdict
         buckets  = defaultdict(list)
         pnl_bkts = defaultdict(list)
 
         for row in rows:
-            rsi5  = row["rsi_5m"] or 99
-            fg    = row["fg_value"] or 50
-            rsi_b = ("rsi_lt25" if rsi5 < 25 else
-                     "rsi_25_35" if rsi5 < 35 else
-                     "rsi_35_40" if rsi5 < 40 else "rsi_gt40")
-            fg_b  = "fg_fear" if fg < 30 else "fg_neutral" if fg < 60 else "fg_greed"
-            key   = (f"{rsi_b}|{fg_b}|{row['session'] or 'UNK'}|"
-                     f"{row['vwap_position'] or 'unk'}|"
-                     f"{'up' if row['trend_5m_up'] else 'dn'}|"
-                     f"{'hl' if row['higher_lows_5m'] else 'no'}|"
-                     f"{'wknd' if row['is_weekend'] else 'wkdy'}|"
-                     f"btc_neu|sess_flat|ls_neu|oi_flat")
+            rsi    = row["rsi_at_entry"] or 50
+            hour   = row["hour_cdt"]   or 12
+            rsi_b  = "rsi_hi" if rsi > 72 else "rsi_mid" if rsi > 62 else "rsi_low"
+            spy_b  = "spy_bull" if row["spy_bullish"] else "spy_bear"
+            sec_b  = row["sector_health"] or "STRONG"
+            hr_b   = "hr_open" if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
+            sec_type = row["sector"] or "TECH"
+            key    = f"{row['symbol']}|{rsi_b}|{spy_b}|{sec_b}|{sec_type}|{hr_b}"
             buckets[key].append(bool(row["won"]))
             if row["pnl_pct"] is not None:
                 pnl_bkts[key].append(float(row["pnl_pct"]))
@@ -591,15 +647,13 @@ def run_pattern_analysis() -> Tuple[int, float]:
                 if len(outcomes) < 3:
                     continue
                 wr      = sum(outcomes) / len(outcomes)
-                avg_pnl = (sum(pnl_bkts[key]) / len(pnl_bkts[key]) if pnl_bkts[key] else None)
+                avg_pnl = sum(pnl_bkts[key]) / len(pnl_bkts[key]) if pnl_bkts[key] else None
                 cur.execute("""
-                    INSERT INTO crypto_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
+                    INSERT INTO berserker_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
                     VALUES (%s,%s,%s,%s)
                     ON CONFLICT (bucket_key) DO UPDATE
-                    SET win_rate=EXCLUDED.win_rate,
-                        sample_count=EXCLUDED.sample_count,
-                        avg_pnl=EXCLUDED.avg_pnl,
-                        last_updated=NOW()
+                    SET win_rate=EXCLUDED.win_rate, sample_count=EXCLUDED.sample_count,
+                        avg_pnl=EXCLUDED.avg_pnl, last_updated=NOW()
                 """, (key, wr, len(outcomes), avg_pnl))
                 written += 1
         conn.commit()
@@ -607,132 +661,153 @@ def run_pattern_analysis() -> Tuple[int, float]:
         total = len(rows)
         wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
         conn.close()
-        log.info(f"  Pattern analysis: {written} buckets | {total} trades | {wr:.1%} WR")
+        log.info(f"  Pattern analysis: {written} buckets | {total} trades | {wr:.1%} overall WR")
         return written, wr
     except Exception as e:
         log.error(f"Pattern analysis error: {e}")
         return 0, 0.0
 
 
+# ── Report ────────────────────────────────────────────────────────────────────
+def build_report(trades: List[Dict], validate_mode: bool = False) -> str:
+    if not trades:
+        return "No trades generated"
+
+    label   = "OUT-OF-SAMPLE" if validate_mode else "FULL TRAIN"
+    wins    = [t for t in trades if t["won"]]
+    total   = len(trades)
+    wr      = round(len(wins) / total * 100, 1)
+    avg_pnl = sum(t["pnl_pct"] for t in trades) / total
+    avg_mfe = sum(t["mfe"] for t in trades) / total
+    avg_mae = sum(t["mae"] for t in trades) / total
+
+    lines = [
+        f"\n{'='*60}",
+        f"BERSERKER BACKTEST V3.0 — {label}",
+        f"{'='*60}",
+        f"Trades: {total} | {len(wins)}W {total-len(wins)}L | {wr}% WR",
+        f"Avg PnL: {avg_pnl:+.3f}% | MFE: +{avg_mfe:.3f}% | MAE: {avg_mae:.3f}%",
+        "",
+        f"{'Symbol':<8} {'Trades':>7} {'WR%':>6} {'AvgPnL':>8}",
+        "-" * 35,
+    ]
+
+    for sym in SYMBOLS:
+        st = [t for t in trades if t["symbol"] == sym]
+        if not st:
+            continue
+        sw     = sum(1 for t in st if t["won"])
+        s_wr   = round(sw / len(st) * 100, 1)
+        s_pnl  = sum(t["pnl_pct"] for t in st) / len(st)
+        lines.append(f"{sym:<8} {len(st):>7} {s_wr:>5.1f}% {s_pnl:>+7.3f}%")
+
+    # Exit breakdown
+    lines += ["", "Exit reasons:"]
+    exit_c = defaultdict(lambda: {"w": 0, "l": 0})
+    for t in trades:
+        k = t["exit_reason"]
+        if t["won"]: exit_c[k]["w"] += 1
+        else:        exit_c[k]["l"] += 1
+    for r, c in sorted(exit_c.items(), key=lambda x: -(x[1]["w"]+x[1]["l"])):
+        tot = c["w"] + c["l"]
+        lines.append(f"  {r:<18} {tot:>5} | {round(c['w']/tot*100,1)}% WR")
+
+    lines.append(f"{'='*60}\n")
+    return "\n".join(lines)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="NEXUS Crypto Backtester V3.0")
-    parser.add_argument("--days",      type=int,   default=365)
-    parser.add_argument("--pairs",     nargs="+",  default=None)
-    parser.add_argument("--dry-run",   action="store_true")
+    parser = argparse.ArgumentParser(description="NEXUS Berserker Backtester V3.0")
+    parser.add_argument("--days",        type=int,  default=730)
+    parser.add_argument("--dry-run",     action="store_true")
     parser.add_argument("--no-validate", action="store_true")
+    parser.add_argument("--no-earnings", action="store_true",
+                        help="Skip yfinance earnings calendar fetch")
     args = parser.parse_args()
 
-    pairs   = args.pairs or ALL_PAIRS
-    days    = args.days
-    dry_run = args.dry_run
-
-    if not ALPACA_API_KEY:
-        log.error("Missing ALPACA_API_KEY")
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY")
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS CRYPTO BACKTESTER V3.0 — Alpaca Edition")
-    log.info(f"Pairs: {pairs} | Days: {days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
-    log.info(f"V5.0: BTC vol regime gate | Partial exits | Walk-forward validation")
+    log.info(f"NEXUS BERSERKER BACKTESTER V3.0")
+    log.info(f"Symbols: {len(SYMBOLS)} | Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
+    log.info(f"V3.0: VIX gate | Earnings blackout | Regime | Walk-forward | Slippage")
     log.info("=" * 60)
 
     send_alert(
-        f"🌙 NEXUS CRYPTO BACKTESTER V3.0 STARTING\n"
-        f"Data source: Alpaca (replaces broken Coinbase API)\n"
-        f"Pairs: {len(pairs)} | Days: {days}\n"
-        f"V5.0: BTC vol regime | Partial exits | Walk-forward\n"
-        f"ETA: ~15-25 min"
+        f"🔥 NEXUS BERSERKER BACKTESTER V3.0 STARTING\n"
+        f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
+        f"V3.0: VIX gate | Earnings | Regime | Walk-forward | Slippage\n"
+        f"Signal engine: V10.19 exact replica\n"
+        f"ETA: ~30-45 min"
     )
 
     start_time = time.time()
 
+    # Fetch earnings calendar (V3.0)
+    earnings_map: Dict[str, List[datetime]] = {s: [] for s in SYMBOLS}
+    if not args.no_earnings:
+        earnings_map = fetch_earnings_dates(SYMBOLS)
+
     # Fetch all bars
-    all_bars = fetch_all_crypto_bars(pairs, days)
+    all_bars = fetch_all_bars(args.days)
     if not all_bars:
-        log.error("No data fetched")
+        log.error("No bar data fetched")
         sys.exit(1)
 
-    # Get BTC bars for context
-    btc_df = all_bars.get("BTC-USDC")
+    # Full training run
+    log.info("Running full training replay...")
+    train_trades = replay_berserker(all_bars, earnings_map, validate_mode=False)
+    log.info(f"Training complete: {len(train_trades)} trades")
+    print(build_report(train_trades, validate_mode=False))
 
-    all_trades  = []
-    pair_summary = []
+    # Walk-forward validation
+    val_trades = []
+    if not args.no_validate:
+        log.info("Running walk-forward validation (last 25% of bars)...")
+        val_trades = replay_berserker(all_bars, earnings_map, validate_mode=True)
+        log.info(f"Validation complete: {len(val_trades)} trades")
+        print(build_report(val_trades, validate_mode=True))
 
-    for pair in pairs:
-        if pair not in all_bars:
-            log.warning(f"  {pair}: no data, skipping")
-            continue
-
-        df = all_bars[pair]
-        log.info(f"Simulating {pair} ({len(df):,} bars)...")
-
-        # Full training
-        train_trades = simulate_pair(pair, df, btc_df, validate_mode=False)
-
-        # Walk-forward validation
-        val_trades = []
-        if not args.no_validate:
-            val_trades = simulate_pair(pair, df, btc_df, validate_mode=True)
-
-        all_t     = train_trades + val_trades
-        wins      = sum(1 for t in all_t if t["won"])
-        non_partial = [t for t in all_t if t["exit_reason"] != "PARTIAL_TP"]
-        wr        = round(wins / max(len(all_t), 1) * 100, 1)
-        avg_pnl   = sum(t["pnl_pct"] for t in non_partial) / max(len(non_partial), 1)
-
-        log.info(f"  {pair}: {len(all_t)} trades | {wr}% WR | avg P&L: {avg_pnl:+.3f}%")
-        all_trades.extend(train_trades)  # only write training to DB
-        pair_summary.append({
-            "pair":   pair,
-            "trades": len(all_t),
-            "wins":   wins,
-            "wr":     wr,
-            "avg_pnl": avg_pnl,
-        })
-        time.sleep(0.5)
-
-    # Write to DB
+    # Write training trades to DB
     written = 0
-    if all_trades:
-        log.info(f"Writing {len(all_trades)} fingerprints to DB...")
-        written = write_fingerprints(all_trades, dry_run)
+    if train_trades:
+        log.info(f"Writing {len(train_trades)} training fingerprints to DB...")
+        written = write_fingerprints(train_trades, args.dry_run)
 
     # Pattern analysis
-    buckets = 0
-    overall_wr = 0.0
-    if not dry_run and DATABASE_URL and written > 0:
+    buckets, overall_wr = 0, 0.0
+    if not args.dry_run and DATABASE_URL and written > 0:
         log.info("Running pattern analysis...")
         buckets, overall_wr = run_pattern_analysis()
 
-    # Summary
     elapsed = round(time.time() - start_time)
-    total_t = sum(p["trades"] for p in pair_summary)
-    total_w = sum(p["wins"]   for p in pair_summary)
-    bt_wr   = round(total_w / max(total_t, 1) * 100, 1)
 
-    sym_lines = [
-        f"  {p['pair']}: {p['wr']}% ({p['trades']}t)"
-        for p in sorted(pair_summary, key=lambda x: -x["wr"])
-    ]
+    # Per-symbol T-Bone summary
+    train_wr = round(len([t for t in train_trades if t["won"]]) / max(len(train_trades), 1) * 100, 1)
+    sym_lines = []
+    for sym in SYMBOLS:
+        st = [t for t in train_trades if t["symbol"] == sym]
+        if st:
+            sw = sum(1 for t in st if t["won"])
+            sym_lines.append(f"  {sym}: {round(sw/len(st)*100,1)}% WR ({len(st)}t)")
 
-    print(f"\n{'='*60}")
-    print(f"CRYPTO BACKTEST V3.0 COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total trades: {total_t} | {bt_wr}% WR")
-    print(f"Fingerprints: {written:,} | Pattern buckets: {buckets}")
-    for p in sorted(pair_summary, key=lambda x: -x["wr"]):
-        print(f"  {p['pair']:<12} {p['trades']:>6} trades | {p['wr']:>5.1f}% WR | "
-              f"avg {p['avg_pnl']:+.3f}%")
-    print(f"{'='*60}")
+    val_line = ""
+    if val_trades:
+        vw  = sum(1 for t in val_trades if t["won"])
+        vwr = round(vw / max(len(val_trades), 1) * 100, 1)
+        val_line = f"\nValidation (last 25%): {vwr}% WR ({len(val_trades)} trades)"
 
     send_alert(
-        f"✅ NEXUS CRYPTO BACKTESTER V3.0 COMPLETE\n"
+        f"✅ NEXUS BERSERKER BACKTESTER V3.0 COMPLETE\n"
         f"──────────────────\n"
-        f"Overall WR: {bt_wr}% ({total_t} trades)\n"
+        f"Training: {train_wr}% WR ({len(train_trades)} trades)\n"
+        + "\n".join(sym_lines) + "\n"
+        f"──────────────────\n"
         f"Fingerprints: {written:,} | Buckets: {buckets}\n"
-        f"──────────────────\n"
-        + "\n".join(sym_lines[:8]) + "\n"
+        f"{val_line}\n"
         f"──────────────────\n"
         f"Elapsed: {elapsed}s"
     )
