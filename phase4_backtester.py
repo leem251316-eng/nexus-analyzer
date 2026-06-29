@@ -458,7 +458,7 @@ def get_qqq_context(qqq_prices: list) -> dict:
 def get_vix_from_vixy(vixy_prices: list) -> float:
     if not vixy_prices:
         return 15.0
-    return vixy_prices[-1] * 10.0
+    return vixy_prices[-1] * 1.5   # VIXY ~$10-25, VIX ~$15-40; 1.5x is correct ratio
 
 def get_underlying_ctx(und_prices: list) -> dict:
     if len(und_prices) < 21:
@@ -933,7 +933,8 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
                     ))
                     written += 1
                 except Exception as e:
-                    log.debug(f"  fingerprint write error: {e}")
+                    log.warning(f"  fingerprint write error: {e}")
+                    break
         conn.commit()
         conn.close()
         log.info(f"  Wrote {written} fingerprints to DB")
