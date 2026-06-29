@@ -152,19 +152,19 @@ BOT_CONFIGS = {
 }
 
 BEAR_RECIPES = {
-    "DUST": {"underlying": "GDX", "min_score": 3,  # BT: lowered from 7 "atr_stop": 0.0180,
+    "DUST": {"underlying": "GDX", "min_score": 3, "atr_stop": 0.0180,
              "avoid_hours": [11],
              "best_signals": ["obv_rising", "below_ma20", "macd_bullish", "far_below_bb"],
              "worst_signals": ["obv_falling", "near_lower_bb"]},
-    "SOXS": {"underlying": "SMH", "min_score": 3,  # BT: lowered from 9 "atr_stop": 0.0177,
+    "SOXS": {"underlying": "SMH", "min_score": 3, "atr_stop": 0.0177,
              "avoid_hours": [9],
              "best_signals": ["below_ma20", "rsi_lt25", "rsi14_lt20", "stochrsi_oversold", "near_lower_bb"],
              "worst_signals": ["obv_rising", "macd_bullish"]},
-    "LABD": {"underlying": "XBI", "min_score": 2,  # BT: lowered from 4 "atr_stop": 0.0164,
+    "LABD": {"underlying": "XBI", "min_score": 2, "atr_stop": 0.0164,
              "avoid_hours": [11, 14],
              "best_signals": ["far_below_bb", "near_lower_bb", "obv_falling", "rsi_lt25", "macd_bullish"],
              "worst_signals": ["bb_squeeze", "below_ma20"]},
-    "SQQQ": {"underlying": "QQQ", "min_score": 2,  # BT: lowered from 5 "atr_stop": 0.0178,
+    "SQQQ": {"underlying": "QQQ", "min_score": 2, "atr_stop": 0.0178,
              "avoid_hours": [11, 13, 14],
              "best_signals": ["rsi_lt40", "rsi14_lt35", "bouncing"],
              "worst_signals": ["rsi_lt25", "at_lower_bb"]},
