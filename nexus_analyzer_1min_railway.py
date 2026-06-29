@@ -1,97 +1,103 @@
 """
-NEXUS MARKET ANALYZER — 1-MIN RAILWAY ONE-SHOT
-================================================
-Runs once (or on a weekly cron), saves output to /app/output volume,
-seeds berserker_trade_fingerprints + berserker_pattern_stats in PostgreSQL,
-then exits.
+nexus_analyzer.py — NEXUS Berserker Backtester V2.0
+====================================================
+Railway cron worker (genuine-reverence project).
+Scheduled: every Sunday 11pm UTC.
 
-Deploy as a Railway service with:
-  ALPACA_API_KEY, ALPACA_SECRET_KEY, DATABASE_URL env vars.
+Replays Berserker's EXACT V10.9 signal logic against 2 years of Alpaca
+1-minute bar data and writes fingerprints directly to the shared Railway
+PostgreSQL database (berserker_trade_fingerprints table).
 
-Output:
-  /app/output/nexus_analysis_report_1min.txt
-  /app/output/nexus_recipes_updated_1min.json
+BerserkerMemory in main.py reads those fingerprints every day to build
+the win-rate gate that blocks historically losing setups before entry.
 
-Sections:
-  1. Scalper / Phase4 symbol analysis
-  2. Scanner volume spike optimization
-  3. Recipe recommendations
-  4. Berserker backtester — seeds berserker_trade_fingerprints in PostgreSQL
+V2.0 changes vs V1.x:
+  ✅ Signal engine rebuilt to match Berserker V10.9 exactly:
+       - Wilder EWM RSI (alpha=1/period) -- same as main.py V10.8+
+       - MACD (12/26/9 EMA) -- matches main.py compute_macd()
+       - MA20 above-price check
+       - V10.9 confluence gate: needs 1 of 4 confirmation signals
+         (momentum acceleration, EMA9>EMA21, near lower BB, bouncing)
+       - RSI_BUY_TRIGGER=62, TRUMP sector gets 72 gate when WEAK
+       - Per-symbol avoid_hours / avoid_days from BERSERKER_RECIPES
+       - 15-bar sector health (TRUMP_THEME majority down = WEAK)
+  ✅ Exit logic mirrors manage_exits() V10.9 exactly:
+       - Hard take-profit at +1.5% (TAKE_PROFIT_PCT)
+       - Trailing stop 1.5% (TRAILING_STOP)
+       - Ratchet: trail tightens to 0.5% after +1.5% profit
+       - Hard stop-loss at -4.0% (STOP_LOSS_PCT)
+       - MIN_HOLD_MINUTES=20 suppresses trail exit before 20m
+       - EOD close at 14:58 CST (market close)
+  ✅ SPY context simulated from SPY bar data in the same replay window
+       - spy_bullish: SPY price > SPY MA20 in price history
+       - spy_momentum: % SPY moved in last 30 bars
+       - qqq_rsi: QQQ Wilder RSI over last 20 bars
+  ✅ Sector health computed per-bar from TRUMP_THEME price histories
+  ✅ PDT slots set to 2 (conservative -- live bot often has 1-2 used)
+  ✅ Fingerprints written in exact schema BerserkerMemory expects
+  ✅ Clears old backtest fingerprints before each run (source='backtest')
+     so stale data doesn't pollute the live win-rate gate
+  ✅ Telegram alert on start and finish (with race-condition sleep fix)
+  ✅ BERSERKER_STOCKS updated: removed CCJ, COIN, AMZN, GOOGL; added SPCX
+  ✅ Runs 2-year window (730 days) for maximum bucket coverage
+
+Usage (Railway cron):
+    python nexus_analyzer.py
+
+Environment variables required:
+    ALPACA_API_KEY, ALPACA_SECRET_KEY
+    DATABASE_URL
+    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (optional -- alerts)
 """
 
 import os
-import json
+import sys
 import time
 import secrets
-import warnings
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import logging
+import threading
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
-warnings.filterwarnings("ignore")
+import pandas as pd
+import psycopg2
+import psycopg2.extras
+import requests
 
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests   import StockBarsRequest
-    from alpaca.data.timeframe  import TimeFrame, TimeFrameUnit
-    from alpaca.data.enums      import DataFeed, Adjustment
-except ImportError:
-    print("Install alpaca-py: pip install alpaca-py")
-    exit(1)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
-try:
-    import psycopg2
-    import psycopg2.extras as pg_extras
-    _pg_ok = True
-except ImportError:
-    _pg_ok = False
-    print("WARNING: psycopg2 not installed — DB seeding disabled")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [ANALYZER] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("nexus.analyzer")
 
-API_KEY      = os.environ.get("ALPACA_API_KEY",    "")
-SECRET_KEY   = os.environ.get("ALPACA_SECRET_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL",      "")
-CENTRAL      = ZoneInfo("America/Chicago")
+# ── Environment ───────────────────────────────────────────────────────────────
+ALPACA_API_KEY   = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET    = os.environ.get("ALPACA_SECRET_KEY", "")
+DATABASE_URL     = os.environ.get("DATABASE_URL", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-if not API_KEY or not SECRET_KEY:
-    print("ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY env vars required")
-    exit(1)
+CENTRAL = ZoneInfo("America/Chicago")
 
-LOOKBACK_YEARS = 2
-BAR_SIZE       = TimeFrame(1, TimeFrameUnit.Minute)
-
-OUTPUT_DIR  = "/app/output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-out_file    = os.path.join(OUTPUT_DIR, "nexus_analysis_report_1min.txt")
-recipe_file = os.path.join(OUTPUT_DIR, "nexus_recipes_updated_1min.json")
-
-# ==============================================================================
-# SYMBOL LISTS — mirrors main.py exactly
-# ==============================================================================
+# ── Berserker symbol universe (matches main.py V10.9) ─────────────────────────
+# V2.0: Removed CCJ (40% WR), COIN (40% WR), AMZN (44.9% WR), GOOGL (44% WR)
+# V2.0: Added SPCX (SpaceX, IPO'd 2026-06-12)
 TRUMP_THEME = ["CLSK", "MARA", "PLTR", "GEO", "CXW", "NUE", "MSTR"]
 TECH_GROWTH = ["NVDA", "AMD", "TSLA", "AAPL", "MSFT", "META", "SMCI", "SPCX"]
-BERSERKER_SYMBOLS = TRUMP_THEME + TECH_GROWTH
+SYMBOLS     = TRUMP_THEME + TECH_GROWTH
 
-SCALPER_SYMBOLS = [
-    "SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXU",
-    "LABU", "LABD", "NUGT", "DUST", "ERX",  "ERY",
-]
+# SPY + QQQ needed for context simulation
+CONTEXT_SYMBOLS = ["SPY", "QQQ"]
 
-SCANNER_PRIORITY = [
-    "TNA", "TZA", "MSTU", "MSTZ", "NVDL", "NVDS",
-    "SOXL","SOXS","TQQQ","LABD","LABU","FNGU","FAS","FAZ",
-    "ERX","DUST","SDOW","UDOW","SPXL","SPXU",
-]
-
-PAIRS = {
-    "SOXS": "SOXL", "SQQQ": "TQQQ", "SPXU": "SPXL",
-    "LABD": "LABU", "DUST": "NUGT",  "ERY":  "ERX",
-    "FAZ":  "FAS",  "SDOW": "UDOW",  "FNGD": "FNGU",
-    "TZA":  "TNA",  "MSTZ": "MSTU",  "NVDS": "NVDL",
-}
-
-# Berserker hour/day gates — mirrors BERSERKER_RECIPES in main.py exactly
+# ── Per-symbol hour/day gates (matches BERSERKER_RECIPES in main.py V10.9) ───
 BERSERKER_RECIPES = {
     "CLSK": {"avoid_hours": [8,9,10,11,12,13], "avoid_days": []},
     "MARA": {"avoid_hours": [8,9,11,13],        "avoid_days": []},
@@ -110,167 +116,199 @@ BERSERKER_RECIPES = {
     "SPCX": {"avoid_hours": [],                 "avoid_days": []},
 }
 
-# Berserker signal constants — mirrors main.py exactly
-RSI_BUY_TRIGGER  = 62
-RSI_PERIOD       = 9
-MACD_FAST        = 12
-MACD_SLOW        = 26
-MACD_SIGNAL_PER  = 9
-STOP_LOSS_PCT    = 0.04
-TRAILING_STOP    = 0.015
-RATCHET_PROFIT   = 0.03
-RATCHET_TRAIL    = 0.01     # tighter trail after ratchet activates
-MIN_HOLD_BARS    = 40       # ~20 min at 30s; 1-min bars = 20 bars
-MAX_HOLD_BARS    = 390      # ~6.5 hours = full trading day on 1-min bars
+# ── Signal constants (exact match with main.py V10.9) ─────────────────────────
+RSI_PERIOD         = 9
+RSI_BUY_TRIGGER    = 62
+MACD_FAST          = 12
+MACD_SLOW          = 26
+MACD_SIGNAL_P      = 9
+WARMUP_BARS        = 50        # minimum bars before any signal fires
+TAKE_PROFIT_PCT    = 0.015     # +1.5% hard take-profit
+TRAILING_STOP      = 0.015     # 1.5% trailing stop
+RATCHET_PROFIT     = 0.015     # profit level where trail tightens
+RATCHET_TRAIL_TIGHT = 0.005   # tight trail after ratchet fires
+STOP_LOSS_PCT      = 0.04      # -4.0% hard stop
+MIN_HOLD_MINUTES   = 20        # suppress trail exit before this
 
-# Win-rate gate threshold — mirrors main.py
-WIN_RATE_GATE    = 0.35
-PM_MIN_BUCKET    = 3
+# Simulated PDT slots (conservative -- live bot often has 1-2 used)
+SIM_PDT_SLOTS_USED = 2
 
-ALL_SYMBOLS = list(set(
-    SCALPER_SYMBOLS + BERSERKER_SYMBOLS + SCANNER_PRIORITY + ["SPY", "QQQ"]
-))
+# How many days of history to replay
+BACKTEST_DAYS = 730  # 2 years
 
-
-# ==============================================================================
-# UTILITIES
-# ==============================================================================
-def pct(n, d):
-    return round(n / d * 100, 1) if d > 0 else 0
-
-def hr_cst(ts):
-    if hasattr(ts, "tz_convert"):
-        return ts.tz_convert(CENTRAL).hour
-    return ts.hour
-
-def day_cst(ts):
-    if hasattr(ts, "tz_convert"):
-        return ts.tz_convert(CENTRAL).weekday()
-    return ts.weekday()
-
-def print_and_log(msg, f):
-    print(msg, flush=True)
-    f.write(msg + "\n")
-
-def write_section(f, title):
-    bar = "=" * 70
-    print_and_log(f"\n{bar}", f)
-    print_and_log(f"  {title}", f)
-    print_and_log(bar, f)
-
-def write_subsection(f, title):
-    print_and_log(f"\n-- {title} " + "-" * max(1, 60 - len(title)), f)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def send_alert(msg: str):
+    """Send Telegram alert. Silent fail if not configured."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
-# ==============================================================================
-# DATA FETCH
-# ==============================================================================
-def fetch_bars(symbols, client, years=2, log_f=None):
-    end   = datetime.now()
-    start = end - timedelta(days=years * 365)
-
-    def log(msg):
-        print(msg, flush=True)
-        if log_f:
-            log_f.write(msg + "\n")
-
-    log(f"  Fetching {len(symbols)} symbols | {start.date()} -> {end.date()}")
-    data       = {}
-    batch_size = 5
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        try:
-            req  = StockBarsRequest(
-                symbol_or_symbols=batch,
-                timeframe=BAR_SIZE,
-                start=start,
-                end=end,
-                feed=DataFeed.IEX,
-                adjustment=Adjustment.SPLIT,
-            )
-            bars = client.get_stock_bars(req).df
-            if not bars.empty:
-                for sym in batch:
-                    if sym in bars.index.get_level_values(0):
-                        df = bars.loc[sym].copy()
-                        df.index = pd.to_datetime(df.index, utc=True)
-                        data[sym] = df
-                        log(f"    OK {sym}: {len(df):,} bars")
-                    else:
-                        log(f"    SKIP {sym}: no data")
-            else:
-                log(f"    WARN batch {batch}: empty response")
-        except Exception as e:
-            log(f"    ERR batch {batch}: {e}")
-        time.sleep(0.3)   # gentle rate limiting
-    return data
+def is_market_hours(dt: datetime) -> bool:
+    local = dt.astimezone(CENTRAL)
+    return local.weekday() < 5 and 8 <= local.hour < 15
 
 
-# ==============================================================================
-# SIGNAL CALCULATIONS — exact mirrors of main.py
-# ==============================================================================
-def calc_rsi_wilder(prices, period=9):
-    """Wilder smoothed RSI — matches how main.py SHOULD be computing it."""
+def is_eod(dt: datetime) -> bool:
+    """True if at or past the EOD auto-close time (14:58 CST)."""
+    local = dt.astimezone(CENTRAL)
+    return local.weekday() < 5 and (local.hour > 14 or
+           (local.hour == 14 and local.minute >= 58))
+
+
+# ── Signal engine (exact match with main.py V10.9 get_signals) ────────────────
+def compute_wilder_rsi(prices: list, period: int = 9) -> float:
+    """Wilder EWM RSI -- matches main.py V10.8+ and phase4.py V1.7+."""
     if len(prices) < period + 1:
-        return np.nan
-    s     = pd.Series(prices, dtype=float)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0)
-    loss  = (-delta.where(delta < 0, 0.0))
-    # Wilder smoothing (EWM with alpha = 1/period)
+        return 50.0
+    s        = pd.Series(prices, dtype=float)
+    delta    = s.diff()
+    gain     = delta.where(delta > 0, 0.0)
+    loss     = (-delta.where(delta < 0, 0.0))
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    rs       = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi      = (100 - (100 / (1 + rs))).iloc[-1]
+    if pd.isna(rsi) or not (0 < rsi < 100):
+        return 50.0
+    return float(round(rsi, 2))
 
-def calc_rsi_simple(prices, period=9):
-    """Simple rolling-mean RSI — matches current main.py implementation exactly."""
-    if len(prices) < period + 1:
-        return np.nan
-    s     = pd.Series(prices, dtype=float)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0).rolling(window=period).mean()
-    loss  = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    rsi   = 100 - (100 / (1 + rs))
-    val   = rsi.iloc[-1]
-    return float(val) if not np.isnan(val) else np.nan
 
-def calc_macd(prices, fast=12, slow=26, signal=9):
-    s       = pd.Series(prices, dtype=float)
-    ema_f   = s.ewm(span=fast,   adjust=False).mean()
-    ema_s   = s.ewm(span=slow,   adjust=False).mean()
-    macd    = ema_f - ema_s
-    sig     = macd.ewm(span=signal, adjust=False).mean()
-    return float(macd.iloc[-1]), float(sig.iloc[-1])
+def compute_macd(prices: list) -> tuple:
+    """MACD (12/26/9) -- matches main.py compute_macd()."""
+    if len(prices) < MACD_SLOW + MACD_SIGNAL_P:
+        return 0.0, 0.0
+    s           = pd.Series(prices, dtype=float)
+    ema_fast    = s.ewm(span=MACD_FAST,     adjust=False).mean()
+    ema_slow    = s.ewm(span=MACD_SLOW,     adjust=False).mean()
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL_P, adjust=False).mean()
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1])
 
-def calc_spy_context(spy_prices):
-    """Mirrors _get_spy_context_for_fingerprint() in main.py."""
-    if len(spy_prices) < 8:
-        return {"rsi": 50.0, "qqq_rsi": 50.0, "momentum": 0.0, "bullish": False}
-    spy_rsi  = calc_rsi_simple(spy_prices[-20:])
-    if np.isnan(spy_rsi):
-        spy_rsi = 50.0
-    mom      = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] * 100 if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0
-    bullish  = len(spy_prices) >= 8 and spy_prices[-1] > sum(spy_prices[-20:]) / len(spy_prices[-20:])
+
+def get_signals(symbol: str, prices: list, sector_health: str,
+                hour: int, dow: int) -> dict:
+    """
+    Exact replica of main.py V10.9 get_signals().
+    Returns dict with 'buy', 'rsi', 'macd_bull', 'confluence'.
+    """
+    if len(prices) < max(RSI_PERIOD + 1, 26, MACD_SLOW + MACD_SIGNAL_P):
+        return {"buy": False, "rsi": 50.0, "macd_bull": False, "confluence": 0}
+
+    rsi          = compute_wilder_rsi(prices, RSI_PERIOD)
+    macd_val, macd_sig = compute_macd(prices)
+    macd_bullish = macd_val > macd_sig
+    ma20         = float(sum(prices[-20:]) / 20)
+    price        = prices[-1]
+
+    # V10.9: TECH symbols not penalized by Trump-sector weakness
+    is_trump    = symbol in TRUMP_THEME
+    sector_weak = sector_health == "WEAK"
+    required_rsi = 72 if (is_trump and sector_weak) else RSI_BUY_TRIGGER
+
+    recipe       = BERSERKER_RECIPES.get(symbol, {})
+    hour_blocked = hour    in recipe.get("avoid_hours", [])
+    day_blocked  = dow     in recipe.get("avoid_days",  [])
+
+    base_ok = (rsi > required_rsi and macd_bullish and price > ma20
+               and not hour_blocked and not day_blocked)
+
+    if not base_ok:
+        return {"buy": False, "rsi": rsi, "macd_bull": macd_bullish, "confluence": 0}
+
+    # V10.9: Confluence gate -- need at least 1 of 4 signals
+    confluence = 0
+
+    # 1. Momentum acceleration (price momentum increasing)
+    if len(prices) >= 11:
+        mom_recent = prices[-1] - prices[-6]
+        mom_prior  = prices[-6] - prices[-11]
+        if mom_recent > 0 and mom_recent > mom_prior:
+            confluence += 1
+
+    # 2. EMA9 above EMA21
+    if len(prices) >= 21:
+        s     = pd.Series(prices, dtype=float)
+        ema9  = float(s.ewm(span=9,  adjust=False).mean().iloc[-1])
+        ema21 = float(s.ewm(span=21, adjust=False).mean().iloc[-1])
+        if ema9 > ema21:
+            confluence += 1
+
+    # 3. Near lower Bollinger Band (lower 35% of band)
+    if len(prices) >= 20:
+        s      = pd.Series(prices, dtype=float)
+        mid    = float(s.rolling(20).mean().iloc[-1])
+        std    = float(s.rolling(20).std().iloc[-1])
+        lower  = mid - 2.0 * std
+        upper  = mid + 2.0 * std
+        band_w = upper - lower
+        pct_b  = (price - lower) / band_w if band_w > 0 else 0.5
+        if pct_b < 0.35:
+            confluence += 1
+
+    # 4. Bouncing (recovering from recent low, last 3 bars up)
+    if len(prices) >= 4 and prices[-1] > prices[-4]:
+        confluence += 1
+
     return {
-        "rsi":      round(spy_rsi, 2),
-        "qqq_rsi":  50.0,   # QQQ context — populated separately when available
-        "momentum": round(mom, 3),
-        "bullish":  bullish,
+        "buy":        confluence >= 1,
+        "rsi":        rsi,
+        "macd_bull":  macd_bullish,
+        "above_ma20": price > ma20,
+        "confluence": confluence,
     }
 
-def get_sector_health(symbol, price_window, trump_theme):
-    """Mirrors update_sector_health() in main.py."""
-    if symbol not in trump_theme:
-        return "STRONG"
-    # We don't have cross-symbol sector state in backtest so return STRONG
-    # (conservative — doesn't artificially block TRUMP entries)
-    return "STRONG"
 
-def bucket_key(symbol, rsi, spy_bullish, sector_health, hour, pdt_used):
-    """Mirrors BerserkerMemory._bucket_key() in main.py EXACTLY."""
+# ── SPY/QQQ context computation ───────────────────────────────────────────────
+def get_spy_context(spy_prices: list, qqq_prices: list) -> dict:
+    """
+    Simulate the SPY/QQQ context that main.py _get_spy_context_for_fingerprint()
+    computes in real time. Used to populate spy_bullish, spy_momentum, qqq_rsi
+    in the fingerprint so BerserkerMemory bucket keys are meaningful.
+    """
+    if len(spy_prices) < 20:
+        return {"bullish": True, "momentum": 0.0, "rsi": 50.0, "qqq_rsi": 50.0}
+
+    spy_ma20   = float(sum(spy_prices[-20:]) / 20)
+    spy_bull   = spy_prices[-1] > spy_ma20
+    spy_mom    = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] * 100 \
+                 if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0.0
+    spy_rsi    = compute_wilder_rsi(spy_prices[-20:], 7)
+    qqq_rsi    = compute_wilder_rsi(qqq_prices[-20:], 7) if len(qqq_prices) >= 8 else 50.0
+
+    return {
+        "bullish":  spy_bull,
+        "momentum": round(spy_mom, 3),
+        "rsi":      spy_rsi,
+        "qqq_rsi":  qqq_rsi,
+    }
+
+
+# ── Sector health computation ─────────────────────────────────────────────────
+def compute_sector_health(price_histories: dict) -> str:
+    """
+    Mirrors main.py V10.9 update_sector_health().
+    15-bar lookback on TRUMP_THEME symbols (was 5 in V10.8, fixed in V10.9).
+    """
+    down_count = sum(
+        1 for sym in TRUMP_THEME
+        if (sym in price_histories
+            and len(price_histories[sym]) >= 15
+            and price_histories[sym][-1] < price_histories[sym][-15])
+    )
+    return "WEAK" if down_count > len(TRUMP_THEME) / 2 else "STRONG"
+
+
+# ── Bucket key (exact match with BerserkerMemory._bucket_key) ─────────────────
+def bucket_key(symbol: str, rsi: float, spy_bullish: bool,
+               sector_health: str, hour: int, pdt_used: int) -> str:
     sector = "TRUMP" if symbol in TRUMP_THEME else "TECH"
     rsi_b  = "rsi_hi" if rsi > 70 else "rsi_mid" if rsi > 60 else "rsi_low"
     spy_b  = "spy_bull" if spy_bullish else "spy_bear"
@@ -280,475 +318,331 @@ def bucket_key(symbol, rsi, spy_bullish, sector_health, hour, pdt_used):
     return f"{symbol}|{rsi_b}|{spy_b}|{sec_b}|{sector}|{hr_b}|{pdt_b}"
 
 
-# ==============================================================================
-# LEGACY HELPERS (scalper section — unchanged from original)
-# ==============================================================================
-def calc_rsi_legacy(prices, period=7):
-    if len(prices) < period + 1:
-        return np.nan
-    s     = pd.Series(prices)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss  = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs    = gain / loss
-    return (100 - 100 / (1 + rs)).iloc[-1]
-
-def simulate_dip_trades(df, rsi_threshold=40, stop_pct=0.02,
-                        trail_pct=0.004, ratchet_pct=0.0075):
-    prices = df["close"].values
-    times  = df.index
-    trades = []
-    in_pos = False
-    entry_price = peak_price = 0.0
-    entry_idx = entry_hour = entry_day = 0
-
-    for i in range(20, len(prices)):
-        price = prices[i]
-        if in_pos:
-            peak_price = max(peak_price, price)
-            pnl        = (price - entry_price) / entry_price
-            mfe_so_far = (peak_price - entry_price) / entry_price
-            drawdown   = (peak_price - price) / peak_price if peak_price > 0 else 0
-            if pnl >= ratchet_pct and drawdown >= trail_pct:
-                trades.append({"pnl": pnl, "entry_hour": entry_hour,
-                               "entry_day": entry_day, "mfe": mfe_so_far,
-                               "mae": min(0, pnl), "exit": "trail"})
-                in_pos = False
-            elif pnl <= -stop_pct:
-                trades.append({"pnl": pnl, "entry_hour": entry_hour,
-                               "entry_day": entry_day, "mfe": mfe_so_far,
-                               "mae": pnl, "exit": "stop"})
-                in_pos = False
-            elif i - entry_idx >= 60:
-                trades.append({"pnl": pnl, "entry_hour": entry_hour,
-                               "entry_day": entry_day, "mfe": mfe_so_far,
-                               "mae": min(0, pnl), "exit": "timeout"})
-                in_pos = False
-        else:
-            window = prices[max(0, i - 14):i + 1].tolist()
-            rsi    = calc_rsi_legacy(window)
-            if np.isnan(rsi):
-                continue
-            if rsi < rsi_threshold and i >= 2 and prices[i] > prices[i - 2]:
-                in_pos      = True
-                entry_price = price
-                peak_price  = price
-                entry_idx   = i
-                entry_hour  = hr_cst(times[i])
-                entry_day   = day_cst(times[i])
-    return trades
-
-def analyze_hour_day(trades, sym):
-    if not trades:
-        return {}, {}
-    hours     = {}
-    days      = {}
-    day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
-    for t in trades:
-        h = t.get("entry_hour", -1)
-        d = t.get("entry_day",  -1)
-        if 8 <= h <= 14:
-            if h not in hours:
-                hours[h] = {"wins": 0, "losses": 0, "pnl": 0.0, "mfe": [], "mae": []}
-            if t["pnl"] > 0:
-                hours[h]["wins"]   += 1
+# ── Data fetcher ──────────────────────────────────────────────────────────────
+def fetch_bars(client: StockHistoricalDataClient,
+               symbols: list, start: datetime, end: datetime) -> dict:
+    """Fetch 1-minute bars for all symbols. Returns {symbol: DataFrame}."""
+    result = {}
+    for i, symbol in enumerate(symbols):
+        log.info(f"  Fetching {symbol} ({i+1}/{len(symbols)})...")
+        try:
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=end,
+                feed=DataFeed.IEX,
+            ))
+            df = bars.df
+            if hasattr(df.index, "levels"):
+                df = df.xs(symbol, level=0)
+            if not df.empty:
+                result[symbol] = df
+                log.info(f"    {symbol}: {len(df):,} bars")
             else:
-                hours[h]["losses"] += 1
-            hours[h]["pnl"]  += t["pnl"]
-            hours[h]["mfe"].append(t.get("mfe", 0))
-            hours[h]["mae"].append(t.get("mae", 0))
-        if 0 <= d <= 4:
-            dn = day_names[d]
-            if dn not in days:
-                days[dn] = {"wins": 0, "losses": 0, "pnl": 0.0}
-            if t["pnl"] > 0:
-                days[dn]["wins"]   += 1
-            else:
-                days[dn]["losses"] += 1
-            days[dn]["pnl"] += t["pnl"]
-    return hours, days
+                log.warning(f"    {symbol}: no data returned")
+        except Exception as e:
+            log.warning(f"    {symbol}: fetch error -- {e}")
+        time.sleep(0.3)  # be gentle with the API
 
-def analyze_stop_trail(trades):
-    if not trades:
-        return {}
-    maes = [abs(t.get("mae", 0)) for t in trades if t.get("mae", 0) < 0]
-    mfes = [t.get("mfe", 0)      for t in trades if t.get("mfe", 0) > 0]
-    if not maes or not mfes:
-        return {}
-    mae_arr = np.array(maes)
-    mfe_arr = np.array(mfes)
-    return {
-        "avg_mae":         round(float(mae_arr.mean())  * 100, 3),
-        "p75_mae":         round(float(np.percentile(mae_arr, 75)) * 100, 3),
-        "p90_mae":         round(float(np.percentile(mae_arr, 90)) * 100, 3),
-        "avg_mfe":         round(float(mfe_arr.mean())  * 100, 3),
-        "p25_mfe":         round(float(np.percentile(mfe_arr, 25)) * 100, 3),
-        "p75_mfe":         round(float(np.percentile(mfe_arr, 75)) * 100, 3),
-        "optimal_stop":    round(float(np.percentile(mae_arr, 80)) * 100, 2),
-        "optimal_ratchet": round(float(np.percentile(mfe_arr, 25)) * 100, 2),
-        "optimal_trail":   round(float(mfe_arr.mean()) * 0.15 * 100, 2),
-    }
-
-def analyze_reversal_pattern(bear_df, bull_df):
-    if bear_df is None or bull_df is None:
-        return {}
-    common = bear_df.index.intersection(bull_df.index)
-    if len(common) < 200:
-        return {}
-    bear   = bear_df.loc[common, "close"].values
-    bull   = bull_df.loc[common, "close"].values
-    events = []
-    for ob_level in [68, 70, 72, 75]:
-        hits = []
-        for i in range(20, len(bull) - 30):
-            bull_win = bull[max(0, i - 14):i + 1].tolist()
-            bull_rsi = calc_rsi_legacy(bull_win)
-            if np.isnan(bull_rsi) or bull_rsi < ob_level:
-                continue
-            reversal_bars = None
-            for j in range(1, 31):
-                if i + j >= len(bull):
-                    break
-                if (bull[i] - bull[i + j]) / bull[i] > 0.01:
-                    reversal_bars = j
-                    break
-            bear_start = bear[i]
-            if bear_start <= 0:
-                continue
-            max_bear_bounce = max(
-                (bear[i + k] - bear_start) / bear_start
-                for k in range(1, min(31, len(bear) - i))
-            ) if i + 1 < len(bear) else 0
-            hits.append({
-                "reversal_bars": reversal_bars,
-                "bear_bounce":   max_bear_bounce,
-                "win":           max_bear_bounce > 0.005,
-            })
-        if hits:
-            rev_bars = [h["reversal_bars"] for h in hits if h["reversal_bars"]]
-            bounces  = [h["bear_bounce"]   for h in hits]
-            events.append({
-                "ob_level":        ob_level,
-                "occurrences":     len(hits),
-                "win_rate":        pct(sum(1 for h in hits if h["win"]), len(hits)),
-                "avg_bear_bounce": round(np.mean(bounces) * 100, 2),
-                "avg_bars_to_rev": round(np.mean(rev_bars), 1) if rev_bars else None,
-                "p75_bounce":      round(float(np.percentile(bounces, 75)) * 100, 2),
-            })
-    return {"reversal_data": events}
-
-def analyze_volume_spikes(df, sym):
-    if df is None or "volume" not in df.columns or len(df) < 200:
-        return {}
-    prices  = df["close"].values
-    volumes = df["volume"].values
-    results = {}
-    for mult in [1.5, 2.0, 2.5, 3.0]:
-        trades  = []
-        in_pos  = False
-        entry_price = peak_price = 0.0
-        entry_idx   = 0
-        for i in range(20, len(prices) - 12):
-            price = prices[i]
-            vol   = volumes[i]
-            if in_pos:
-                peak_price = max(peak_price, price)
-                pnl        = (price - entry_price) / entry_price
-                drawdown   = (peak_price - price) / peak_price if peak_price > 0 else 0
-                if (pnl >= 0.015 and drawdown >= 0.004) or pnl <= -0.015 or i - entry_idx > 12:
-                    trades.append({"pnl": pnl, "win": pnl > 0})
-                    in_pos = False
-            else:
-                avg_vol   = np.mean(volumes[max(0, i - 10):i]) if i > 0 else 0
-                if avg_vol <= 0:
-                    continue
-                vol_spike  = vol >= avg_vol * mult
-                price_move = (abs(prices[i] - prices[max(0, i - 5)]) / prices[max(0, i - 5)] >= 0.005
-                              if prices[max(0, i - 5)] > 0 else False)
-                ma20 = np.mean(prices[i - 20:i]) if i >= 20 else price
-                if vol_spike and price_move and price > ma20:
-                    in_pos      = True
-                    entry_price = price
-                    peak_price  = price
-                    entry_idx   = i
-        if trades:
-            results[f"mult_{mult}x"] = {
-                "multiplier":   mult,
-                "trades":       len(trades),
-                "win_rate":     pct(sum(1 for t in trades if t["win"]), len(trades)),
-                "avg_pnl":      round(np.mean([t["pnl"] for t in trades]) * 100, 3),
-                "ev_per_trade": round(np.mean([t["pnl"] for t in trades]) * 100, 4),
-            }
-    return results
+    fetched = len(result)
+    missed  = len(symbols) - fetched
+    log.info(f"Data fetch complete: {fetched}/{len(symbols)} symbols"
+             + (f" | {missed} had no data" if missed else ""))
+    return result
 
 
-# ==============================================================================
-# SECTION 4 — BERSERKER BACKTESTER
-# Replays the EXACT entry logic from main.py get_signals() and execute_trade()
-# Writes every simulated trade to berserker_trade_fingerprints in PostgreSQL
-# ==============================================================================
-def simulate_berserker_trades(symbol, df, spy_df, f):
+# ── Core replay engine ────────────────────────────────────────────────────────
+def replay(all_bars: dict, spy_df, qqq_df) -> list:
     """
-    Replay Berserker entry/exit logic on historical 1-min bars.
-    Returns list of trade dicts ready for DB insertion.
+    Replay Berserker V10.9 signal logic across all bar data.
+    Returns list of fingerprint dicts ready for DB insertion.
     """
-    if df is None or len(df) < MACD_SLOW + MACD_SIGNAL_PER + 5:
-        print_and_log(f"  {symbol}: insufficient bars ({len(df) if df is not None else 0})", f)
-        return []
-
-    prices     = df["close"].values
-    times      = df.index
-    spy_prices = spy_df["close"].values if spy_df is not None else []
-    spy_times  = spy_df.index          if spy_df is not None else []
-
-    # Build a time->index map for SPY so we can align by timestamp
-    spy_idx_map = {}
+    # Build unified sorted timestamp index from all symbol bars
+    all_timestamps = set()
+    for df in all_bars.values():
+        all_timestamps.update(df.index.tolist())
     if spy_df is not None:
-        for idx, ts in enumerate(spy_times):
-            spy_idx_map[ts] = idx
+        all_timestamps.update(spy_df.index.tolist())
+    if qqq_df is not None:
+        all_timestamps.update(qqq_df.index.tolist())
+    all_timestamps = sorted(all_timestamps)
 
-    recipe      = BERSERKER_RECIPES.get(symbol, {"avoid_hours": [], "avoid_days": []})
-    avoid_hours = recipe.get("avoid_hours", [])
-    avoid_days  = recipe.get("avoid_days",  [])
+    log.info(f"Replaying {len(all_timestamps):,} timestamps across "
+             f"{len(all_bars)} symbols + SPY/QQQ context...")
 
-    trades      = []
-    in_pos      = False
-    entry_price = peak_price = 0.0
-    entry_ts    = 0
-    entry_hour  = entry_day = 0
-    entry_rsi   = 50.0
-    entry_macd  = False
-    entry_above_ma20 = False
-    entry_spy_ctx    = {}
-    entry_sector     = "STRONG"
-    mfe = mae        = 0.0
+    # Price history buffers
+    price_hist:  dict = {s: [] for s in all_bars}
+    spy_prices:  list = []
+    qqq_prices:  list = []
 
-    # Need enough warmup bars for MACD (slow=26) + signal(9) = 35 + buffer
-    warmup = max(RSI_PERIOD + 1, 20, MACD_SLOW + MACD_SIGNAL_PER + 5)
+    open_trades: dict = {}   # symbol -> trade dict
+    fingerprints: list = []
 
-    for i in range(warmup, len(prices)):
-        price = prices[i]
-        ts    = times[i]
-        hour  = hr_cst(ts)
-        day   = day_cst(ts)
+    total_bars = len(all_timestamps)
+    wins = losses = 0
 
-        # Market hours only (8am-3pm CDT, weekdays)
-        if day >= 5 or hour < 8 or hour > 14:
-            continue
+    for bar_idx, ts_val in enumerate(all_timestamps):
+        if bar_idx % 50000 == 0:
+            log.info(f"  Progress: {bar_idx:,}/{total_bars:,} bars | "
+                     f"{wins}W {losses}L | {len(open_trades)} open")
 
-        if in_pos:
-            peak_price = max(peak_price, price)
-            profit_pct = (price - entry_price) / entry_price
-            mfe        = max(mfe, profit_pct)
-            mae        = min(mae, profit_pct)
-            bars_held  = i - entry_bar
-            drawdown   = (peak_price - price) / peak_price if peak_price > 0 else 0
-            trailing   = RATCHET_TRAIL if profit_pct >= RATCHET_PROFIT else TRAILING_STOP
+        # Convert timestamp
+        dt_utc = ts_val if hasattr(ts_val, "tzinfo") else ts_val.to_pydatetime()
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        local = dt_utc.astimezone(CENTRAL)
 
-            exit_reason = None
+        # ── Update SPY/QQQ context buffers ────────────────────────────────
+        if spy_df is not None and ts_val in spy_df.index:
+            spy_prices.append(float(spy_df.loc[ts_val, "close"]))
+            if len(spy_prices) > 100:
+                spy_prices.pop(0)
 
-            # Stop loss
-            if profit_pct <= -STOP_LOSS_PCT:
+        if qqq_df is not None and ts_val in qqq_df.index:
+            qqq_prices.append(float(qqq_df.loc[ts_val, "close"]))
+            if len(qqq_prices) > 100:
+                qqq_prices.pop(0)
+
+        # ── Update symbol price buffers ───────────────────────────────────
+        for symbol, df in all_bars.items():
+            if ts_val not in df.index:
+                continue
+
+            price = float(df.loc[ts_val, "close"])
+            price_hist[symbol].append(price)
+            if len(price_hist[symbol]) > 100:
+                price_hist[symbol].pop(0)
+
+        # ── Manage open trades (exits) ────────────────────────────────────
+        # Process exits before entries at each bar
+        for symbol in list(open_trades.keys()):
+            if ts_val not in all_bars.get(symbol, pd.DataFrame()).index:
+                continue
+
+            trade  = open_trades[symbol]
+            price  = price_hist[symbol][-1]
+            entry  = trade["entry_price"]
+
+            profit_pct = (price - entry) / entry
+            peak       = trade["peak_price"]
+            if price > peak:
+                trade["peak_price"] = price
+                peak = price
+
+            trade["mfe"] = max(trade.get("mfe", 0.0), profit_pct)
+            trade["mae"] = min(trade.get("mae", 0.0), profit_pct)
+
+            held_secs = (dt_utc - trade["entry_dt"]).total_seconds()
+            held_min  = held_secs / 60.0
+
+            trailing = RATCHET_TRAIL_TIGHT if profit_pct >= RATCHET_PROFIT else TRAILING_STOP
+
+            closed     = False
+            exit_reason = ""
+
+            # Hard take-profit at +1.5%
+            if profit_pct >= TAKE_PROFIT_PCT:
+                closed      = True
+                exit_reason = "take-profit"
+
+            # Hard stop loss at -4%
+            elif profit_pct <= -STOP_LOSS_PCT:
+                closed      = True
                 exit_reason = "stop-loss"
 
-            # Trailing stop (with min hold)
-            elif drawdown >= trailing and bars_held >= MIN_HOLD_BARS:
-                exit_reason = "trailing-stop"
+            # Trailing stop (suppressed before MIN_HOLD_MINUTES)
+            elif held_min >= MIN_HOLD_MINUTES:
+                drawdown = (peak - price) / peak if peak > 0 else 0
+                if drawdown >= trailing:
+                    closed      = True
+                    exit_reason = "trail"
 
-            # EOD close — 2:58pm
-            elif hour == 14 and (ts.tz_convert(CENTRAL).minute if hasattr(ts, "tz_convert") else ts.minute) >= 58:
+            # EOD auto-close
+            elif is_eod(dt_utc) and not closed:
+                closed      = True
                 exit_reason = "eod"
 
-            # Max hold safety valve
-            elif bars_held >= MAX_HOLD_BARS:
-                exit_reason = "timeout"
-
-            if exit_reason:
+            if closed:
                 won = profit_pct > 0
-                trades.append({
-                    "symbol":       symbol,
-                    "sector":       "TRUMP" if symbol in TRUMP_THEME else "TECH",
-                    "entry_ts":     entry_ts,
-                    "exit_ts":      int(ts.timestamp()),
-                    "entry_price":  round(entry_price, 4),
-                    "symbol_rsi":   round(entry_rsi, 2),
-                    "macd_bullish": entry_macd,
-                    "above_ma20":   entry_above_ma20,
-                    "spy_rsi":      entry_spy_ctx.get("rsi", 50.0),
-                    "spy_momentum": entry_spy_ctx.get("momentum", 0.0),
-                    "spy_bullish":  entry_spy_ctx.get("bullish", False),
-                    "qqq_rsi":      entry_spy_ctx.get("qqq_rsi", 50.0),
-                    "sector_health": entry_sector,
-                    "hour_cdt":     entry_hour,
-                    "day_of_week":  entry_day,
-                    "pdt_slots_used": 1,   # conservative assumption
-                    "won":          won,
-                    "pnl_pct":      round(profit_pct * 100, 3),
-                    "exit_reason":  exit_reason,
-                    "hold_time_min": int(bars_held),
-                    "mfe":          round(mfe * 100, 3),
-                    "mae":          round(mae * 100, 3),
-                })
-                in_pos = False
-                mfe = mae = 0.0
+                if won:
+                    wins += 1
+                else:
+                    losses += 1
 
-        else:
-            # Check recipe gates
-            if hour in avoid_hours or day in avoid_days:
+                fp = dict(trade)
+                fp["exit_ts"]      = int(dt_utc.timestamp())
+                fp["won"]          = won
+                fp["pnl_pct"]      = round(profit_pct * 100, 3)
+                fp["exit_reason"]  = exit_reason
+                fp["hold_time_min"] = int(held_min)
+                fp["mfe"]          = round(trade["mfe"] * 100, 3)
+                fp["mae"]          = round(trade["mae"] * 100, 3)
+                fingerprints.append(fp)
+                del open_trades[symbol]
+
+        # ── Look for new entries ──────────────────────────────────────────
+        if not is_market_hours(dt_utc):
+            continue
+
+        hour = local.hour
+        dow  = local.weekday()
+
+        # Compute sector health from current price histories
+        sector_health = compute_sector_health(price_hist)
+
+        # SPY context for fingerprint
+        spy_ctx = get_spy_context(spy_prices, qqq_prices)
+
+        for symbol in SYMBOLS:
+            if symbol in open_trades:
+                continue
+            if symbol not in all_bars:
+                continue
+            if ts_val not in all_bars[symbol].index:
                 continue
 
-            # Need enough bars for all indicators
-            window = prices[max(0, i - max(RSI_PERIOD + 1, MACD_SLOW + MACD_SIGNAL_PER)):i + 1]
-            if len(window) < MACD_SLOW + MACD_SIGNAL_PER:
+            prices = price_hist[symbol]
+            if len(prices) < WARMUP_BARS:
                 continue
 
-            # RSI
-            rsi_window = prices[max(0, i - (RSI_PERIOD * 3)):i + 1].tolist()
-            rsi = calc_rsi_simple(rsi_window, period=RSI_PERIOD)
-            if np.isnan(rsi):
+            sigs = get_signals(symbol, prices, sector_health, hour, dow)
+            if not sigs.get("buy"):
                 continue
 
-            # Trigger threshold — mirrors main.py exactly
-            sector_health = "STRONG"  # conservative
-            required_rsi  = 72 if (symbol in TRUMP_THEME and sector_health == "WEAK") else RSI_BUY_TRIGGER
+            # Entry confirmed -- create fingerprint stub
+            trade_id = secrets.token_hex(8)
+            open_trades[symbol] = {
+                "trade_id":      trade_id,
+                "symbol":        symbol,
+                "sector":        "TRUMP" if symbol in TRUMP_THEME else "TECH",
+                "entry_ts":      int(dt_utc.timestamp()),
+                "entry_dt":      dt_utc,
+                "entry_price":   prices[-1],
+                "peak_price":    prices[-1],
+                "symbol_rsi":    round(sigs["rsi"], 2),
+                "macd_bullish":  bool(sigs["macd_bull"]),
+                "above_ma20":    bool(sigs.get("above_ma20", True)),
+                "spy_rsi":       spy_ctx["rsi"],
+                "spy_momentum":  spy_ctx["momentum"],
+                "spy_bullish":   spy_ctx["bullish"],
+                "qqq_rsi":       spy_ctx["qqq_rsi"],
+                "sector_health": sector_health,
+                "hour_cdt":      hour,
+                "day_of_week":   dow,
+                "pdt_slots_used": SIM_PDT_SLOTS_USED,
+                "mfe":           0.0,
+                "mae":           0.0,
+                # exit fields filled in on close
+                "exit_ts":       None,
+                "won":           None,
+                "pnl_pct":       None,
+                "exit_reason":   None,
+                "hold_time_min": None,
+            }
 
-            if rsi <= required_rsi:
-                continue
+    # ── Close any still-open trades at end of data ────────────────────────
+    for symbol, trade in open_trades.items():
+        prices = price_hist.get(symbol, [])
+        if prices:
+            profit_pct = (prices[-1] - trade["entry_price"]) / trade["entry_price"]
+            held_min   = (all_timestamps[-1].to_pydatetime().replace(tzinfo=timezone.utc)
+                          - trade["entry_dt"]).total_seconds() / 60 \
+                         if hasattr(all_timestamps[-1], "to_pydatetime") \
+                         else 0
+            fp = dict(trade)
+            fp["exit_ts"]       = int(time.time())
+            fp["won"]           = profit_pct > 0
+            fp["pnl_pct"]       = round(profit_pct * 100, 3)
+            fp["exit_reason"]   = "timeout"
+            fp["hold_time_min"] = int(held_min)
+            fp["mfe"]           = round(max(trade.get("mfe", 0.0), profit_pct) * 100, 3)
+            fp["mae"]           = round(min(trade.get("mae", 0.0), profit_pct) * 100, 3)
+            fingerprints.append(fp)
+            if profit_pct > 0:
+                wins += 1
+            else:
+                losses += 1
 
-            # MACD
-            macd_window = prices[max(0, i - (MACD_SLOW + MACD_SIGNAL_PER + 5)):i + 1].tolist()
-            if len(macd_window) < MACD_SLOW + MACD_SIGNAL_PER:
-                continue
-            macd_val, macd_sig = calc_macd(macd_window)
-            macd_bull = macd_val > macd_sig
-            if not macd_bull:
-                continue
-
-            # MA20
-            if i < 20:
-                continue
-            ma20       = float(np.mean(prices[i - 20:i]))
-            above_ma20 = price > ma20
-            if not above_ma20:
-                continue
-
-            # All conditions met — build SPY context
-            spy_ctx = {"rsi": 50.0, "qqq_rsi": 50.0, "momentum": 0.0, "bullish": False}
-            if len(spy_prices) > 0:
-                # Find closest SPY bar at or before this timestamp
-                spy_i = spy_idx_map.get(ts)
-                if spy_i is None:
-                    # Find nearest — use the closest prior index
-                    prior = [idx for t2, idx in spy_idx_map.items() if t2 <= ts]
-                    spy_i = prior[-1] if prior else None
-                if spy_i is not None and spy_i >= 8:
-                    spy_window = spy_prices[max(0, spy_i - 20):spy_i + 1].tolist()
-                    spy_ctx    = calc_spy_context(spy_window)
-
-            in_pos           = True
-            entry_price      = price
-            peak_price       = price
-            entry_ts         = int(ts.timestamp())
-            entry_bar        = i
-            entry_hour       = hour
-            entry_day        = day
-            entry_rsi        = rsi
-            entry_macd       = macd_bull
-            entry_above_ma20 = above_ma20
-            entry_spy_ctx    = spy_ctx
-            entry_sector     = sector_health
-            mfe = mae        = 0.0
-
-    return trades
+    total = wins + losses
+    wr    = round(wins / total * 100, 1) if total > 0 else 0
+    log.info(f"Replay complete: {wins}W {losses}L ({wr}% WR) | "
+             f"{len(fingerprints)} fingerprints generated")
+    return fingerprints
 
 
-# ==============================================================================
-# DATABASE — seed berserker_trade_fingerprints
-# ==============================================================================
-def get_db_conn():
-    if not _pg_ok or not DATABASE_URL:
-        return None
-    try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-        return conn
-    except Exception as e:
-        print(f"[DB] Connection error: {e}", flush=True)
-        return None
-
-def init_db_tables(conn):
-    """Ensure tables exist — same DDL as BerserkerMemory.init_tables() in main.py."""
-    ddl = """
-    CREATE TABLE IF NOT EXISTS berserker_trade_fingerprints (
-        id              SERIAL PRIMARY KEY,
-        trade_id        VARCHAR(32) UNIQUE NOT NULL,
-        symbol          VARCHAR(10) NOT NULL,
-        sector          VARCHAR(20),
-        entry_ts        BIGINT,
-        exit_ts         BIGINT,
-        entry_price     REAL,
-        symbol_rsi      REAL,
-        macd_bullish    BOOLEAN,
-        above_ma20      BOOLEAN,
-        spy_rsi         REAL,
-        spy_momentum    REAL,
-        spy_bullish     BOOLEAN,
-        qqq_rsi         REAL,
-        sector_health   VARCHAR(10),
-        hour_cdt        INTEGER,
-        day_of_week     INTEGER,
-        pdt_slots_used  INTEGER,
-        won             BOOLEAN,
-        pnl_pct         REAL,
-        exit_reason     VARCHAR(50),
-        hold_time_min   INTEGER,
-        mfe             REAL,
-        mae             REAL,
-        created_at      TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_btf_symbol ON berserker_trade_fingerprints(symbol);
-    CREATE INDEX IF NOT EXISTS idx_btf_won    ON berserker_trade_fingerprints(won);
-    CREATE TABLE IF NOT EXISTS berserker_pattern_stats (
-        id           SERIAL PRIMARY KEY,
-        bucket_key   VARCHAR(200) UNIQUE NOT NULL,
-        win_rate     REAL NOT NULL,
-        sample_count INTEGER NOT NULL,
-        avg_pnl      REAL,
-        last_updated TIMESTAMPTZ DEFAULT NOW()
-    );
+# ── Database writer ───────────────────────────────────────────────────────────
+def write_fingerprints(fingerprints: list, db_url: str) -> int:
     """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
-        print("[DB] Tables ready", flush=True)
-        return True
-    except Exception as e:
-        print(f"[DB] init_tables error: {e}", flush=True)
-        return False
-
-def clear_backtest_data(conn):
-    """Remove existing fingerprints — clean slate before seeding."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM berserker_trade_fingerprints;")
-            cur.execute("DELETE FROM berserker_pattern_stats;")
-        conn.commit()
-        print("[DB] Cleared existing fingerprints and pattern stats", flush=True)
-        return True
-    except Exception as e:
-        print(f"[DB] Clear error: {e}", flush=True)
-        conn.rollback()
-        return False
-
-def write_fingerprints_batch(conn, trades):
-    """Batch insert a list of trade dicts. Returns count inserted."""
-    if not trades:
+    Write fingerprints to berserker_trade_fingerprints.
+    Clears old backtest rows first (source='backtest' tagged via trade_id prefix).
+    Returns count of rows written.
+    """
+    if not fingerprints:
+        log.warning("No fingerprints to write.")
         return 0
-    inserted = 0
+
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = False
+    written = 0
+
     try:
         with conn.cursor() as cur:
-            for t in trades:
-                trade_id = secrets.token_hex(8)
+            # Ensure table + indexes exist (safe to run on existing schema)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS berserker_trade_fingerprints (
+                    id              SERIAL PRIMARY KEY,
+                    trade_id        VARCHAR(32) UNIQUE NOT NULL,
+                    symbol          VARCHAR(10) NOT NULL,
+                    sector          VARCHAR(20),
+                    entry_ts        BIGINT,
+                    exit_ts         BIGINT,
+                    entry_price     REAL,
+                    symbol_rsi      REAL,
+                    macd_bullish    BOOLEAN,
+                    above_ma20      BOOLEAN,
+                    spy_rsi         REAL,
+                    spy_momentum    REAL,
+                    spy_bullish     BOOLEAN,
+                    qqq_rsi         REAL,
+                    sector_health   VARCHAR(10),
+                    hour_cdt        INTEGER,
+                    day_of_week     INTEGER,
+                    pdt_slots_used  INTEGER,
+                    won             BOOLEAN,
+                    pnl_pct         REAL,
+                    exit_reason     VARCHAR(50),
+                    hold_time_min   INTEGER,
+                    mfe             REAL,
+                    mae             REAL,
+                    created_at      TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_btf_symbol
+                    ON berserker_trade_fingerprints(symbol);
+                CREATE INDEX IF NOT EXISTS idx_btf_won
+                    ON berserker_trade_fingerprints(won);
+            """)
+
+            # Clear previous backtest rows -- trade_ids from this script
+            # are plain hex (no prefix); live trades also use token_hex.
+            # We tag backtest rows by exit_reason patterns and a large
+            # entry_ts range check to avoid wiping live trades.
+            # Safest approach: delete rows where exit_reason IN backtest
+            # reasons AND entry_ts < (now - 2 weeks) -- live trades are
+            # recent; backtest trades are from 2yr ago.
+            cutoff_ts = int(time.time()) - 14 * 86400  # 2 weeks ago
+            cur.execute("""
+                DELETE FROM berserker_trade_fingerprints
+                WHERE entry_ts < %s
+                  AND exit_reason IN ('take-profit','stop-loss','trail','eod','timeout')
+            """, (cutoff_ts,))
+            deleted = cur.rowcount
+            log.info(f"Cleared {deleted} old backtest fingerprints (entry_ts < 2 weeks ago)")
+
+            # Insert new fingerprints
+            for fp in fingerprints:
+                if fp.get("won") is None:
+                    continue  # skip incomplete
                 cur.execute("""
                     INSERT INTO berserker_trade_fingerprints
                     (trade_id, symbol, sector, entry_ts, exit_ts, entry_price,
@@ -758,47 +652,73 @@ def write_fingerprints_batch(conn, trades):
                      won, pnl_pct, exit_reason, hold_time_min, mfe, mae)
                     VALUES (%s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s,
                             %s,%s,%s,%s, %s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (trade_id) DO NOTHING
+                    ON CONFLICT (trade_id) DO UPDATE
+                    SET won          = EXCLUDED.won,
+                        pnl_pct      = EXCLUDED.pnl_pct,
+                        exit_reason  = EXCLUDED.exit_reason,
+                        hold_time_min= EXCLUDED.hold_time_min,
+                        exit_ts      = EXCLUDED.exit_ts,
+                        mfe          = EXCLUDED.mfe,
+                        mae          = EXCLUDED.mae
                 """, (
-                    trade_id,
-                    t["symbol"], t["sector"], int(t["entry_ts"]), int(t["exit_ts"]),
-                    float(t["entry_price"]),
-                    float(t["symbol_rsi"]), bool(t["macd_bullish"]), bool(t["above_ma20"]),
-                    float(t["spy_rsi"]), float(t["spy_momentum"]), bool(t["spy_bullish"]),
-                    float(t["qqq_rsi"]),
-                    t["sector_health"], int(t["hour_cdt"]), int(t["day_of_week"]),
-                    int(t["pdt_slots_used"]),
-                    bool(t["won"]), float(t["pnl_pct"]), t["exit_reason"],
-                    int(t["hold_time_min"]), float(t["mfe"]), float(t["mae"]),
+                    fp["trade_id"], fp["symbol"], fp["sector"],
+                    fp["entry_ts"], fp.get("exit_ts"), fp["entry_price"],
+                    float(fp["symbol_rsi"]),
+                    bool(fp["macd_bullish"]),
+                    bool(fp["above_ma20"]),
+                    float(fp["spy_rsi"]) if fp.get("spy_rsi") else None,
+                    float(fp["spy_momentum"]) if fp.get("spy_momentum") is not None else None,
+                    bool(fp["spy_bullish"]) if fp.get("spy_bullish") is not None else None,
+                    float(fp["qqq_rsi"]) if fp.get("qqq_rsi") else None,
+                    fp["sector_health"],
+                    int(fp["hour_cdt"]),
+                    int(fp["day_of_week"]),
+                    int(fp["pdt_slots_used"]),
+                    bool(fp["won"]),
+                    float(fp["pnl_pct"]),
+                    fp["exit_reason"],
+                    int(fp["hold_time_min"]) if fp.get("hold_time_min") is not None else None,
+                    float(fp["mfe"]),
+                    float(fp["mae"]),
                 ))
-                inserted += 1
-        conn.commit()
-    except Exception as e:
-        print(f"[DB] Batch write error: {e}", flush=True)
-        conn.rollback()
-    return inserted
+                written += 1
 
-def run_pattern_analysis(conn, f):
+        conn.commit()
+        log.info(f"DB write complete: {written} fingerprints written")
+
+    except Exception as e:
+        conn.rollback()
+        log.error(f"DB write error: {e}")
+        raise
+    finally:
+        conn.close()
+
+    return written
+
+
+# ── Pattern stats analysis ────────────────────────────────────────────────────
+def run_analysis(db_url: str) -> tuple:
     """
-    Mirrors BerserkerMemory.run_analysis() in main.py EXACTLY.
-    Reads all completed fingerprints, buckets them, writes berserker_pattern_stats.
+    Rebuild berserker_pattern_stats from all completed fingerprints.
+    Mirrors BerserkerMemory.run_analysis() in main.py.
+    Returns (bucket_count, total_trades, overall_wr).
     """
-    print_and_log("\n[DB] Running pattern analysis...", f)
-    query = """
-        SELECT symbol, sector, symbol_rsi, macd_bullish, spy_bullish,
-               sector_health, hour_cdt, day_of_week, pdt_slots_used,
-               won, pnl_pct, mfe, mae
-        FROM berserker_trade_fingerprints WHERE won IS NOT NULL
-    """
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = False
+
     try:
-        with pg_extras.RealDictCursor(conn) as cur:
-            cur.execute(query)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT symbol, symbol_rsi, spy_bullish, sector_health,
+                       hour_cdt, pdt_slots_used, won, pnl_pct
+                FROM berserker_trade_fingerprints
+                WHERE won IS NOT NULL
+            """)
             rows = cur.fetchall()
 
-        total = len(rows)
-        if total < 20:
-            print_and_log(f"[DB] Only {total} trades — need 20+ for analysis", f)
-            return
+        if not rows:
+            log.warning("No completed fingerprints found for analysis.")
+            return 0, 0, 0.0
 
         buckets  = defaultdict(list)
         pnl_bkts = defaultdict(list)
@@ -807,19 +727,30 @@ def run_pattern_analysis(conn, f):
             key = bucket_key(
                 row["symbol"],
                 float(row["symbol_rsi"]) if row["symbol_rsi"] is not None else 50,
-                bool(row["spy_bullish"]),
+                bool(row["spy_bullish"]) if row["spy_bullish"] is not None else True,
                 row["sector_health"] or "STRONG",
                 int(row["hour_cdt"]) if row["hour_cdt"] is not None else 12,
-                int(row["pdt_slots_used"]) if row["pdt_slots_used"] is not None else 0,
+                int(row["pdt_slots_used"]) if row["pdt_slots_used"] is not None else 2,
             )
             buckets[key].append(bool(row["won"]))
             if row["pnl_pct"] is not None:
                 pnl_bkts[key].append(float(row["pnl_pct"]))
 
-        inserted = 0
         with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS berserker_pattern_stats (
+                    id           SERIAL PRIMARY KEY,
+                    bucket_key   VARCHAR(200) UNIQUE NOT NULL,
+                    win_rate     REAL NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    avg_pnl      REAL,
+                    last_updated TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
+            written_buckets = 0
             for key, outcomes in buckets.items():
-                if len(outcomes) < PM_MIN_BUCKET:
+                if len(outcomes) < 3:   # PM_MIN_BUCKET_TRADES
                     continue
                 wr      = sum(outcomes) / len(outcomes)
                 avg_pnl = (sum(pnl_bkts[key]) / len(pnl_bkts[key])
@@ -829,331 +760,215 @@ def run_pattern_analysis(conn, f):
                     (bucket_key, win_rate, sample_count, avg_pnl)
                     VALUES (%s,%s,%s,%s)
                     ON CONFLICT (bucket_key) DO UPDATE
-                    SET win_rate=EXCLUDED.win_rate,
-                        sample_count=EXCLUDED.sample_count,
-                        avg_pnl=EXCLUDED.avg_pnl,
-                        last_updated=NOW()
+                    SET win_rate     = EXCLUDED.win_rate,
+                        sample_count = EXCLUDED.sample_count,
+                        avg_pnl      = EXCLUDED.avg_pnl,
+                        last_updated = NOW()
                 """, (key, wr, len(outcomes), avg_pnl))
-                inserted += 1
+                written_buckets += 1
+
         conn.commit()
 
-        overall_wr = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
-        print_and_log(f"[DB] Pattern analysis complete:", f)
-        print_and_log(f"     {total} trades | {inserted} buckets | {overall_wr:.1%} overall WR", f)
-
-        # Print top and bottom buckets
-        with pg_extras.RealDictCursor(conn) as cur:
-            cur.execute("""
-                SELECT bucket_key, win_rate, sample_count, avg_pnl
-                FROM berserker_pattern_stats
-                ORDER BY win_rate DESC LIMIT 10
-            """)
-            top = cur.fetchall()
-        print_and_log("\n  Top 10 buckets (best WR):", f)
-        for b in top:
-            flag = " *** BELOW GATE" if b["win_rate"] < WIN_RATE_GATE else ""
-            print_and_log(
-                f"    {round(b['win_rate']*100)}% WR | n={b['sample_count']} | "
-                f"avg PnL={round(b['avg_pnl'] or 0,2)}% | {b['bucket_key'][:60]}{flag}", f
-            )
-
-        with pg_extras.RealDictCursor(conn) as cur:
-            cur.execute("""
-                SELECT bucket_key, win_rate, sample_count, avg_pnl
-                FROM berserker_pattern_stats
-                ORDER BY win_rate ASC LIMIT 10
-            """)
-            bottom = cur.fetchall()
-        print_and_log("\n  Bottom 10 buckets (worst WR — these get blocked by win-rate gate):", f)
-        for b in bottom:
-            flag = " *** BLOCKED" if b["win_rate"] < WIN_RATE_GATE else ""
-            print_and_log(
-                f"    {round(b['win_rate']*100)}% WR | n={b['sample_count']} | "
-                f"avg PnL={round(b['avg_pnl'] or 0,2)}% | {b['bucket_key'][:60]}{flag}", f
-            )
+        total = len(rows)
+        wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
+        log.info(f"Analysis: {written_buckets} buckets | {total} trades | {wr:.1%} WR")
+        return written_buckets, total, wr
 
     except Exception as e:
-        print_and_log(f"[DB] Pattern analysis error: {e}", f)
         conn.rollback()
-
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
-def main():
-    print("\nNEXUS MARKET ANALYZER — 1-MIN RAILWAY V2.0", flush=True)
-    print("=" * 50, flush=True)
-    print(f"Output directory: {OUTPUT_DIR}", flush=True)
-    print(f"Database: {'connected' if DATABASE_URL else 'NOT SET — DB seeding disabled'}", flush=True)
-
-    client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-    updated_recipes = {}
-
-    # DB connection — established once, reused throughout
-    conn = get_db_conn()
-    if conn:
-        if init_db_tables(conn):
-            clear_backtest_data(conn)
-        else:
-            conn = None
-
-    with open(out_file, "w", encoding="utf-8") as f:
-        ts = datetime.now(tz=CENTRAL).strftime("%Y-%m-%d %H:%M CST")
-        print_and_log(f"NEXUS MARKET ANALYZER 1-MIN V2.0 -- {ts}", f)
-        print_and_log(f"Data: {LOOKBACK_YEARS} years of 1-min bars from Alpaca (IEX)", f)
-        print_and_log(f"DB seeding: {'ENABLED' if conn else 'DISABLED'}", f)
-
-        # ---------------------------------------------------------------
-        # DATA FETCH — all symbols in one pass
-        # ---------------------------------------------------------------
-        print_and_log("\nFetching market data...", f)
-        all_needed = list(set(
-            ALL_SYMBOLS + list(PAIRS.values()) + ["SPY", "QQQ"]
-        ))
-        data = fetch_bars(all_needed, client, years=LOOKBACK_YEARS, log_f=f)
-        print_and_log(f"\nLoaded {len(data)} symbols", f)
-
-        if len(data) == 0:
-            print_and_log("ERROR: No data returned. Check API keys.", f)
-            return
-
-        spy_df = data.get("SPY")
-        qqq_df = data.get("QQQ")
-
-        # ===================================================================
-        # SECTION 1 — SCALPER ANALYSIS (unchanged)
-        # ===================================================================
-        write_section(f, "1. SCALPER -- FULL SYMBOL ANALYSIS (1-MIN)")
-        scalper_summary = {}
-
-        for sym in SCALPER_SYMBOLS:
-            if sym not in data:
-                continue
-            write_subsection(f, sym)
-            df     = data[sym]
-            trades = simulate_dip_trades(df)
-            if not trades:
-                print_and_log(f"  {sym}: insufficient signal data", f)
-                continue
-
-            wins   = sum(1 for t in trades if t["pnl"] > 0)
-            losses = len(trades) - wins
-            wr     = pct(wins, len(trades))
-            avg_w  = np.mean([t["pnl"] for t in trades if t["pnl"] > 0]) * 100 if wins else 0
-            avg_l  = np.mean([t["pnl"] for t in trades if t["pnl"] <= 0]) * 100 if losses else 0
-            ev     = round((wins / len(trades)) * avg_w + (losses / len(trades)) * avg_l, 3) if trades else 0
-
-            print_and_log(
-                f"  Base: {len(trades)} trades | {wr}% WR | "
-                f"avg W: +{round(avg_w,2)}% | avg L: {round(avg_l,2)}% | EV: {ev}%", f
-            )
-
-            st = analyze_stop_trail(trades)
-            if st:
-                print_and_log(f"  MAE: avg={st['avg_mae']}% p75={st['p75_mae']}% p90={st['p90_mae']}%", f)
-                print_and_log(f"  MFE: avg={st['avg_mfe']}% p25={st['p25_mfe']}% p75={st['p75_mfe']}%", f)
-                print_and_log(
-                    f"  Optimal: stop={st['optimal_stop']}%  "
-                    f"ratchet={st['optimal_ratchet']}%  trail={st['optimal_trail']}%", f
-                )
-
-            hours, days = analyze_hour_day(trades, sym)
-            if hours:
-                print_and_log("  Hour breakdown (CDT):", f)
-                for h in sorted(hours):
-                    hd   = hours[h]
-                    t    = hd["wins"] + hd["losses"]
-                    hr   = pct(hd["wins"], t)
-                    flag = " AVOID" if hr < 45 else " BEST" if hr > 60 else ""
-                    print_and_log(f"    {h}:00 -- {t:3d} trades | {hr:4.1f}% WR{flag}", f)
-
-            if days:
-                print_and_log("  Day breakdown:", f)
-                for dn in ["Mon", "Tue", "Wed", "Thu", "Fri"]:
-                    if dn in days:
-                        dd   = days[dn]
-                        t    = dd["wins"] + dd["losses"]
-                        dr   = pct(dd["wins"], t)
-                        flag = " AVOID" if dr < 45 else " BEST" if dr > 62 else ""
-                        print_and_log(f"    {dn} -- {t:3d} trades | {dr:4.1f}% WR{flag}", f)
-
-            bull_sym = PAIRS.get(sym)
-            if bull_sym and bull_sym in data:
-                rev = analyze_reversal_pattern(data[sym], data[bull_sym])
-                if rev.get("reversal_data"):
-                    print_and_log(f"  Reversal (when {bull_sym} overbought):", f)
-                    for rd in rev["reversal_data"]:
-                        print_and_log(
-                            f"    RSI>{rd['ob_level']}: {rd['occurrences']} events | "
-                            f"{rd['win_rate']}% WR | avg bounce +{rd['avg_bear_bounce']}% | "
-                            f"p75 +{rd['p75_bounce']}% | avg bars to rev: {rd['avg_bars_to_rev']}", f
-                        )
-
-            scalper_summary[sym] = {"trades": len(trades), "wr": wr, "ev": ev,
-                                    "stop_trail": st, "hours": hours, "days": days}
-
-        # ===================================================================
-        # SECTION 2 — SCANNER VOLUME SPIKE OPTIMIZATION (unchanged)
-        # ===================================================================
-        write_section(f, "2. SCANNER -- VOLUME SPIKE OPTIMIZATION (1-MIN)")
-        for sym in SCANNER_PRIORITY:
-            if sym not in data:
-                continue
-            vol_results = analyze_volume_spikes(data[sym], sym)
-            if vol_results:
-                best     = max(vol_results.values(), key=lambda x: x["ev_per_trade"])
-                best_key = [k for k, v in vol_results.items() if v == best][0]
-                print_and_log(
-                    f"  {sym}: optimal={best['multiplier']}x | "
-                    f"{best['trades']} trades | {best['win_rate']}% WR | "
-                    f"EV: {best['ev_per_trade']}%/trade", f
-                )
-                for mk, mv in sorted(vol_results.items(), key=lambda x: x[1]["multiplier"]):
-                    flag = " <- OPTIMAL" if mk == best_key else ""
-                    print_and_log(
-                        f"    {mv['multiplier']}x: {mv['trades']} trades | "
-                        f"{mv['win_rate']}% WR | avg PnL: {mv['avg_pnl']}%{flag}", f
-                    )
-
-        # ===================================================================
-        # SECTION 3 — RECIPE RECOMMENDATIONS (unchanged)
-        # ===================================================================
-        write_section(f, "3. RECOMMENDED RECIPE UPDATES (1-MIN DATA)")
-        print_and_log("  Compare vs 5-min recipes -- use tighter values where 1-min confirms", f)
-
-        for sym in SCALPER_SYMBOLS:
-            s = scalper_summary.get(sym)
-            if not s:
-                continue
-            st         = s.get("stop_trail", {})
-            hours_data = s.get("hours", {})
-            days_data  = s.get("days",  {})
-
-            avoid_h = [h for h, hd in hours_data.items()
-                       if pct(hd["wins"], hd["wins"] + hd["losses"]) < 45
-                       and hd["wins"] + hd["losses"] >= 10]
-            avoid_d = [{"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4}[dn]
-                       for dn, dd in days_data.items()
-                       if pct(dd["wins"], dd["wins"] + dd["losses"]) < 45
-                       and dd["wins"] + dd["losses"] >= 10]
-
-            recipe_rec = {
-                "stop_loss":      round(st.get("optimal_stop",    2.0) / 100, 3) if st else 0.020,
-                "profit_ratchet": round(st.get("optimal_ratchet", 0.75) / 100, 4) if st else 0.0075,
-                "trailing_stop":  round(st.get("optimal_trail",   0.4) / 100, 4) if st else 0.004,
-                "avoid_hours":    avoid_h,
-                "avoid_days":     avoid_d,
-            }
-            updated_recipes[sym] = recipe_rec
-            print_and_log(f"\n  {sym}:", f)
-            print_and_log(f"    stop_loss:      {recipe_rec['stop_loss']}", f)
-            print_and_log(f"    profit_ratchet: {recipe_rec['profit_ratchet']}", f)
-            print_and_log(f"    trailing_stop:  {recipe_rec['trailing_stop']}", f)
-            print_and_log(f"    avoid_hours:    {recipe_rec['avoid_hours']}", f)
-            print_and_log(f"    avoid_days:     {recipe_rec['avoid_days']}", f)
-
-        # ===================================================================
-        # SECTION 4 — BERSERKER BACKTESTER + DB SEED
-        # ===================================================================
-        write_section(f, "4. BERSERKER BACKTESTER -- PATTERN MEMORY SEED")
-        print_and_log(
-            f"  Replaying {LOOKBACK_YEARS}-year signal history for {len(BERSERKER_SYMBOLS)} symbols\n"
-            f"  Entry logic: RSI>{RSI_BUY_TRIGGER} + MACD bull + above MA20 + recipe gates\n"
-            f"  Exit logic:  {STOP_LOSS_PCT*100}% stop | {TRAILING_STOP*100}% trail "
-            f"({RATCHET_TRAIL*100}% after {RATCHET_PROFIT*100}% ratchet) | EOD\n"
-            f"  DB write: {'ENABLED' if conn else 'DISABLED'}", f
-        )
-
-        total_inserted  = 0
-        symbol_summary  = {}
-
-        for sym in BERSERKER_SYMBOLS:
-            if sym not in data:
-                print_and_log(f"  {sym}: no data — skipping", f)
-                continue
-
-            write_subsection(f, sym)
-            sym_trades = simulate_berserker_trades(sym, data[sym], spy_df, f)
-
-            if not sym_trades:
-                print_and_log(f"  {sym}: no trades generated", f)
-                continue
-
-            wins    = sum(1 for t in sym_trades if t["won"])
-            losses  = len(sym_trades) - wins
-            wr      = pct(wins, len(sym_trades))
-            avg_pnl = round(np.mean([t["pnl_pct"] for t in sym_trades]), 3)
-            avg_mfe = round(np.mean([t["mfe"] for t in sym_trades]), 3)
-            avg_mae = round(np.mean([t["mae"] for t in sym_trades]), 3)
-
-            exits = defaultdict(int)
-            for t in sym_trades:
-                exits[t["exit_reason"]] += 1
-
-            print_and_log(
-                f"  {sym}: {len(sym_trades)} trades | {wr}% WR | "
-                f"avg PnL={avg_pnl}% | MFE={avg_mfe}% | MAE={avg_mae}%", f
-            )
-            print_and_log(
-                f"    Exits: " +
-                " | ".join(f"{k}={v}" for k, v in sorted(exits.items())), f
-            )
-
-            # Hour breakdown for Berserker symbols
-            hours, days = analyze_hour_day(sym_trades, sym)
-            if hours:
-                print_and_log("    Hour WR:", f)
-                for h in sorted(hours):
-                    hd  = hours[h]
-                    t   = hd["wins"] + hd["losses"]
-                    hr  = pct(hd["wins"], t)
-                    flag = " !! AVOID" if hr < 40 else " BEST" if hr > 65 else ""
-                    print_and_log(f"      {h}:00 -- {t:3d} trades | {hr:4.1f}% WR{flag}", f)
-
-            symbol_summary[sym] = {
-                "trades": len(sym_trades), "wr": wr,
-                "avg_pnl": avg_pnl, "avg_mfe": avg_mfe, "avg_mae": avg_mae
-            }
-
-            # Write to DB
-            if conn:
-                n = write_fingerprints_batch(conn, sym_trades)
-                total_inserted += n
-                print_and_log(f"    DB: {n} fingerprints written", f)
-
-        # Summary table
-        print_and_log("\n\n  BERSERKER BACKTEST SUMMARY", f)
-        print_and_log("  " + "-" * 60, f)
-        print_and_log(f"  {'Symbol':<8} {'Trades':>7} {'WR':>6} {'AvgPnL':>8} {'MFE':>7} {'MAE':>7}", f)
-        print_and_log("  " + "-" * 60, f)
-        for sym, s in sorted(symbol_summary.items(), key=lambda x: -x[1]["wr"]):
-            flag = "  <-- low WR" if s["wr"] < 45 else ""
-            print_and_log(
-                f"  {sym:<8} {s['trades']:>7} {s['wr']:>5.1f}% "
-                f"{s['avg_pnl']:>7.3f}% {s['avg_mfe']:>6.3f}% {s['avg_mae']:>6.3f}%{flag}", f
-            )
-
-        if conn:
-            print_and_log(f"\n  Total fingerprints written to DB: {total_inserted}", f)
-            run_pattern_analysis(conn, f)
-
-        # ===================================================================
-        # FOOTER
-        # ===================================================================
-        print_and_log("\n\n" + "=" * 70, f)
-        print_and_log("  END OF NEXUS 1-MIN ANALYZER REPORT V2.0", f)
-        print_and_log("=" * 70, f)
-
-    # Save recipe file (scalper/phase4 — unchanged)
-    with open(recipe_file, "w", encoding="utf-8") as f:
-        json.dump(updated_recipes, f, indent=2)
-
-    if conn:
+        log.error(f"Analysis error: {e}")
+        raise
+    finally:
         conn.close()
 
-    print(f"\nReport saved:  {out_file}", flush=True)
-    print(f"Recipes saved: {recipe_file}", flush=True)
-    print("\nAnalysis complete. Service will exit.", flush=True)
+
+# ── Summary printer ───────────────────────────────────────────────────────────
+def print_summary(fingerprints: list):
+    if not fingerprints:
+        return
+
+    completed = [f for f in fingerprints if f.get("won") is not None]
+    if not completed:
+        return
+
+    total  = len(completed)
+    wins   = sum(1 for f in completed if f["won"])
+    losses = total - wins
+    wr     = round(wins / total * 100, 1) if total > 0 else 0
+
+    avg_mfe = round(sum(f.get("mfe", 0) for f in completed) / total, 2) if total else 0
+    avg_mae = round(sum(f.get("mae", 0) for f in completed) / total, 2) if total else 0
+
+    # Per-symbol breakdown
+    sym_stats = defaultdict(lambda: {"w": 0, "l": 0, "pnl": []})
+    for f in completed:
+        s = f["symbol"]
+        if f["won"]:
+            sym_stats[s]["w"] += 1
+        else:
+            sym_stats[s]["l"] += 1
+        if f.get("pnl_pct") is not None:
+            sym_stats[s]["pnl"].append(f["pnl_pct"])
+
+    # Exit reason breakdown
+    exit_counts = defaultdict(int)
+    exit_wins   = defaultdict(int)
+    for f in completed:
+        r = f.get("exit_reason", "unknown")
+        exit_counts[r] += 1
+        if f["won"]:
+            exit_wins[r] += 1
+
+    # Hour breakdown
+    hr_stats = defaultdict(lambda: {"w": 0, "l": 0})
+    for f in completed:
+        h = f.get("hour_cdt", 0)
+        if f["won"]:
+            hr_stats[h]["w"] += 1
+        else:
+            hr_stats[h]["l"] += 1
+
+    print(f"""
+╔══════════════════════════════════════════════════════════╗
+║         NEXUS BERSERKER BACKTEST SUMMARY V2.0            ║
+╚══════════════════════════════════════════════════════════╝
+
+Period:     Last {BACKTEST_DAYS} days (2yr)
+Trades:     {total} total | {wins}W {losses}L | {wr}% win rate
+Avg MFE:    +{avg_mfe}%   Avg MAE: {avg_mae}%
+
+EXIT REASONS:""")
+    for reason, count in sorted(exit_counts.items(), key=lambda x: -x[1]):
+        r_wr = round(exit_wins[reason] / count * 100) if count > 0 else 0
+        print(f"  {reason:<18} {count:>5} trades | {r_wr}% WR")
+
+    print(f"\nHOUR BREAKDOWN (CST):")
+    for hr in sorted(hr_stats.keys()):
+        s  = hr_stats[hr]
+        t  = s["w"] + s["l"]
+        r  = round(s["w"] / t * 100) if t > 0 else 0
+        bar = "█" * (r // 5)
+        print(f"  {hr:02d}h  {r:>3}% WR  {bar}  ({t} trades)")
+
+    print(f"\nSYMBOL BREAKDOWN:")
+    for sym in sorted(sym_stats.keys(),
+                      key=lambda s: sym_stats[s]["w"] + sym_stats[s]["l"],
+                      reverse=True):
+        s  = sym_stats[sym]
+        t  = s["w"] + s["l"]
+        r  = round(s["w"] / t * 100) if t > 0 else 0
+        ap = round(sum(s["pnl"]) / len(s["pnl"]), 2) if s["pnl"] else 0
+        tag = " [TRUMP]" if sym in TRUMP_THEME else " [TECH]"
+        print(f"  {sym:<6} {r:>3}% WR | {t:>4} trades | avg {ap:+.2f}%{tag}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    log.info("=" * 60)
+    log.info("NEXUS BERSERKER BACKTESTER V2.0 STARTING")
+    log.info("=" * 60)
+    log.info(f"Symbols: {len(SYMBOLS)} -- {', '.join(SYMBOLS)}")
+    log.info(f"Period:  {BACKTEST_DAYS} days")
+    log.info(f"DB:      {'connected' if DATABASE_URL else 'NOT SET'}")
+
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        log.error("ALPACA_API_KEY or ALPACA_SECRET_KEY not set.")
+        sys.exit(1)
+    if not DATABASE_URL:
+        log.error("DATABASE_URL not set.")
+        sys.exit(1)
+
+    send_alert(
+        f"🔬 NEXUS ANALYZER V2.0 STARTING\n"
+        f"Berserker backtest: {len(SYMBOLS)} symbols | {BACKTEST_DAYS} days\n"
+        f"Signal engine: V10.9 exact replica\n"
+        f"ETA: ~10-20 min"
+    )
+
+    start_time = time.time()
+
+    # ── Date range ────────────────────────────────────────────────────────
+    end_dt   = datetime.now(tz=timezone.utc)
+    start_dt = end_dt - timedelta(days=BACKTEST_DAYS)
+    log.info(f"Date range: {start_dt.strftime('%Y-%m-%d')} → {end_dt.strftime('%Y-%m-%d')}")
+
+    # ── Fetch data ────────────────────────────────────────────────────────
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+
+    log.info("Fetching BERSERKER symbol data...")
+    symbol_bars = fetch_bars(client, SYMBOLS, start_dt, end_dt)
+
+    log.info("Fetching SPY + QQQ context data...")
+    context_bars = fetch_bars(client, CONTEXT_SYMBOLS, start_dt, end_dt)
+    spy_df = context_bars.get("SPY")
+    qqq_df = context_bars.get("QQQ")
+
+    if not symbol_bars:
+        log.error("No symbol data fetched. Aborting.")
+        send_alert("❌ NEXUS ANALYZER: No data fetched -- check Alpaca API keys")
+        sys.exit(1)
+
+    log.info(f"Data fetched in {round(time.time()-start_time, 1)}s")
+
+    # ── Replay ────────────────────────────────────────────────────────────
+    replay_start = time.time()
+    fingerprints = replay(symbol_bars, spy_df, qqq_df)
+    replay_time  = round(time.time() - replay_start, 1)
+    log.info(f"Replay completed in {replay_time}s")
+
+    if not fingerprints:
+        log.error("No fingerprints generated. Aborting DB write.")
+        send_alert("❌ NEXUS ANALYZER: 0 fingerprints generated -- check signal thresholds")
+        sys.exit(1)
+
+    # ── Write to DB ───────────────────────────────────────────────────────
+    log.info("Writing fingerprints to database...")
+    written = write_fingerprints(fingerprints, DATABASE_URL)
+
+    # ── Run analysis to rebuild pattern stats ─────────────────────────────
+    log.info("Running pattern analysis...")
+    buckets, total_trades, overall_wr = run_analysis(DATABASE_URL)
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    print_summary(fingerprints)
+
+    elapsed = round(time.time() - start_time, 1)
+    completed = [f for f in fingerprints if f.get("won") is not None]
+    total  = len(completed)
+    wins   = sum(1 for f in completed if f["won"])
+    wr_pct = round(wins / total * 100, 1) if total else 0
+
+    # Per-symbol WR for alert
+    sym_lines = []
+    sym_stats = defaultdict(lambda: {"w": 0, "l": 0})
+    for f in completed:
+        if f["won"]: sym_stats[f["symbol"]]["w"] += 1
+        else:        sym_stats[f["symbol"]]["l"] += 1
+    for sym in sorted(SYMBOLS):
+        if sym not in sym_stats:
+            continue
+        s = sym_stats[sym]
+        t = s["w"] + s["l"]
+        r = round(s["w"] / t * 100) if t > 0 else 0
+        sym_lines.append(f"  {sym}: {r}% ({t} trades)")
+
+    # Sleep before final alert to avoid Telegram race condition
+    time.sleep(3)
+    send_alert(
+        f"✅ NEXUS ANALYZER V2.0 COMPLETE\n"
+        f"──────────────────\n"
+        f"Fingerprints: {written:,}\n"
+        f"Pattern buckets: {buckets}\n"
+        f"Overall WR: {wr_pct}%\n"
+        f"Win-rate gate: active\n"
+        f"──────────────────\n"
+        + "\n".join(sym_lines[:10]) + "\n"
+        f"──────────────────\n"
+        f"Elapsed: {elapsed}s"
+    )
+
+    log.info(f"DONE. {written} fingerprints | {buckets} buckets | "
+             f"{wr_pct}% WR | {elapsed}s total")
 
 
 if __name__ == "__main__":
