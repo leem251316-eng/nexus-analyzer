@@ -320,19 +320,26 @@ def replay_berserker(all_bars: dict,
     feeds bars to per-symbol price histories, runs exact get_signals_bt().
     validate_mode: skip first 75% of bars (walk-forward out-of-sample).
     """
-    # Unified timestamp index (market hours only)
-    all_ts = set()
+    # Unified timestamp index — market hours only
+    all_ts_raw = set()
     for sym in SYMBOLS:
         if sym in all_bars:
-            all_ts.update(all_bars[sym].index.tolist())
+            all_ts_raw.update(all_bars[sym].index.tolist())
     if "SPY" in all_bars:
-        all_ts.update(all_bars["SPY"].index.tolist())
-    all_ts = sorted(all_ts)
+        all_ts_raw.update(all_bars["SPY"].index.tolist())
+
+    # Filter to market hours BEFORE slicing for walk-forward
+    # (validate_start must be computed on market-hours bars only)
+    all_ts = sorted(t for t in all_ts_raw if is_market_hours(
+        t if (hasattr(t, "tzinfo") and t.tzinfo) else t.to_pydatetime().replace(tzinfo=timezone.utc)
+    ))
 
     total_bars = len(all_ts)
+    # Walk-forward: trade only the last 25% of market-hours bars
+    # (price history still warms up from bar 0, just no entries before cutoff)
     validate_start = int(total_bars * 0.75) if validate_mode else 0
     label = "OUT-OF-SAMPLE" if validate_mode else "FULL TRAIN"
-    log.info(f"  {label}: {total_bars:,} timestamps")
+    log.info(f"  {label}: {total_bars:,} market-hours timestamps | validate_start={validate_start}")
 
     # Price histories
     price_hist:   Dict[str, deque] = {s: deque(maxlen=100) for s in SYMBOLS + ["SPY", "QQQ", "VIXY"]}
@@ -362,9 +369,7 @@ def replay_berserker(all_bars: dict,
         in_train_window    = not validate_mode
 
         dt_utc = ts if (hasattr(ts, "tzinfo") and ts.tzinfo) else ts.to_pydatetime().replace(tzinfo=timezone.utc)
-        if not is_market_hours(dt_utc):
-            continue
-
+        # Market hours pre-filtered above -- no need to check again
         hour = get_hour_cdt(dt_utc)
         dow  = get_day_of_week(dt_utc)
 
@@ -573,7 +578,8 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
                     ))
                     written += 1
                 except Exception as e:
-                    log.debug(f"fingerprint error: {e}")
+                    log.warning(f"fingerprint error [{t.get("symbol","?")}]: {e}")
+                    break  # stop after first error to see root cause
         conn.commit()
         conn.close()
         log.info(f"  Wrote {written}/{len(trades)} fingerprints")
