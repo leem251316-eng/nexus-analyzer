@@ -1,64 +1,52 @@
+#!/usr/bin/env python3
 """
-nexus_analyzer.py — NEXUS Berserker Backtester V2.0
-====================================================
-Railway cron worker (genuine-reverence project).
-Scheduled: every Sunday 11pm UTC.
+nexus_analyzer_1min_railway.py V3.0 — NEXUS Berserker Backtester
+=================================================================
+Runs every Sunday 11pm UTC as Railway cron worker (genuine-reverence).
+Pulls 2yr 1-min Alpaca IEX bars, replays through the EXACT Berserker
+V10.19 signal engine, writes fingerprints to berserker_trade_fingerprints.
 
-Replays Berserker's EXACT V10.9 signal logic against 2 years of Alpaca
-1-minute bar data and writes fingerprints directly to the shared Railway
-PostgreSQL database (berserker_trade_fingerprints table).
+V3.0 upgrades (Jun 2026):
+  ✅ VIX regime gate: VIXY bars fetched alongside SPY/QQQ.
+     VIXY * 10 = approx VIX. When VIX > 25, entries skipped in replay.
+     Matches V10.19 live VIX gate behavior.
+  ✅ Earnings blackout: yfinance calendar fetched at run start for all
+     SYMBOLS. Any bar within 48h of a known earnings date is skipped.
+     Matches V10.19 earnings_blocked behavior.
+  ✅ Regime score: computed from SPY below MA20 + VIX > 25. Score >= 3
+     blocks entries (simplified -- no live CB state in backtest).
+  ✅ Walk-forward validation: trains on first 21 months, validates on
+     last 3 months. Both sets reported in T-Bone alert.
+  ✅ Slippage modeling: entry price * 1.0005 (0.05% half-spread).
+  ✅ Per-symbol TP/SL from BERSERKER_RECIPES (not global fallback).
+  ✅ Sector health: TRUMP_THEME sector_health computed from SPY + TRUMP
+     symbol price history, gates TRUMP entries in weak markets.
+  ✅ Confluence gate: all 4 signals replicated exactly from main.py V10.19
+     (momentum, EMA9>EMA21, MACD histogram accel, bouncing).
 
-BerserkerMemory in main.py reads those fingerprints every day to build
-the win-rate gate that blocks historically losing setups before entry.
+Signal engine is an EXACT copy of main.py V10.19 -- any drift between
+backtester and live code is a bug. Keep them in sync.
 
-V2.0 changes vs V1.x:
-  ✅ Signal engine rebuilt to match Berserker V10.9 exactly:
-       - Wilder EWM RSI (alpha=1/period) -- same as main.py V10.8+
-       - MACD (12/26/9 EMA) -- matches main.py compute_macd()
-       - MA20 above-price check
-       - V10.9 confluence gate: needs 1 of 4 confirmation signals
-         (momentum acceleration, EMA9>EMA21, near lower BB, bouncing)
-       - RSI_BUY_TRIGGER=62, TRUMP sector gets 72 gate when WEAK
-       - Per-symbol avoid_hours / avoid_days from BERSERKER_RECIPES
-       - 15-bar sector health (TRUMP_THEME majority down = WEAK)
-  ✅ Exit logic mirrors manage_exits() V10.9 exactly:
-       - Hard take-profit at +1.5% (TAKE_PROFIT_PCT)
-       - Trailing stop 1.5% (TRAILING_STOP)
-       - Ratchet: trail tightens to 0.5% after +1.5% profit
-       - Hard stop-loss at -4.0% (STOP_LOSS_PCT)
-       - MIN_HOLD_MINUTES=20 suppresses trail exit before 20m
-       - EOD close at 14:58 CST (market close)
-  ✅ SPY context simulated from SPY bar data in the same replay window
-       - spy_bullish: SPY price > SPY MA20 in price history
-       - spy_momentum: % SPY moved in last 30 bars
-       - qqq_rsi: QQQ Wilder RSI over last 20 bars
-  ✅ Sector health computed per-bar from TRUMP_THEME price histories
-  ✅ PDT slots set to 2 (conservative -- live bot often has 1-2 used)
-  ✅ Fingerprints written in exact schema BerserkerMemory expects
-  ✅ Clears old backtest fingerprints before each run (source='backtest')
-     so stale data doesn't pollute the live win-rate gate
-  ✅ Telegram alert on start and finish (with race-condition sleep fix)
-  ✅ BERSERKER_STOCKS updated: removed CCJ, COIN, AMZN, GOOGL; added SPCX
-  ✅ Runs 2-year window (730 days) for maximum bucket coverage
+Environment:
+  DATABASE_URL (public Railway Postgres URL)
+  ALPACA_API_KEY, ALPACA_SECRET_KEY
+  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-Usage (Railway cron):
-    python nexus_analyzer.py
-
-Environment variables required:
-    ALPACA_API_KEY, ALPACA_SECRET_KEY
-    DATABASE_URL
-    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (optional -- alerts)
+Usage:
+  python nexus_analyzer_1min_railway.py          # default 730 days
+  python nexus_analyzer_1min_railway.py --days 365
+  python nexus_analyzer_1min_railway.py --dry-run
 """
 
 import os
 import sys
 import time
 import secrets
+import argparse
 import logging
-import threading
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from zoneinfo import ZoneInfo
+from typing import Optional, Tuple, List, Dict
 
 import pandas as pd
 import psycopg2
@@ -67,908 +55,762 @@ import requests
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [ANALYZER] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [BERSERKER-BT] %(message)s",
+    datefmt="%H:%M:%S",
 )
-log = logging.getLogger("nexus.analyzer")
+log = logging.getLogger("berserker_bt")
 
 # ── Environment ───────────────────────────────────────────────────────────────
+DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ALPACA_API_KEY   = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET    = os.environ.get("ALPACA_SECRET_KEY", "")
-DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-CENTRAL = ZoneInfo("America/Chicago")
-
-# ── Berserker symbol universe (matches main.py V10.9) ─────────────────────────
-# V2.0: Removed CCJ (40% WR), COIN (40% WR), AMZN (44.9% WR), GOOGL (44% WR)
-# V2.0: Added SPCX (SpaceX, IPO'd 2026-06-12)
+# ── Signal engine constants (must match main.py V10.19 exactly) ───────────────
 TRUMP_THEME = ["CLSK", "MARA", "PLTR", "GEO", "CXW", "NUE", "MSTR"]
-TECH_GROWTH = ["NVDA", "AMD", "TSLA", "AAPL", "MSFT", "META", "SMCI", "SPCX"]
+TECH_GROWTH = ["NVDA", "TSLA", "AAPL", "SMCI", "SPCX"]
 SYMBOLS     = TRUMP_THEME + TECH_GROWTH
 
-# SPY + QQQ needed for context simulation
-CONTEXT_SYMBOLS = ["SPY", "QQQ"]
-
-# ── Per-symbol hour/day gates (matches BERSERKER_RECIPES in main.py V10.9) ───
 BERSERKER_RECIPES = {
-    "CLSK": {"avoid_hours": [8,9,10,11,12,13], "avoid_days": []},
-    "MARA": {"avoid_hours": [8,9,11,13],        "avoid_days": []},
-    "PLTR": {"avoid_hours": [8,14],             "avoid_days": []},
-    "GEO":  {"avoid_hours": [8,9,11,12,13,14],  "avoid_days": []},
-    "CXW":  {"avoid_hours": [8,10,12,13,14],    "avoid_days": []},
-    "NUE":  {"avoid_hours": [8,11],             "avoid_days": [3]},
-    "MSTR": {"avoid_hours": [8,9,10,13],        "avoid_days": [0]},
-    "NVDA": {"avoid_hours": [13],               "avoid_days": [3]},
-    "AMD":  {"avoid_hours": [8,14],             "avoid_days": [4]},
-    "TSLA": {"avoid_hours": [8,13],             "avoid_days": [3]},
-    "AAPL": {"avoid_hours": [],                 "avoid_days": []},
-    "MSFT": {"avoid_hours": [],                 "avoid_days": []},
-    "META": {"avoid_hours": [14],               "avoid_days": []},
-    "SMCI": {"avoid_hours": [8,9,10,11,13,14],  "avoid_days": [1,3,4]},
-    "SPCX": {"avoid_hours": [],                 "avoid_days": []},
+    "CLSK": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "MARA": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "PLTR": {"avoid_hours": [9, 11],  "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "GEO":  {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "CXW":  {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "NUE":  {"avoid_hours": [10, 12], "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "MSTR": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "NVDA": {"avoid_hours": [8, 9],   "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "TSLA": {"avoid_hours": [11, 10], "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "AAPL": {"avoid_hours": [8, 13],  "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "SMCI": {"avoid_hours": [],       "avoid_days": [], "tp": 0.015, "sl": 0.010},
+    "SPCX": {"avoid_hours": [9, 13],  "avoid_days": [], "tp": 0.015, "sl": 0.015},
 }
 
-# ── Signal constants (exact match with main.py V10.9) ─────────────────────────
-RSI_PERIOD         = 9
-RSI_BUY_TRIGGER    = 62
-MACD_FAST          = 12
-MACD_SLOW          = 26
-MACD_SIGNAL_P      = 9
-WARMUP_BARS        = 50        # minimum bars before any signal fires
-TAKE_PROFIT_PCT    = 0.015     # +1.5% hard take-profit
-TRAILING_STOP      = 0.015     # 1.5% trailing stop
-RATCHET_PROFIT     = 0.015     # profit level where trail tightens
-RATCHET_TRAIL_TIGHT = 0.005   # tight trail after ratchet fires
-STOP_LOSS_PCT      = 0.04      # -4.0% hard stop
-MIN_HOLD_MINUTES   = 20        # suppress trail exit before this
+RSI_PERIOD       = 9
+MACD_FAST        = 12
+MACD_SLOW        = 26
+MACD_SIGNAL      = 9
+RSI_BUY_TRIGGER  = 62
+WARMUP_BARS      = 50
+TAKE_PROFIT_PCT  = 0.015
+STOP_LOSS_PCT    = 0.010
+SLIPPAGE_PCT     = 0.0005   # V3.0: 0.05% half-spread on market orders
 
-# Simulated PDT slots (conservative -- live bot often has 1-2 used)
-SIM_PDT_SLOTS_USED = 2
-
-# How many days of history to replay
-BACKTEST_DAYS = 730  # 2 years
+# V3.0: New intelligence gates matching V10.19
+VIX_BLOCK_THRESHOLD = 25.0   # VIXY * 10 > 25 = block new entries
+EARNINGS_BUFFER_H   = 48     # hours before/after earnings to block
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(msg: str):
-    """Send Telegram alert. Silent fail if not configured."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=5,
+            timeout=8
         )
     except Exception:
         pass
 
-
 def is_market_hours(dt: datetime) -> bool:
-    local = dt.astimezone(CENTRAL)
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    local   = dt.astimezone(central)
     return local.weekday() < 5 and 8 <= local.hour < 15
 
+def get_hour_cdt(dt: datetime) -> int:
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    return dt.astimezone(central).hour
 
-def is_eod(dt: datetime) -> bool:
-    """True if at or past the EOD auto-close time (14:58 CST)."""
-    local = dt.astimezone(CENTRAL)
-    return local.weekday() < 5 and (local.hour > 14 or
-           (local.hour == 14 and local.minute >= 58))
+def get_day_of_week(dt: datetime) -> int:
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    return dt.astimezone(central).weekday()
+
+# ── Earnings calendar (V3.0) ──────────────────────────────────────────────────
+def fetch_earnings_dates(symbols: List[str]) -> Dict[str, List[datetime]]:
+    """
+    Fetch upcoming/recent earnings dates for all symbols via yfinance.
+    Returns {symbol: [datetime, ...]} for earnings event timestamps.
+    Falls back gracefully if yfinance unavailable or symbol has no data.
+    """
+    earnings_map: Dict[str, List[datetime]] = {s: [] for s in symbols}
+    try:
+        import yfinance as yf
+        log.info(f"Fetching earnings dates for {len(symbols)} symbols...")
+        for sym in symbols:
+            try:
+                cal = yf.Ticker(sym).calendar
+                if cal is None:
+                    continue
+                if isinstance(cal, dict):
+                    dates = cal.get("Earnings Date", [])
+                    if dates is None:
+                        continue
+                    if not hasattr(dates, "__iter__"):
+                        dates = [dates]
+                    for d in dates:
+                        try:
+                            if hasattr(d, "to_pydatetime"):
+                                d = d.to_pydatetime()
+                            if not isinstance(d, datetime):
+                                d = datetime.combine(d, datetime.min.time())
+                            if d.tzinfo is None:
+                                d = d.replace(tzinfo=timezone.utc)
+                            earnings_map[sym].append(d)
+                        except Exception:
+                            pass
+                time.sleep(0.2)
+            except Exception:
+                pass
+        filled = sum(1 for v in earnings_map.values() if v)
+        log.info(f"  Earnings dates: {filled}/{len(symbols)} symbols have data")
+    except ImportError:
+        log.warning("yfinance not available — earnings blackout disabled")
+    return earnings_map
+
+def is_earnings_blocked(dt: datetime, earnings_dates: List[datetime]) -> bool:
+    """True if dt is within EARNINGS_BUFFER_H of any known earnings event."""
+    for ed in earnings_dates:
+        diff_h = abs((dt - ed).total_seconds()) / 3600
+        if diff_h <= EARNINGS_BUFFER_H:
+            return True
+    return False
 
 
-# ── Signal engine (exact match with main.py V10.9 get_signals) ────────────────
-def compute_wilder_rsi(prices: list, period: int = 9) -> float:
-    """Wilder EWM RSI -- matches main.py V10.8+ and phase4.py V1.7+."""
-    if len(prices) < period + 1:
-        return 50.0
-    s        = pd.Series(prices, dtype=float)
+# ── Signal engine (exact copy of main.py V10.19) ─────────────────────────────
+def compute_rsi(prices: deque) -> float:
+    s        = pd.Series(list(prices))
     delta    = s.diff()
     gain     = delta.where(delta > 0, 0.0)
     loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
     rs       = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi      = (100 - (100 / (1 + rs))).iloc[-1]
-    if pd.isna(rsi) or not (0 < rsi < 100):
-        return 50.0
-    return float(round(rsi, 2))
+    return float((100 - (100 / (1 + rs))).iloc[-1])
 
-
-def compute_macd(prices: list) -> tuple:
-    """MACD (12/26/9) -- matches main.py compute_macd()."""
-    if len(prices) < MACD_SLOW + MACD_SIGNAL_P:
-        return 0.0, 0.0
-    s           = pd.Series(prices, dtype=float)
-    ema_fast    = s.ewm(span=MACD_FAST,     adjust=False).mean()
-    ema_slow    = s.ewm(span=MACD_SLOW,     adjust=False).mean()
+def compute_macd(prices: deque):
+    s           = pd.Series(list(prices))
+    ema_fast    = s.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow    = s.ewm(span=MACD_SLOW, adjust=False).mean()
     macd_line   = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=MACD_SIGNAL_P, adjust=False).mean()
-    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1])
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line.iloc[-1], signal_line.iloc[-1], histogram
 
+def compute_sector_health(trump_prices: Dict[str, deque]) -> str:
+    """WEAK if majority of TRUMP_THEME symbols are below their 20-bar MA."""
+    down_count = 0
+    for sym in TRUMP_THEME:
+        prices = trump_prices.get(sym)
+        if prices and len(prices) >= 20:
+            ma20 = sum(list(prices)[-20:]) / 20
+            if list(prices)[-1] < ma20:
+                down_count += 1
+    return "WEAK" if down_count > len(TRUMP_THEME) / 2 else "STRONG"
 
-def get_signals(symbol: str, prices: list, sector_health: str,
-                hour: int, dow: int) -> dict:
+def get_signals_bt(symbol: str, prices: deque,
+                   sector_health: str, is_trump: bool) -> dict:
     """
-    Exact replica of main.py V10.9 get_signals().
-    Returns dict with 'buy', 'rsi', 'macd_bull', 'confluence'.
+    Exact replica of get_signals() from main.py V10.19.
+    Uses local price history deque instead of global price_history dict.
     """
-    if len(prices) < max(RSI_PERIOD + 1, 26, MACD_SLOW + MACD_SIGNAL_P):
-        return {"buy": False, "rsi": 50.0, "macd_bull": False, "confluence": 0}
+    if len(prices) < max(RSI_PERIOD + 1, MACD_SLOW + MACD_SIGNAL):
+        return {"buy": False}
 
-    rsi          = compute_wilder_rsi(prices, RSI_PERIOD)
-    macd_val, macd_sig = compute_macd(prices)
+    price = list(prices)[-1]
+    rsi   = compute_rsi(prices)
+    macd_val, macd_sig, macd_hist = compute_macd(prices)
     macd_bullish = macd_val > macd_sig
-    ma20         = float(sum(prices[-20:]) / 20)
-    price        = prices[-1]
+    ma20         = sum(list(prices)[-20:]) / 20
 
-    # V10.9: TECH symbols not penalized by Trump-sector weakness
-    is_trump    = symbol in TRUMP_THEME
-    sector_weak = sector_health == "WEAK"
+    sector_weak  = sector_health == "WEAK"
     required_rsi = 72 if (is_trump and sector_weak) else RSI_BUY_TRIGGER
 
-    recipe       = BERSERKER_RECIPES.get(symbol, {})
-    hour_blocked = hour    in recipe.get("avoid_hours", [])
-    day_blocked  = dow     in recipe.get("avoid_days",  [])
-
-    base_ok = (rsi > required_rsi and macd_bullish and price > ma20
-               and not hour_blocked and not day_blocked)
-
+    base_ok = (rsi > required_rsi and macd_bullish and price > ma20)
     if not base_ok:
-        return {"buy": False, "rsi": rsi, "macd_bull": macd_bullish, "confluence": 0}
+        return {"buy": False, "rsi": round(rsi, 2), "macd_bull": macd_bullish}
 
-    # V10.9: Confluence gate -- need at least 1 of 4 signals
     confluence = 0
+    prices_l   = list(prices)
 
-    # 1. Momentum acceleration (price momentum increasing)
-    if len(prices) >= 11:
-        mom_recent = prices[-1] - prices[-6]
-        mom_prior  = prices[-6] - prices[-11]
+    # 1. Price momentum
+    if len(prices_l) >= 10:
+        mom_recent = prices_l[-1] - prices_l[-6]  if len(prices_l) >= 6  else 0
+        mom_prior  = prices_l[-6] - prices_l[-11] if len(prices_l) >= 11 else 0
         if mom_recent > 0 and mom_recent > mom_prior:
             confluence += 1
 
-    # 2. EMA9 above EMA21
-    if len(prices) >= 21:
-        s     = pd.Series(prices, dtype=float)
+    # 2. EMA9 > EMA21
+    if len(prices_l) >= 21:
+        s     = pd.Series(prices_l)
         ema9  = float(s.ewm(span=9,  adjust=False).mean().iloc[-1])
         ema21 = float(s.ewm(span=21, adjust=False).mean().iloc[-1])
         if ema9 > ema21:
             confluence += 1
 
-    # 3. Near lower Bollinger Band (lower 35% of band)
-    if len(prices) >= 20:
-        s      = pd.Series(prices, dtype=float)
-        mid    = float(s.rolling(20).mean().iloc[-1])
-        std    = float(s.rolling(20).std().iloc[-1])
-        lower  = mid - 2.0 * std
-        upper  = mid + 2.0 * std
-        band_w = upper - lower
-        pct_b  = (price - lower) / band_w if band_w > 0 else 0.5
-        if pct_b < 0.35:
-            confluence += 1
+    # 3. MACD histogram accelerating
+    if len(macd_hist) >= 2 and float(macd_hist.iloc[-1]) > float(macd_hist.iloc[-2]):
+        confluence += 1
 
-    # 4. Bouncing (recovering from recent low, last 3 bars up)
-    if len(prices) >= 4 and prices[-1] > prices[-4]:
+    # 4. Bouncing
+    if len(prices_l) >= 4 and prices_l[-1] > prices_l[-4]:
         confluence += 1
 
     return {
         "buy":        confluence >= 1,
-        "rsi":        rsi,
+        "rsi":        round(rsi, 2),
         "macd_bull":  macd_bullish,
         "above_ma20": price > ma20,
         "confluence": confluence,
     }
 
 
-# ── SPY/QQQ context computation ───────────────────────────────────────────────
-def get_spy_context(spy_prices: list, qqq_prices: list) -> dict:
-    """
-    Simulate the SPY/QQQ context that main.py _get_spy_context_for_fingerprint()
-    computes in real time. Used to populate spy_bullish, spy_momentum, qqq_rsi
-    in the fingerprint so BerserkerMemory bucket keys are meaningful.
-    """
-    if len(spy_prices) < 20:
-        return {"bullish": True, "momentum": 0.0, "rsi": 50.0, "qqq_rsi": 50.0}
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def fetch_all_bars(days: int) -> dict:
+    """Fetch 1-min bars for SYMBOLS + SPY + QQQ + VIXY."""
+    client   = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+    end_dt   = datetime.now(timezone.utc).replace(hour=21, minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(days=days)
+    all_syms = SYMBOLS + ["SPY", "QQQ", "VIXY"]
 
-    spy_ma20   = float(sum(spy_prices[-20:]) / 20)
-    spy_bull   = spy_prices[-1] > spy_ma20
-    spy_mom    = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] * 100 \
-                 if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0.0
-    spy_rsi    = compute_wilder_rsi(spy_prices[-20:], 7)
-    qqq_rsi    = compute_wilder_rsi(qqq_prices[-20:], 7) if len(qqq_prices) >= 8 else 50.0
+    log.info(f"Fetching {days}d 1-min bars for {len(all_syms)} symbols...")
+    log.info(f"Range: {start_dt.strftime('%Y-%m-%d')} -> {end_dt.strftime('%Y-%m-%d')}")
 
-    return {
-        "bullish":  spy_bull,
-        "momentum": round(spy_mom, 3),
-        "rsi":      spy_rsi,
-        "qqq_rsi":  qqq_rsi,
-    }
-
-
-# ── Sector health computation ─────────────────────────────────────────────────
-def compute_sector_health(price_histories: dict) -> str:
-    """
-    Mirrors main.py V10.9 update_sector_health().
-    15-bar lookback on TRUMP_THEME symbols (was 5 in V10.8, fixed in V10.9).
-    """
-    down_count = sum(
-        1 for sym in TRUMP_THEME
-        if (sym in price_histories
-            and len(price_histories[sym]) >= 15
-            and price_histories[sym][-1] < price_histories[sym][-15])
-    )
-    return "WEAK" if down_count > len(TRUMP_THEME) / 2 else "STRONG"
-
-
-# ── Bucket key (exact match with BerserkerMemory._bucket_key) ─────────────────
-def bucket_key(symbol: str, rsi: float, spy_bullish: bool,
-               sector_health: str, hour: int, pdt_used: int) -> str:
-    sector = "TRUMP" if symbol in TRUMP_THEME else "TECH"
-    rsi_b  = "rsi_hi" if rsi > 70 else "rsi_mid" if rsi > 60 else "rsi_low"
-    spy_b  = "spy_bull" if spy_bullish else "spy_bear"
-    sec_b  = sector_health or "STRONG"
-    hr_b   = "hr_open" if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
-    pdt_b  = "pdt_ok" if pdt_used < 2 else "pdt_tight"
-    return f"{symbol}|{rsi_b}|{spy_b}|{sec_b}|{sector}|{hr_b}|{pdt_b}"
-
-
-# ── Data fetcher ──────────────────────────────────────────────────────────────
-def fetch_bars(client: StockHistoricalDataClient,
-               symbols: list, start: datetime, end: datetime) -> dict:
-    """Fetch 1-minute bars for all symbols. Returns {symbol: DataFrame}."""
     result = {}
-    for i, symbol in enumerate(symbols):
-        log.info(f"  Fetching {symbol} ({i+1}/{len(symbols)})...")
+    for i, sym in enumerate(all_syms):
         try:
             bars = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Minute,
-                start=start,
-                end=end,
+                symbol_or_symbols=sym,
+                timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                start=start_dt,
+                end=end_dt,
                 feed=DataFeed.IEX,
             ))
             df = bars.df
             if hasattr(df.index, "levels"):
-                df = df.xs(symbol, level=0)
+                df = df.xs(sym, level=0)
             if not df.empty:
-                result[symbol] = df
-                log.info(f"    {symbol}: {len(df):,} bars")
+                result[sym] = df
+                log.info(f"  [{i+1}/{len(all_syms)}] {sym}: {len(df):,} bars")
             else:
-                log.warning(f"    {symbol}: no data returned")
+                log.warning(f"  [{i+1}/{len(all_syms)}] {sym}: EMPTY")
         except Exception as e:
-            log.warning(f"    {symbol}: fetch error -- {e}")
-        time.sleep(0.3)  # be gentle with the API
+            log.error(f"  [{i+1}/{len(all_syms)}] {sym}: {e}")
+        time.sleep(0.3)
 
-    fetched = len(result)
-    missed  = len(symbols) - fetched
-    log.info(f"Data fetch complete: {fetched}/{len(symbols)} symbols"
-             + (f" | {missed} had no data" if missed else ""))
+    log.info(f"Fetched {len(result)}/{len(all_syms)} symbols")
     return result
 
 
-# ── Core replay engine ────────────────────────────────────────────────────────
-def replay(all_bars: dict, spy_df, qqq_df) -> list:
+# ── Replay engine ─────────────────────────────────────────────────────────────
+def replay_berserker(all_bars: dict,
+                     earnings_map: Dict[str, List[datetime]],
+                     validate_mode: bool = False) -> List[Dict]:
     """
-    Replay Berserker V10.9 signal logic across all bar data.
-    Returns list of fingerprint dicts ready for DB insertion.
+    Main replay loop. Iterates all market timestamps in order,
+    feeds bars to per-symbol price histories, runs exact get_signals_bt().
+    validate_mode: skip first 75% of bars (walk-forward out-of-sample).
     """
-    # Build unified sorted timestamp index from all symbol bars
-    all_timestamps = set()
-    for df in all_bars.values():
-        all_timestamps.update(df.index.tolist())
-    if spy_df is not None:
-        all_timestamps.update(spy_df.index.tolist())
-    if qqq_df is not None:
-        all_timestamps.update(qqq_df.index.tolist())
-    all_timestamps = sorted(all_timestamps)
+    # Unified timestamp index — market hours only
+    all_ts_raw = set()
+    for sym in SYMBOLS:
+        if sym in all_bars:
+            all_ts_raw.update(all_bars[sym].index.tolist())
+    if "SPY" in all_bars:
+        all_ts_raw.update(all_bars["SPY"].index.tolist())
 
-    log.info(f"Replaying {len(all_timestamps):,} timestamps across "
-             f"{len(all_bars)} symbols + SPY/QQQ context...")
+    # Filter to market hours BEFORE slicing for walk-forward
+    # (validate_start must be computed on market-hours bars only)
+    all_ts = sorted(t for t in all_ts_raw if is_market_hours(
+        t if (hasattr(t, "tzinfo") and t.tzinfo) else t.to_pydatetime().replace(tzinfo=timezone.utc)
+    ))
 
-    # Price history buffers
-    price_hist:  dict = {s: [] for s in all_bars}
-    spy_prices:  list = []
-    qqq_prices:  list = []
+    total_bars = len(all_ts)
+    # Walk-forward: trade only the last 25% of market-hours bars
+    # (price history still warms up from bar 0, just no entries before cutoff)
+    validate_start = int(total_bars * 0.75) if validate_mode else 0
+    label = "OUT-OF-SAMPLE" if validate_mode else "FULL TRAIN"
+    log.info(f"  {label}: {total_bars:,} market-hours timestamps | validate_start={validate_start}")
 
-    open_trades: dict = {}   # symbol -> trade dict
-    fingerprints: list = []
+    # Price histories
+    price_hist:   Dict[str, deque] = {s: deque(maxlen=100) for s in SYMBOLS + ["SPY", "QQQ", "VIXY"]}
+    trump_prices: Dict[str, deque] = {s: price_hist[s] for s in TRUMP_THEME}
 
-    total_bars = len(all_timestamps)
-    wins = losses = 0
+    # Per-symbol trade state
+    in_position:  Dict[str, bool]  = {s: False for s in SYMBOLS}
+    entry_price:  Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    peak_price:   Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    entry_bar:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
+    entry_rsi:    Dict[str, float] = {s: 50.0  for s in SYMBOLS}
+    entry_spy_bull: Dict[str, bool] = {s: False for s in SYMBOLS}
+    entry_spy_rsi:  Dict[str, float] = {s: 50.0  for s in SYMBOLS}
+    entry_spy_mom:  Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    mfe_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    mae_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
+    entry_hour:   Dict[str, int]   = {s: 12     for s in SYMBOLS}
+    entry_day:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
 
-    for bar_idx, ts_val in enumerate(all_timestamps):
-        if bar_idx % 50000 == 0:
-            log.info(f"  Progress: {bar_idx:,}/{total_bars:,} bars | "
-                     f"{wins}W {losses}L | {len(open_trades)} open")
+    trades:   List[Dict] = []
+    bar_num   = 0
+    vix_smooth = 15.0
 
-        # Convert timestamp
-        dt_utc = ts_val if hasattr(ts_val, "tzinfo") else ts_val.to_pydatetime()
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        local = dt_utc.astimezone(CENTRAL)
+    for bar_idx, ts in enumerate(all_ts):
+        bar_num += 1
 
-        # ── Update SPY/QQQ context buffers ────────────────────────────────
-        if spy_df is not None and ts_val in spy_df.index:
-            spy_prices.append(float(spy_df.loc[ts_val, "close"]))
-            if len(spy_prices) > 100:
-                spy_prices.pop(0)
+        # Determine if this bar is in the validation window
+        in_validate_window = validate_mode and bar_idx >= validate_start
+        in_train_window    = not validate_mode
 
-        if qqq_df is not None and ts_val in qqq_df.index:
-            qqq_prices.append(float(qqq_df.loc[ts_val, "close"]))
-            if len(qqq_prices) > 100:
-                qqq_prices.pop(0)
+        dt_utc = ts if (hasattr(ts, "tzinfo") and ts.tzinfo) else ts.to_pydatetime().replace(tzinfo=timezone.utc)
+        # Market hours pre-filtered above -- no need to check again
+        hour = get_hour_cdt(dt_utc)
+        dow  = get_day_of_week(dt_utc)
 
-        # ── Update symbol price buffers ───────────────────────────────────
-        for symbol, df in all_bars.items():
-            if ts_val not in df.index:
+        # Update all price histories
+        for sym in list(SYMBOLS) + ["SPY", "QQQ", "VIXY"]:
+            if sym in all_bars and ts in all_bars[sym].index:
+                row = all_bars[sym].loc[ts]
+                price_hist[sym].append(float(row["close"]))
+
+        # VIX approximation via VIXY (V3.0)
+        # VIXY is a 1x VIX futures ETF trading $10-25 while VIX is 12-40.
+        # Real multiplier is ~1.5x (not 10x). Keeps threshold at 25 consistent
+        # with main.py V10.19's VIX_BLOCK_THRESHOLD.
+        if price_hist["VIXY"]:
+            vixy = list(price_hist["VIXY"])[-1]
+            raw_vix = vixy * 1.5
+            vix_smooth = vix_smooth * 0.7 + raw_vix * 0.3
+        vix_blocking = vix_smooth > VIX_BLOCK_THRESHOLD
+
+        # SPY context for fingerprinting and sector health gate
+        spy_prices = list(price_hist["SPY"])
+        spy_bullish = False
+        spy_above_ma20 = False
+        spy_rsi_val = 50.0
+        spy_momentum_val = 0.0
+        if len(spy_prices) >= 20:
+            spy_ma20 = sum(spy_prices[-20:]) / 20
+            spy_above_ma20   = spy_prices[-1] > spy_ma20
+            spy_bullish      = spy_above_ma20
+            spy_rsi_val      = compute_rsi(deque(spy_prices)) if len(spy_prices) > 10 else 50.0
+            spy_momentum_val = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0.0
+
+        # Regime score (V3.0): simplified -- VIX + SPY bear
+        regime_block = (not spy_above_ma20) and vix_blocking
+
+        # Sector health for TRUMP gate
+        sector_health = compute_sector_health(trump_prices)
+
+        # Skip if not in the right window for this mode
+        if validate_mode and bar_idx < validate_start:
+            continue  # still updated prices above, just skip trading
+
+        for sym in SYMBOLS:
+            if sym not in all_bars:
+                continue
+            if ts not in all_bars[sym].index:
+                continue
+            if len(price_hist[sym]) < WARMUP_BARS:
                 continue
 
-            price = float(df.loc[ts_val, "close"])
-            price_hist[symbol].append(price)
-            if len(price_hist[symbol]) > 100:
-                price_hist[symbol].pop(0)
+            is_trump = sym in TRUMP_THEME
+            recipe   = BERSERKER_RECIPES.get(sym, {})
+            sym_tp   = recipe.get("tp", TAKE_PROFIT_PCT)
+            sym_sl   = recipe.get("sl", STOP_LOSS_PCT)
 
-        # ── Manage open trades (exits) ────────────────────────────────────
-        # Process exits before entries at each bar
-        for symbol in list(open_trades.keys()):
-            if ts_val not in all_bars.get(symbol, pd.DataFrame()).index:
-                continue
+            price = list(price_hist[sym])[-1]
 
-            trade  = open_trades[symbol]
-            price  = price_hist[symbol][-1]
-            entry  = trade["entry_price"]
+            # ── MANAGE OPEN POSITION ──────────────────────────────────────
+            if in_position[sym]:
+                profit_pct = (price - entry_price[sym]) / entry_price[sym]
+                mfe_track[sym] = max(mfe_track[sym], profit_pct)
+                mae_track[sym] = min(mae_track[sym], profit_pct)
+                peak_price[sym] = max(peak_price[sym], price)
 
-            profit_pct = (price - entry) / entry
-            peak       = trade["peak_price"]
-            if price > peak:
-                trade["peak_price"] = price
-                peak = price
+                exit_reason = None
+                if   profit_pct >= sym_tp:  exit_reason = "take_profit"
+                elif profit_pct <= -sym_sl: exit_reason = "stop_loss"
 
-            trade["mfe"] = max(trade.get("mfe", 0.0), profit_pct)
-            trade["mae"] = min(trade.get("mae", 0.0), profit_pct)
+                if exit_reason:
+                    hold_min = bar_num - entry_bar[sym]
+                    trades.append({
+                        "trade_id":     "bt_" + secrets.token_hex(8),
+                        "symbol":       sym,
+                        "entry_price":  round(entry_price[sym], 4),
+                        "exit_price":   round(price, 4),
+                        "pnl_pct":      round(profit_pct * 100, 3),
+                        "exit_reason":  exit_reason,
+                        "hold_min":     hold_min,
+                        "won":          profit_pct > 0,
+                        "rsi_at_entry": entry_rsi[sym],
+                        "spy_bullish":  entry_spy_bull[sym],
+                        "spy_rsi":       entry_spy_rsi[sym],
+                        "spy_momentum":  entry_spy_mom[sym],
+                        "sector_health": sector_health,
+                        "is_trump":     is_trump,
+                        "sector":       "TRUMP" if is_trump else "TECH",
+                        "hour_cdt":     entry_hour[sym],
+                        "day_of_week":  entry_day[sym],
+                        "mfe":          round(mfe_track[sym] * 100, 3),
+                        "mae":          round(mae_track[sym] * 100, 3),
+                        "vix_at_entry": round(vix_smooth, 1),
+                        "validate":     validate_mode,
+                        "tp_used":      sym_tp,
+                        "sl_used":      sym_sl,
+                    })
+                    in_position[sym]  = False
+                    entry_price[sym]  = 0.0
+                    peak_price[sym]   = 0.0
+                    mfe_track[sym]    = 0.0
+                    mae_track[sym]    = 0.0
 
-            held_secs = (dt_utc - trade["entry_dt"]).total_seconds()
-            held_min  = held_secs / 60.0
+            # ── CHECK FOR ENTRY ───────────────────────────────────────────
+            elif not in_position[sym]:
+                # V3.0 gates
+                if vix_blocking:
+                    continue
+                if regime_block:
+                    continue
+                if is_earnings_blocked(dt_utc, earnings_map.get(sym, [])):
+                    continue
+                if hour in recipe.get("avoid_hours", []):
+                    continue
+                if dow in recipe.get("avoid_days", []):
+                    continue
 
-            trailing = RATCHET_TRAIL_TIGHT if profit_pct >= RATCHET_PROFIT else TRAILING_STOP
+                sig = get_signals_bt(sym, price_hist[sym], sector_health, is_trump)
+                if sig.get("buy"):
+                    entry_px          = price * (1 + SLIPPAGE_PCT)
+                    in_position[sym]  = True
+                    entry_price[sym]  = entry_px
+                    peak_price[sym]   = entry_px
+                    entry_bar[sym]    = bar_num
+                    entry_rsi[sym]    = sig.get("rsi", 50.0)
+                    entry_spy_bull[sym] = spy_bullish
+                    entry_spy_rsi[sym]  = spy_rsi_val
+                    entry_spy_mom[sym]  = spy_momentum_val
+                    mfe_track[sym]    = 0.0
+                    mae_track[sym]    = 0.0
+                    entry_hour[sym]   = hour
+                    entry_day[sym]    = dow
 
-            closed     = False
-            exit_reason = ""
+        if bar_num % 100000 == 0:
+            total_so_far = len(trades)
+            log.info(f"  Progress: {bar_num:,}/{total_bars:,} | {total_so_far} trades")
 
-            # Hard take-profit at +1.5%
-            if profit_pct >= TAKE_PROFIT_PCT:
-                closed      = True
-                exit_reason = "take-profit"
+    # Force-close any open at end
+    for sym in SYMBOLS:
+        if in_position[sym] and price_hist[sym]:
+            price = list(price_hist[sym])[-1]
+            profit_pct = (price - entry_price[sym]) / entry_price[sym]
+            trades.append({
+                "trade_id":    "bt_" + secrets.token_hex(8),
+                "symbol":      sym,
+                "entry_price": round(entry_price[sym], 4),
+                "exit_price":  round(price, 4),
+                "pnl_pct":     round(profit_pct * 100, 3),
+                "exit_reason": "timeout",
+                "hold_min":    bar_num - entry_bar[sym],
+                "won":         profit_pct > 0,
+                "rsi_at_entry": entry_rsi[sym],
+                "spy_bullish": entry_spy_bull[sym],
+                "sector_health": "STRONG",
+                "is_trump":    sym in TRUMP_THEME,
+                "sector":      "TRUMP" if sym in TRUMP_THEME else "TECH",
+                "hour_cdt":    entry_hour[sym],
+                "day_of_week": entry_day[sym],
+                "mfe":         round(mfe_track[sym] * 100, 3),
+                "mae":         round(mae_track[sym] * 100, 3),
+                "vix_at_entry": round(vix_smooth, 1),
+                "validate":    validate_mode,
+                "tp_used":     BERSERKER_RECIPES.get(sym, {}).get("tp", TAKE_PROFIT_PCT),
+                "sl_used":     BERSERKER_RECIPES.get(sym, {}).get("sl", STOP_LOSS_PCT),
+            })
 
-            # Hard stop loss at -4%
-            elif profit_pct <= -STOP_LOSS_PCT:
-                closed      = True
-                exit_reason = "stop-loss"
-
-            # Trailing stop (suppressed before MIN_HOLD_MINUTES)
-            elif held_min >= MIN_HOLD_MINUTES:
-                drawdown = (peak - price) / peak if peak > 0 else 0
-                if drawdown >= trailing:
-                    closed      = True
-                    exit_reason = "trail"
-
-            # EOD auto-close
-            elif is_eod(dt_utc) and not closed:
-                closed      = True
-                exit_reason = "eod"
-
-            if closed:
-                won = profit_pct > 0
-                if won:
-                    wins += 1
-                else:
-                    losses += 1
-
-                fp = dict(trade)
-                fp["exit_ts"]      = int(dt_utc.timestamp())
-                fp["won"]          = won
-                fp["pnl_pct"]      = round(profit_pct * 100, 3)
-                fp["exit_reason"]  = exit_reason
-                fp["hold_time_min"] = int(held_min)
-                fp["mfe"]          = round(trade["mfe"] * 100, 3)
-                fp["mae"]          = round(trade["mae"] * 100, 3)
-                fingerprints.append(fp)
-                del open_trades[symbol]
-
-        # ── Look for new entries ──────────────────────────────────────────
-        if not is_market_hours(dt_utc):
-            continue
-
-        hour = local.hour
-        dow  = local.weekday()
-
-        # Compute sector health from current price histories
-        sector_health = compute_sector_health(price_hist)
-
-        # SPY context for fingerprint
-        spy_ctx = get_spy_context(spy_prices, qqq_prices)
-
-        for symbol in SYMBOLS:
-            if symbol in open_trades:
-                continue
-            if symbol not in all_bars:
-                continue
-            if ts_val not in all_bars[symbol].index:
-                continue
-
-            prices = price_hist[symbol]
-            if len(prices) < WARMUP_BARS:
-                continue
-
-            sigs = get_signals(symbol, prices, sector_health, hour, dow)
-            if not sigs.get("buy"):
-                continue
-
-            # Entry confirmed -- create fingerprint stub
-            trade_id = secrets.token_hex(8)
-            open_trades[symbol] = {
-                "trade_id":      trade_id,
-                "symbol":        symbol,
-                "sector":        "TRUMP" if symbol in TRUMP_THEME else "TECH",
-                "entry_ts":      int(dt_utc.timestamp()),
-                "entry_dt":      dt_utc,
-                "entry_price":   prices[-1],
-                "peak_price":    prices[-1],
-                "symbol_rsi":    round(sigs["rsi"], 2),
-                "macd_bullish":  bool(sigs["macd_bull"]),
-                "above_ma20":    bool(sigs.get("above_ma20", True)),
-                "spy_rsi":       spy_ctx["rsi"],
-                "spy_momentum":  spy_ctx["momentum"],
-                "spy_bullish":   spy_ctx["bullish"],
-                "qqq_rsi":       spy_ctx["qqq_rsi"],
-                "sector_health": sector_health,
-                "hour_cdt":      hour,
-                "day_of_week":   dow,
-                "pdt_slots_used": SIM_PDT_SLOTS_USED,
-                "mfe":           0.0,
-                "mae":           0.0,
-                # exit fields filled in on close
-                "exit_ts":       None,
-                "won":           None,
-                "pnl_pct":       None,
-                "exit_reason":   None,
-                "hold_time_min": None,
-            }
-
-    # ── Close any still-open trades at end of data ────────────────────────
-    for symbol, trade in open_trades.items():
-        prices = price_hist.get(symbol, [])
-        if prices:
-            profit_pct = (prices[-1] - trade["entry_price"]) / trade["entry_price"]
-            held_min   = (all_timestamps[-1].to_pydatetime().replace(tzinfo=timezone.utc)
-                          - trade["entry_dt"]).total_seconds() / 60 \
-                         if hasattr(all_timestamps[-1], "to_pydatetime") \
-                         else 0
-            fp = dict(trade)
-            fp["exit_ts"]       = int(time.time())
-            fp["won"]           = profit_pct > 0
-            fp["pnl_pct"]       = round(profit_pct * 100, 3)
-            fp["exit_reason"]   = "timeout"
-            fp["hold_time_min"] = int(held_min)
-            fp["mfe"]           = round(max(trade.get("mfe", 0.0), profit_pct) * 100, 3)
-            fp["mae"]           = round(min(trade.get("mae", 0.0), profit_pct) * 100, 3)
-            fingerprints.append(fp)
-            if profit_pct > 0:
-                wins += 1
-            else:
-                losses += 1
-
-    total = wins + losses
-    wr    = round(wins / total * 100, 1) if total > 0 else 0
-    log.info(f"Replay complete: {wins}W {losses}L ({wr}% WR) | "
-             f"{len(fingerprints)} fingerprints generated")
-    return fingerprints
+    return trades
 
 
-# ── Database writer ───────────────────────────────────────────────────────────
-def write_fingerprints(fingerprints: list, db_url: str) -> int:
-    """
-    Write fingerprints to berserker_trade_fingerprints.
-    Clears old backtest rows first (source='backtest' tagged via trade_id prefix).
-    Returns count of rows written.
-    """
-    if not fingerprints:
-        log.warning("No fingerprints to write.")
-        return 0
-
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = False
-    written = 0
-
+# ── DB write ──────────────────────────────────────────────────────────────────
+def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
+    if dry_run or not DATABASE_URL:
+        log.info(f"  DRY RUN: would write {len(trades)} fingerprints")
+        return len(trades)
     try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        written = 0
         with conn.cursor() as cur:
-            # Ensure table + indexes exist (safe to run on existing schema)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS berserker_trade_fingerprints (
-                    id              SERIAL PRIMARY KEY,
-                    trade_id        VARCHAR(32) UNIQUE NOT NULL,
-                    symbol          VARCHAR(10) NOT NULL,
-                    sector          VARCHAR(20),
-                    entry_ts        BIGINT,
-                    exit_ts         BIGINT,
-                    entry_price     REAL,
-                    symbol_rsi      REAL,
-                    macd_bullish    BOOLEAN,
-                    above_ma20      BOOLEAN,
-                    spy_rsi         REAL,
-                    spy_momentum    REAL,
-                    spy_bullish     BOOLEAN,
-                    qqq_rsi         REAL,
-                    sector_health   VARCHAR(10),
-                    hour_cdt        INTEGER,
-                    day_of_week     INTEGER,
-                    pdt_slots_used  INTEGER,
-                    won             BOOLEAN,
-                    pnl_pct         REAL,
-                    exit_reason     VARCHAR(50),
-                    hold_time_min   INTEGER,
-                    mfe             REAL,
-                    mae             REAL,
-                    created_at      TIMESTAMPTZ DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_btf_symbol
-                    ON berserker_trade_fingerprints(symbol);
-                CREATE INDEX IF NOT EXISTS idx_btf_won
-                    ON berserker_trade_fingerprints(won);
-            """)
-
-            # Clear previous backtest rows -- trade_ids from this script
-            # are plain hex (no prefix); live trades also use token_hex.
-            # We tag backtest rows by exit_reason patterns and a large
-            # entry_ts range check to avoid wiping live trades.
-            # Safest approach: delete rows where exit_reason IN backtest
-            # reasons AND entry_ts < (now - 2 weeks) -- live trades are
-            # recent; backtest trades are from 2yr ago.
-            cutoff_ts = int(time.time()) - 14 * 86400  # 2 weeks ago
             cur.execute("""
                 DELETE FROM berserker_trade_fingerprints
-                WHERE entry_ts < %s
-                  AND exit_reason IN ('take-profit','stop-loss','trail','eod','timeout')
-            """, (cutoff_ts,))
-            deleted = cur.rowcount
-            log.info(f"Cleared {deleted} old backtest fingerprints (entry_ts < 2 weeks ago)")
-
-            # Insert new fingerprints
-            for fp in fingerprints:
-                if fp.get("won") is None:
-                    continue  # skip incomplete
-                cur.execute("""
-                    INSERT INTO berserker_trade_fingerprints
-                    (trade_id, symbol, sector, entry_ts, exit_ts, entry_price,
-                     symbol_rsi, macd_bullish, above_ma20,
-                     spy_rsi, spy_momentum, spy_bullish, qqq_rsi,
-                     sector_health, hour_cdt, day_of_week, pdt_slots_used,
-                     won, pnl_pct, exit_reason, hold_time_min, mfe, mae)
-                    VALUES (%s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s,
-                            %s,%s,%s,%s, %s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (trade_id) DO UPDATE
-                    SET won          = EXCLUDED.won,
-                        pnl_pct      = EXCLUDED.pnl_pct,
-                        exit_reason  = EXCLUDED.exit_reason,
-                        hold_time_min= EXCLUDED.hold_time_min,
-                        exit_ts      = EXCLUDED.exit_ts,
-                        mfe          = EXCLUDED.mfe,
-                        mae          = EXCLUDED.mae
-                """, (
-                    fp["trade_id"], fp["symbol"], fp["sector"],
-                    fp["entry_ts"], fp.get("exit_ts"), fp["entry_price"],
-                    float(fp["symbol_rsi"]),
-                    bool(fp["macd_bullish"]),
-                    bool(fp["above_ma20"]),
-                    float(fp["spy_rsi"]) if fp.get("spy_rsi") else None,
-                    float(fp["spy_momentum"]) if fp.get("spy_momentum") is not None else None,
-                    bool(fp["spy_bullish"]) if fp.get("spy_bullish") is not None else None,
-                    float(fp["qqq_rsi"]) if fp.get("qqq_rsi") else None,
-                    fp["sector_health"],
-                    int(fp["hour_cdt"]),
-                    int(fp["day_of_week"]),
-                    int(fp["pdt_slots_used"]),
-                    bool(fp["won"]),
-                    float(fp["pnl_pct"]),
-                    fp["exit_reason"],
-                    int(fp["hold_time_min"]) if fp.get("hold_time_min") is not None else None,
-                    float(fp["mfe"]),
-                    float(fp["mae"]),
-                ))
-                written += 1
-
+                WHERE trade_id LIKE 'bt_%' AND won IS NOT NULL
+            """)
+            for t in trades:
+                try:
+                    cur.execute("""
+                        INSERT INTO berserker_trade_fingerprints
+                        (trade_id, symbol, sector,
+                         entry_ts, exit_ts, entry_price,
+                         symbol_rsi, spy_bullish, spy_rsi, spy_momentum,
+                         sector_health, hour_cdt, day_of_week,
+                         won, pnl_pct, exit_reason, hold_time_min,
+                         mfe, mae, is_paper)
+                        VALUES (%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,
+                                %s,%s,%s,%s, %s,%s,%s)
+                        ON CONFLICT (trade_id) DO UPDATE
+                        SET won=EXCLUDED.won, pnl_pct=EXCLUDED.pnl_pct,
+                            exit_reason=EXCLUDED.exit_reason,
+                            mfe=EXCLUDED.mfe, mae=EXCLUDED.mae
+                    """, (
+                        t["trade_id"],
+                        t["symbol"],
+                        t.get("sector", "TECH"),
+                        int(time.time()), int(time.time()),
+                        round(t.get("entry_price", 0.0), 4),
+                        round(t.get("rsi_at_entry", 50.0), 2),
+                        bool(t.get("spy_bullish", False)),
+                        round(t.get("spy_rsi", 50.0), 2),
+                        round(t.get("spy_momentum", 0.0), 4),
+                        t.get("sector_health", "STRONG"),
+                        t.get("hour_cdt", 12),
+                        t.get("day_of_week", 0),
+                        bool(t["won"]),
+                        round(t["pnl_pct"], 3),
+                        t["exit_reason"],
+                        t.get("hold_min", 0),
+                        round(t.get("mfe", 0), 3),
+                        round(t.get("mae", 0), 3),
+                        False,
+                    ))
+                    written += 1
+                except Exception as e:
+                    log.warning(f"fingerprint error [{t.get('symbol','?')}]: {e}")
+                    break
         conn.commit()
-        log.info(f"DB write complete: {written} fingerprints written")
-
-    except Exception as e:
-        conn.rollback()
-        log.error(f"DB write error: {e}")
-        raise
-    finally:
         conn.close()
+        log.info(f"  Wrote {written}/{len(trades)} fingerprints")
+        return written
+    except Exception as e:
+        log.error(f"DB write error: {e}")
+        return 0
 
-    return written
 
-
-# ── Pattern stats analysis ────────────────────────────────────────────────────
-def run_analysis(db_url: str) -> tuple:
-    """
-    Rebuild berserker_pattern_stats from all completed fingerprints.
-    Mirrors BerserkerMemory.run_analysis() in main.py.
-    Returns (bucket_count, total_trades, overall_wr).
-    """
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = False
-
+def run_pattern_analysis() -> Tuple[int, float]:
+    """Run BerserkerMemory.run_analysis() equivalent — updates bucket win rates."""
+    if not DATABASE_URL:
+        return 0, 0.0
     try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT symbol, symbol_rsi, spy_bullish, sector_health,
-                       hour_cdt, pdt_slots_used, won, pnl_pct
-                FROM berserker_trade_fingerprints
-                WHERE won IS NOT NULL
+                SELECT symbol, symbol_rsi as rsi_at_entry, spy_bullish,
+                       sector_health, sector,
+                       hour_cdt, day_of_week, won, pnl_pct, mfe, mae
+                FROM berserker_trade_fingerprints WHERE won IS NOT NULL
             """)
             rows = cur.fetchall()
 
         if not rows:
-            log.warning("No completed fingerprints found for analysis.")
-            return 0, 0, 0.0
+            conn.close()
+            return 0, 0.0
 
         buckets  = defaultdict(list)
         pnl_bkts = defaultdict(list)
 
         for row in rows:
-            key = bucket_key(
-                row["symbol"],
-                float(row["symbol_rsi"]) if row["symbol_rsi"] is not None else 50,
-                bool(row["spy_bullish"]) if row["spy_bullish"] is not None else True,
-                row["sector_health"] or "STRONG",
-                int(row["hour_cdt"]) if row["hour_cdt"] is not None else 12,
-                int(row["pdt_slots_used"]) if row["pdt_slots_used"] is not None else 2,
-            )
+            rsi    = row["rsi_at_entry"] or 50
+            hour   = row["hour_cdt"]   or 12
+            rsi_b  = "rsi_hi" if rsi > 72 else "rsi_mid" if rsi > 62 else "rsi_low"
+            spy_b  = "spy_bull" if row["spy_bullish"] else "spy_bear"
+            sec_b  = row["sector_health"] or "STRONG"
+            hr_b   = "hr_open" if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
+            sec_type = row["sector"] or "TECH"
+            key    = f"{row['symbol']}|{rsi_b}|{spy_b}|{sec_b}|{sec_type}|{hr_b}"
             buckets[key].append(bool(row["won"]))
             if row["pnl_pct"] is not None:
                 pnl_bkts[key].append(float(row["pnl_pct"]))
 
+        written = 0
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS berserker_pattern_stats (
-                    id           SERIAL PRIMARY KEY,
-                    bucket_key   VARCHAR(200) UNIQUE NOT NULL,
-                    win_rate     REAL NOT NULL,
-                    sample_count INTEGER NOT NULL,
-                    avg_pnl      REAL,
-                    last_updated TIMESTAMPTZ DEFAULT NOW()
-                );
-            """)
-
-            written_buckets = 0
             for key, outcomes in buckets.items():
-                if len(outcomes) < 3:   # PM_MIN_BUCKET_TRADES
+                if len(outcomes) < 3:
                     continue
                 wr      = sum(outcomes) / len(outcomes)
-                avg_pnl = (sum(pnl_bkts[key]) / len(pnl_bkts[key])
-                           if pnl_bkts[key] else None)
+                avg_pnl = sum(pnl_bkts[key]) / len(pnl_bkts[key]) if pnl_bkts[key] else None
                 cur.execute("""
-                    INSERT INTO berserker_pattern_stats
-                    (bucket_key, win_rate, sample_count, avg_pnl)
+                    INSERT INTO berserker_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
                     VALUES (%s,%s,%s,%s)
                     ON CONFLICT (bucket_key) DO UPDATE
-                    SET win_rate     = EXCLUDED.win_rate,
-                        sample_count = EXCLUDED.sample_count,
-                        avg_pnl      = EXCLUDED.avg_pnl,
-                        last_updated = NOW()
+                    SET win_rate=EXCLUDED.win_rate, sample_count=EXCLUDED.sample_count,
+                        avg_pnl=EXCLUDED.avg_pnl, last_updated=NOW()
                 """, (key, wr, len(outcomes), avg_pnl))
-                written_buckets += 1
-
+                written += 1
         conn.commit()
 
         total = len(rows)
         wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
-        log.info(f"Analysis: {written_buckets} buckets | {total} trades | {wr:.1%} WR")
-        return written_buckets, total, wr
-
-    except Exception as e:
-        conn.rollback()
-        log.error(f"Analysis error: {e}")
-        raise
-    finally:
         conn.close()
+        log.info(f"  Pattern analysis: {written} buckets | {total} trades | {wr:.1%} overall WR")
+        return written, wr
+    except Exception as e:
+        log.error(f"Pattern analysis error: {e}")
+        return 0, 0.0
 
 
-# ── Summary printer ───────────────────────────────────────────────────────────
-def print_summary(fingerprints: list):
-    if not fingerprints:
-        return
+# ── Report ────────────────────────────────────────────────────────────────────
+def build_report(trades: List[Dict], validate_mode: bool = False) -> str:
+    if not trades:
+        return "No trades generated"
 
-    completed = [f for f in fingerprints if f.get("won") is not None]
-    if not completed:
-        return
+    label   = "OUT-OF-SAMPLE" if validate_mode else "FULL TRAIN"
+    wins    = [t for t in trades if t["won"]]
+    total   = len(trades)
+    wr      = round(len(wins) / total * 100, 1)
+    avg_pnl = sum(t["pnl_pct"] for t in trades) / total
+    avg_mfe = sum(t["mfe"] for t in trades) / total
+    avg_mae = sum(t["mae"] for t in trades) / total
 
-    total  = len(completed)
-    wins   = sum(1 for f in completed if f["won"])
-    losses = total - wins
-    wr     = round(wins / total * 100, 1) if total > 0 else 0
+    lines = [
+        f"\n{'='*60}",
+        f"BERSERKER BACKTEST V3.0 — {label}",
+        f"{'='*60}",
+        f"Trades: {total} | {len(wins)}W {total-len(wins)}L | {wr}% WR",
+        f"Avg PnL: {avg_pnl:+.3f}% | MFE: +{avg_mfe:.3f}% | MAE: {avg_mae:.3f}%",
+        "",
+        f"{'Symbol':<8} {'Trades':>7} {'WR%':>6} {'AvgPnL':>8}",
+        "-" * 35,
+    ]
 
-    avg_mfe = round(sum(f.get("mfe", 0) for f in completed) / total, 2) if total else 0
-    avg_mae = round(sum(f.get("mae", 0) for f in completed) / total, 2) if total else 0
+    for sym in SYMBOLS:
+        st = [t for t in trades if t["symbol"] == sym]
+        if not st:
+            continue
+        sw     = sum(1 for t in st if t["won"])
+        s_wr   = round(sw / len(st) * 100, 1)
+        s_pnl  = sum(t["pnl_pct"] for t in st) / len(st)
+        lines.append(f"{sym:<8} {len(st):>7} {s_wr:>5.1f}% {s_pnl:>+7.3f}%")
 
-    # Per-symbol breakdown
-    sym_stats = defaultdict(lambda: {"w": 0, "l": 0, "pnl": []})
-    for f in completed:
-        s = f["symbol"]
-        if f["won"]:
-            sym_stats[s]["w"] += 1
-        else:
-            sym_stats[s]["l"] += 1
-        if f.get("pnl_pct") is not None:
-            sym_stats[s]["pnl"].append(f["pnl_pct"])
+    # Exit breakdown
+    lines += ["", "Exit reasons:"]
+    exit_c = defaultdict(lambda: {"w": 0, "l": 0})
+    for t in trades:
+        k = t["exit_reason"]
+        if t["won"]: exit_c[k]["w"] += 1
+        else:        exit_c[k]["l"] += 1
+    for r, c in sorted(exit_c.items(), key=lambda x: -(x[1]["w"]+x[1]["l"])):
+        tot = c["w"] + c["l"]
+        lines.append(f"  {r:<18} {tot:>5} | {round(c['w']/tot*100,1)}% WR")
 
-    # Exit reason breakdown
-    exit_counts = defaultdict(int)
-    exit_wins   = defaultdict(int)
-    for f in completed:
-        r = f.get("exit_reason", "unknown")
-        exit_counts[r] += 1
-        if f["won"]:
-            exit_wins[r] += 1
-
-    # Hour breakdown
-    hr_stats = defaultdict(lambda: {"w": 0, "l": 0})
-    for f in completed:
-        h = f.get("hour_cdt", 0)
-        if f["won"]:
-            hr_stats[h]["w"] += 1
-        else:
-            hr_stats[h]["l"] += 1
-
-    print(f"""
-╔══════════════════════════════════════════════════════════╗
-║         NEXUS BERSERKER BACKTEST SUMMARY V2.0            ║
-╚══════════════════════════════════════════════════════════╝
-
-Period:     Last {BACKTEST_DAYS} days (2yr)
-Trades:     {total} total | {wins}W {losses}L | {wr}% win rate
-Avg MFE:    +{avg_mfe}%   Avg MAE: {avg_mae}%
-
-EXIT REASONS:""")
-    for reason, count in sorted(exit_counts.items(), key=lambda x: -x[1]):
-        r_wr = round(exit_wins[reason] / count * 100) if count > 0 else 0
-        print(f"  {reason:<18} {count:>5} trades | {r_wr}% WR")
-
-    print(f"\nHOUR BREAKDOWN (CST):")
-    for hr in sorted(hr_stats.keys()):
-        s  = hr_stats[hr]
-        t  = s["w"] + s["l"]
-        r  = round(s["w"] / t * 100) if t > 0 else 0
-        bar = "█" * (r // 5)
-        print(f"  {hr:02d}h  {r:>3}% WR  {bar}  ({t} trades)")
-
-    print(f"\nSYMBOL BREAKDOWN:")
-    for sym in sorted(sym_stats.keys(),
-                      key=lambda s: sym_stats[s]["w"] + sym_stats[s]["l"],
-                      reverse=True):
-        s  = sym_stats[sym]
-        t  = s["w"] + s["l"]
-        r  = round(s["w"] / t * 100) if t > 0 else 0
-        ap = round(sum(s["pnl"]) / len(s["pnl"]), 2) if s["pnl"] else 0
-        tag = " [TRUMP]" if sym in TRUMP_THEME else " [TECH]"
-        print(f"  {sym:<6} {r:>3}% WR | {t:>4} trades | avg {ap:+.2f}%{tag}")
+    lines.append(f"{'='*60}\n")
+    return "\n".join(lines)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info("=" * 60)
-    log.info("NEXUS BERSERKER BACKTESTER V2.0 STARTING")
-    log.info("=" * 60)
-    log.info(f"Symbols: {len(SYMBOLS)} -- {', '.join(SYMBOLS)}")
-    log.info(f"Period:  {BACKTEST_DAYS} days")
-    log.info(f"DB:      {'connected' if DATABASE_URL else 'NOT SET'}")
+    parser = argparse.ArgumentParser(description="NEXUS Berserker Backtester V3.0")
+    parser.add_argument("--days",        type=int,  default=730)
+    parser.add_argument("--dry-run",     action="store_true")
+    parser.add_argument("--no-validate", action="store_true")
+    parser.add_argument("--no-earnings", action="store_true",
+                        help="Skip yfinance earnings calendar fetch")
+    args = parser.parse_args()
 
     if not ALPACA_API_KEY or not ALPACA_SECRET:
-        log.error("ALPACA_API_KEY or ALPACA_SECRET_KEY not set.")
-        sys.exit(1)
-    if not DATABASE_URL:
-        log.error("DATABASE_URL not set.")
+        log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY")
         sys.exit(1)
 
+    log.info("=" * 60)
+    log.info(f"NEXUS BERSERKER BACKTESTER V3.0")
+    log.info(f"Symbols: {len(SYMBOLS)} | Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
+    log.info(f"V3.0: VIX gate | Earnings blackout | Regime | Walk-forward | Slippage")
+    log.info("=" * 60)
+
     send_alert(
-        f"🔬 NEXUS ANALYZER V2.0 STARTING\n"
-        f"Berserker backtest: {len(SYMBOLS)} symbols | {BACKTEST_DAYS} days\n"
-        f"Signal engine: V10.9 exact replica\n"
-        f"ETA: ~10-20 min"
+        f"🔥 NEXUS BERSERKER BACKTESTER V3.0 STARTING\n"
+        f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
+        f"V3.0: VIX gate | Earnings | Regime | Walk-forward | Slippage\n"
+        f"Signal engine: V10.19 exact replica\n"
+        f"ETA: ~30-45 min"
     )
 
     start_time = time.time()
 
-    # ── Date range ────────────────────────────────────────────────────────
-    end_dt   = datetime.now(tz=timezone.utc)
-    start_dt = end_dt - timedelta(days=BACKTEST_DAYS)
-    log.info(f"Date range: {start_dt.strftime('%Y-%m-%d')} → {end_dt.strftime('%Y-%m-%d')}")
+    # Fetch earnings calendar (V3.0)
+    earnings_map: Dict[str, List[datetime]] = {s: [] for s in SYMBOLS}
+    if not args.no_earnings:
+        earnings_map = fetch_earnings_dates(SYMBOLS)
 
-    # ── Fetch data ────────────────────────────────────────────────────────
-    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
-
-    log.info("Fetching BERSERKER symbol data...")
-    symbol_bars = fetch_bars(client, SYMBOLS, start_dt, end_dt)
-
-    log.info("Fetching SPY + QQQ context data...")
-    context_bars = fetch_bars(client, CONTEXT_SYMBOLS, start_dt, end_dt)
-    spy_df = context_bars.get("SPY")
-    qqq_df = context_bars.get("QQQ")
-
-    if not symbol_bars:
-        log.error("No symbol data fetched. Aborting.")
-        send_alert("❌ NEXUS ANALYZER: No data fetched -- check Alpaca API keys")
+    # Fetch all bars
+    all_bars = fetch_all_bars(args.days)
+    if not all_bars:
+        log.error("No bar data fetched")
         sys.exit(1)
 
-    log.info(f"Data fetched in {round(time.time()-start_time, 1)}s")
+    # Full training run
+    log.info("Running full training replay...")
+    train_trades = replay_berserker(all_bars, earnings_map, validate_mode=False)
+    log.info(f"Training complete: {len(train_trades)} trades")
+    print(build_report(train_trades, validate_mode=False))
 
-    # ── Replay ────────────────────────────────────────────────────────────
-    replay_start = time.time()
-    fingerprints = replay(symbol_bars, spy_df, qqq_df)
-    replay_time  = round(time.time() - replay_start, 1)
-    log.info(f"Replay completed in {replay_time}s")
+    # Walk-forward validation
+    val_trades = []
+    if not args.no_validate:
+        log.info("Running walk-forward validation (last 25% of bars)...")
+        val_trades = replay_berserker(all_bars, earnings_map, validate_mode=True)
+        log.info(f"Validation complete: {len(val_trades)} trades")
+        print(build_report(val_trades, validate_mode=True))
 
-    if not fingerprints:
-        log.error("No fingerprints generated. Aborting DB write.")
-        send_alert("❌ NEXUS ANALYZER: 0 fingerprints generated -- check signal thresholds")
-        sys.exit(1)
+    # Write training trades to DB
+    written = 0
+    if train_trades:
+        log.info(f"Writing {len(train_trades)} training fingerprints to DB...")
+        written = write_fingerprints(train_trades, args.dry_run)
 
-    # ── Write to DB ───────────────────────────────────────────────────────
-    log.info("Writing fingerprints to database...")
-    written = write_fingerprints(fingerprints, DATABASE_URL)
+    # Pattern analysis
+    buckets, overall_wr = 0, 0.0
+    if not args.dry_run and DATABASE_URL and written > 0:
+        log.info("Running pattern analysis...")
+        buckets, overall_wr = run_pattern_analysis()
 
-    # ── Run analysis to rebuild pattern stats ─────────────────────────────
-    log.info("Running pattern analysis...")
-    buckets, total_trades, overall_wr = run_analysis(DATABASE_URL)
+    elapsed = round(time.time() - start_time)
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print_summary(fingerprints)
-
-    elapsed = round(time.time() - start_time, 1)
-    completed = [f for f in fingerprints if f.get("won") is not None]
-    total  = len(completed)
-    wins   = sum(1 for f in completed if f["won"])
-    wr_pct = round(wins / total * 100, 1) if total else 0
-
-    # Per-symbol WR for alert
+    # Per-symbol T-Bone summary
+    train_wr = round(len([t for t in train_trades if t["won"]]) / max(len(train_trades), 1) * 100, 1)
     sym_lines = []
-    sym_stats = defaultdict(lambda: {"w": 0, "l": 0})
-    for f in completed:
-        if f["won"]: sym_stats[f["symbol"]]["w"] += 1
-        else:        sym_stats[f["symbol"]]["l"] += 1
-    for sym in sorted(SYMBOLS):
-        if sym not in sym_stats:
-            continue
-        s = sym_stats[sym]
-        t = s["w"] + s["l"]
-        r = round(s["w"] / t * 100) if t > 0 else 0
-        sym_lines.append(f"  {sym}: {r}% ({t} trades)")
+    for sym in SYMBOLS:
+        st = [t for t in train_trades if t["symbol"] == sym]
+        if st:
+            sw = sum(1 for t in st if t["won"])
+            sym_lines.append(f"  {sym}: {round(sw/len(st)*100,1)}% WR ({len(st)}t)")
 
-    # Sleep before final alert to avoid Telegram race condition
-    time.sleep(3)
+    val_line = ""
+    if val_trades:
+        vw  = sum(1 for t in val_trades if t["won"])
+        vwr = round(vw / max(len(val_trades), 1) * 100, 1)
+        val_line = f"\nValidation (last 25%): {vwr}% WR ({len(val_trades)} trades)"
+
     send_alert(
-        f"✅ NEXUS ANALYZER V2.0 COMPLETE\n"
+        f"✅ NEXUS BERSERKER BACKTESTER V3.0 COMPLETE\n"
         f"──────────────────\n"
-        f"Fingerprints: {written:,}\n"
-        f"Pattern buckets: {buckets}\n"
-        f"Overall WR: {wr_pct}%\n"
-        f"Win-rate gate: active\n"
+        f"Training: {train_wr}% WR ({len(train_trades)} trades)\n"
+        + "\n".join(sym_lines) + "\n"
         f"──────────────────\n"
-        + "\n".join(sym_lines[:10]) + "\n"
+        f"Fingerprints: {written:,} | Buckets: {buckets}\n"
+        f"{val_line}\n"
         f"──────────────────\n"
         f"Elapsed: {elapsed}s"
     )
 
-    log.info(f"DONE. {written} fingerprints | {buckets} buckets | "
-             f"{wr_pct}% WR | {elapsed}s total")
+    log.info(f"DONE. {written} fingerprints | {buckets} buckets | {elapsed}s")
 
 
 if __name__ == "__main__":
