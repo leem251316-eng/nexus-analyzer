@@ -557,6 +557,13 @@ class BotState:
         self.bear_ext_peak     = 0.0
         self.reversal_state    = {"state": "IDLE"}
         self.trades            = []   # completed trade dicts
+        # Diagnostic counters
+        self.skip_bounce       = 0
+        self.skip_tide         = 0
+        self.skip_vol          = 0
+        self.skip_vix          = 0
+        self.skip_avoid_hour   = 0
+        self.score_checks      = 0
 
 
 def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
@@ -751,10 +758,10 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
             # Only attempt entry when ETF has a fresh bar (prevents false bouncing signals)
             elif len(bot.prices) >= WARMUP_BARS and has_new_bar:
                 if hour in cfg.get("avoid_hours", []):
-                    bot.skip_avoid_hour = getattr(bot, "skip_avoid_hour", 0) + 1
+                    bot.skip_avoid_hour += 1
                     continue
                 if vix_level >= VIX_PAUSE:
-                    bot.skip_vix = getattr(bot, "skip_vix", 0) + 1
+                    bot.skip_vix += 1
                     continue
 
                 prices_l  = list(bot.prices)
@@ -767,15 +774,15 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
 
                 # Check bull entry
                 if not sym_ctx.get("bouncing"):
-                    bot.skip_bounce = getattr(bot, "skip_bounce", 0) + 1
+                    bot.skip_bounce += 1
                 elif und_ctx.get("available") and und_ctx.get("tide_bearish"):
-                    bot.skip_tide = getattr(bot, "skip_tide", 0) + 1
+                    bot.skip_tide += 1
                 elif not sym_ctx.get("vol_confirmed", True):
-                    bot.skip_vol = getattr(bot, "skip_vol", 0) + 1
+                    bot.skip_vol += 1
                 elif True:  # passed all pre-filters
                     score   = compute_entry_score(sym, sym_ctx, is_bear=False)
                     min_sc  = cfg["min_score"]
-                    bot.score_checks = getattr(bot, "score_checks", 0) + 1
+                    bot.score_checks += 1
                     if score >= min_sc:
                         bot.mode       = select_mode(spy_ctx, sym_ctx)
                         entry_px       = prices_l[-1] * (1 + SLIPPAGE_PCT)
