@@ -352,6 +352,8 @@ def replay_berserker(all_bars: dict,
     entry_bar:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
     entry_rsi:    Dict[str, float] = {s: 50.0  for s in SYMBOLS}
     entry_spy_bull: Dict[str, bool] = {s: False for s in SYMBOLS}
+    entry_spy_rsi:  Dict[str, float] = {s: 50.0  for s in SYMBOLS}
+    entry_spy_mom:  Dict[str, float] = {s: 0.0   for s in SYMBOLS}
     mfe_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
     mae_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
     entry_hour:   Dict[str, int]   = {s: 12     for s in SYMBOLS}
@@ -393,10 +395,14 @@ def replay_berserker(all_bars: dict,
         spy_prices = list(price_hist["SPY"])
         spy_bullish = False
         spy_above_ma20 = False
+        spy_rsi_val = 50.0
+        spy_momentum_val = 0.0
         if len(spy_prices) >= 20:
             spy_ma20 = sum(spy_prices[-20:]) / 20
-            spy_above_ma20 = spy_prices[-1] > spy_ma20
-            spy_bullish    = spy_above_ma20
+            spy_above_ma20   = spy_prices[-1] > spy_ma20
+            spy_bullish      = spy_above_ma20
+            spy_rsi_val      = compute_rsi(deque(spy_prices)) if len(spy_prices) > 10 else 50.0
+            spy_momentum_val = (spy_prices[-1] - spy_prices[-6]) / spy_prices[-6] if len(spy_prices) >= 6 and spy_prices[-6] > 0 else 0.0
 
         # Regime score (V3.0): simplified -- VIX + SPY bear
         regime_block = (not spy_above_ma20) and vix_blocking
@@ -447,6 +453,8 @@ def replay_berserker(all_bars: dict,
                         "won":          profit_pct > 0,
                         "rsi_at_entry": entry_rsi[sym],
                         "spy_bullish":  entry_spy_bull[sym],
+                        "spy_rsi":       entry_spy_rsi[sym],
+                        "spy_momentum":  entry_spy_mom[sym],
                         "sector_health": sector_health,
                         "is_trump":     is_trump,
                         "sector":       "TRUMP" if is_trump else "TECH",
@@ -488,6 +496,8 @@ def replay_berserker(all_bars: dict,
                     entry_bar[sym]    = bar_num
                     entry_rsi[sym]    = sig.get("rsi", 50.0)
                     entry_spy_bull[sym] = spy_bullish
+                    entry_spy_rsi[sym]  = spy_rsi_val
+                    entry_spy_mom[sym]  = spy_momentum_val
                     mfe_track[sym]    = 0.0
                     mae_track[sym]    = 0.0
                     entry_hour[sym]   = hour
@@ -547,12 +557,14 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
                 try:
                     cur.execute("""
                         INSERT INTO berserker_trade_fingerprints
-                        (trade_id, symbol, entry_ts, exit_ts,
-                         rsi_at_entry, spy_bullish, sector_health, sector,
-                         hour_cdt, day_of_week, vix_at_entry,
+                        (trade_id, symbol, sector,
+                         entry_ts, exit_ts, entry_price,
+                         symbol_rsi, spy_bullish, spy_rsi, spy_momentum,
+                         sector_health, hour_cdt, day_of_week,
                          won, pnl_pct, exit_reason, hold_time_min,
                          mfe, mae, is_paper)
-                        VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s)
+                        VALUES (%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,
+                                %s,%s,%s,%s, %s,%s,%s)
                         ON CONFLICT (trade_id) DO UPDATE
                         SET won=EXCLUDED.won, pnl_pct=EXCLUDED.pnl_pct,
                             exit_reason=EXCLUDED.exit_reason,
@@ -560,14 +572,16 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
                     """, (
                         t["trade_id"],
                         t["symbol"],
+                        t.get("sector", "TECH"),
                         int(time.time()), int(time.time()),
+                        round(t.get("entry_price", 0.0), 4),
                         round(t.get("rsi_at_entry", 50.0), 2),
                         bool(t.get("spy_bullish", False)),
+                        round(t.get("spy_rsi", 50.0), 2),
+                        round(t.get("spy_momentum", 0.0), 4),
                         t.get("sector_health", "STRONG"),
-                        t.get("sector", "TECH"),
                         t.get("hour_cdt", 12),
                         t.get("day_of_week", 0),
-                        round(t.get("vix_at_entry", 15.0), 1),
                         bool(t["won"]),
                         round(t["pnl_pct"], 3),
                         t["exit_reason"],
@@ -578,8 +592,8 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
                     ))
                     written += 1
                 except Exception as e:
-                    log.warning(f"fingerprint error [{t.get("symbol","?")}]: {e}")
-                    break  # stop after first error to see root cause
+                    log.warning(f"fingerprint error [{t.get('symbol','?')}]: {e}")
+                    break
         conn.commit()
         conn.close()
         log.info(f"  Wrote {written}/{len(trades)} fingerprints")
@@ -598,7 +612,8 @@ def run_pattern_analysis() -> Tuple[int, float]:
         conn.autocommit = False
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT symbol, rsi_at_entry, spy_bullish, sector_health, sector,
+                SELECT symbol, symbol_rsi as rsi_at_entry, spy_bullish,
+                       sector_health, sector,
                        hour_cdt, day_of_week, won, pnl_pct, mfe, mae
                 FROM berserker_trade_fingerprints WHERE won IS NOT NULL
             """)
