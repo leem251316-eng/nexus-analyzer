@@ -375,9 +375,12 @@ def replay_berserker(all_bars: dict,
                 price_hist[sym].append(float(row["close"]))
 
         # VIX approximation via VIXY (V3.0)
+        # VIXY is a 1x VIX futures ETF trading $10-25 while VIX is 12-40.
+        # Real multiplier is ~1.5x (not 10x). Keeps threshold at 25 consistent
+        # with main.py V10.19's VIX_BLOCK_THRESHOLD.
         if price_hist["VIXY"]:
             vixy = list(price_hist["VIXY"])[-1]
-            raw_vix = vixy * 10.0
+            raw_vix = vixy * 1.5
             vix_smooth = vix_smooth * 0.7 + raw_vix * 0.3
         vix_blocking = vix_smooth > VIX_BLOCK_THRESHOLD
 
