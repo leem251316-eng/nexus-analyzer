@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.0 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.1 -- NEXUS Phase4 Backtester
 =====================================================
+V1.1 fixes (Jun 29 2026):
+  ✅ Dangerous first DELETE removed from write_fingerprints() — the original
+     DELETE WHERE mode IN (...) AND exit_ts IS NULL would wipe live open-position
+     fingerprints if Phase4 holds a trade when the Sunday cron fires. Now only
+     the safe 'bt_'-prefix DELETE runs.
+  ✅ run_pattern_analysis() bucket key aligned with Phase4Memory._bucket_key()
+     in phase4.py — was using 3 RSI bands (hi/mid/low), live service uses 4
+     (lt30/30_40/40_55/gt55). Mismatch meant backtester-seeded phase4_pattern_stats
+     entries were NEVER hit at runtime. Both now use the 4-band format.
 Pulls 2yr 1-minute Alpaca IEX bars for all Phase4 ETFs + underlyings,
 replays through the EXACT same V2.0 signal engine (compute_entry_score,
 select_mode, get_signal_suite, check_reversal), writes fingerprints to
@@ -908,19 +917,12 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
         conn.autocommit = False
         written = 0
         with conn.cursor() as cur:
-            # Clear old backtest entries (keep live trades)
+            # Clear previous backtest entries only — identified by 'bt_' prefix.
+            # NEVER delete by mode/exit_ts: that would wipe live open-position fingerprints
+            # if Phase4 is holding a trade when the Sunday cron fires.
             cur.execute("""
                 DELETE FROM phase4_trade_fingerprints
-                WHERE mode IN ('SCALP','RIDE','EXTENDED')
-                  AND entry_price IS NOT NULL
-                  AND exit_ts IS NULL
-            """)
-            # Actually just clear all backtest-sourced entries
-            cur.execute("""
-                DELETE FROM phase4_trade_fingerprints
-                WHERE entry_ts IS NOT NULL
-                  AND won IS NOT NULL
-                  AND trade_id LIKE 'bt_%'
+                WHERE trade_id LIKE 'bt_%'
             """)
             for t in trades:
                 trade_id = "bt_" + t["trade_id"]
@@ -1003,7 +1005,12 @@ def run_pattern_analysis() -> Tuple[int, float]:
             spy_b = {"bullish": row["spy_bullish"]}
             qqq_o = {"overbought": row["qqq_overbought"]}
             hour  = row["hour_cdt"] if row["hour_cdt"] is not None else 12
-            rsi_b  = "rsi_hi" if rsi > 70 else "rsi_mid" if rsi > 40 else "rsi_low"
+            # RSI bands MUST match Phase4Memory._bucket_key() in phase4.py exactly —
+            # otherwise backtester-seeded phase4_pattern_stats entries are never hit
+            # at runtime because the keys don't align.
+            rsi_b  = ("rsi_lt30"  if rsi < 30 else
+                      "rsi_30_40" if rsi < 40 else
+                      "rsi_40_55" if rsi < 55 else "rsi_gt55")
             spy_b2 = "spy_bull" if spy_b.get("bullish") else "spy_bear"
             qqq_b  = "qqq_ob"  if qqq_o.get("overbought") else "qqq_ok"
             hr_b   = "hr_open" if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
@@ -1122,17 +1129,17 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS PHASE4 BACKTESTER V1.0")
+    log.info(f"NEXUS PHASE4 BACKTESTER V1.1")
     log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
 
     send_alert(
-        f"⚡ PHASE4 BACKTESTER V1.0 STARTING\n"
+        f"⚡ PHASE4 BACKTESTER V1.1 STARTING\n"
         f"Bots: NUGT | SOXL | LABU | TQQQ\n"
         f"Bear pairs: DUST | SOXS | LABD | SQQQ\n"
         f"Period: {args.days} days | Slippage: {SLIPPAGE_PCT*100:.2f}%\n"
-        f"V2.0 signal engine | Walk-forward validation\n"
+        f"V1.1: safe DELETE + aligned bucket keys\n"
         f"ETA: ~45-60 min"
     )
 
@@ -1189,7 +1196,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(validate_trades)} trades)"
 
     send_alert(
-        f"✅ PHASE4 BACKTESTER V1.0 COMPLETE\n"
+        f"✅ PHASE4 BACKTESTER V1.1 COMPLETE\n"
         f"──────────────────\n"
         f"Training WR: {train_wr}% ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"
