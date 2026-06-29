@@ -458,7 +458,7 @@ def get_qqq_context(qqq_prices: list) -> dict:
 def get_vix_from_vixy(vixy_prices: list) -> float:
     if not vixy_prices:
         return 15.0
-    return vixy_prices[-1] * 10.0
+    return vixy_prices[-1] * 1.5   # VIXY ~$10-25, VIX ~$15-40; 1.5x is correct ratio
 
 def get_underlying_ctx(und_prices: list) -> dict:
     if len(und_prices) < 21:
@@ -587,6 +587,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
 
     all_trades = []
     bar_num    = 0
+    _diag_logged = False
 
     for bar_idx, ts in enumerate(all_ts):
         bar_num += 1
@@ -613,7 +614,8 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
             cfg = bot.cfg
 
             # Update bull ETF prices
-            if sym in all_bars and ts in all_bars[sym].index:
+            has_new_bar = sym in all_bars and ts in all_bars[sym].index
+            if has_new_bar:
                 row = all_bars[sym].loc[ts]
                 bot.prices.append(float(row["close"]))
                 bot.volumes.append(float(row.get("volume", 0)))
@@ -746,10 +748,13 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                     bot.bear_ext_peak     = 0.0
 
             # ── LOOK FOR ENTRY ────────────────────────────────────────────
-            elif len(bot.prices) >= WARMUP_BARS:
+            # Only attempt entry when ETF has a fresh bar (prevents false bouncing signals)
+            elif len(bot.prices) >= WARMUP_BARS and has_new_bar:
                 if hour in cfg.get("avoid_hours", []):
+                    bot.skip_avoid_hour = getattr(bot, "skip_avoid_hour", 0) + 1
                     continue
                 if vix_level >= VIX_PAUSE:
+                    bot.skip_vix = getattr(bot, "skip_vix", 0) + 1
                     continue
 
                 prices_l  = list(bot.prices)
@@ -761,11 +766,16 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                 vix_caution = vix_level >= VIX_CAUTION
 
                 # Check bull entry
-                if (sym_ctx.get("bouncing") and
-                        not (und_ctx.get("available") and und_ctx.get("tide_bearish")) and
-                        sym_ctx.get("vol_confirmed", True)):
+                if not sym_ctx.get("bouncing"):
+                    bot.skip_bounce = getattr(bot, "skip_bounce", 0) + 1
+                elif und_ctx.get("available") and und_ctx.get("tide_bearish"):
+                    bot.skip_tide = getattr(bot, "skip_tide", 0) + 1
+                elif not sym_ctx.get("vol_confirmed", True):
+                    bot.skip_vol = getattr(bot, "skip_vol", 0) + 1
+                elif True:  # passed all pre-filters
                     score   = compute_entry_score(sym, sym_ctx, is_bear=False)
                     min_sc  = cfg["min_score"]
+                    bot.score_checks = getattr(bot, "score_checks", 0) + 1
                     if score >= min_sc:
                         bot.mode       = select_mode(spy_ctx, sym_ctx)
                         entry_px       = prices_l[-1] * (1 + SLIPPAGE_PCT)
@@ -834,8 +844,15 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                                         bot.reversal_state    = {"state": "IDLE"}
                                         bot.mode = "SCALP"
 
+        if not _diag_logged and bar_idx == 50000:
+            _diag_logged = True
+            for s, b in bots.items():
+                log.info(f"  DIAG [{s}]: prices={len(b.prices)} bounce_skip={getattr(b,'skip_bounce',0)} "
+                         f"tide_skip={getattr(b,'skip_tide',0)} vol_skip={getattr(b,'skip_vol',0)} "
+                         f"score_checks={getattr(b,'score_checks',0)} vix_skip={getattr(b,'skip_vix',0)} "
+                         f"avoid_skip={getattr(b,'skip_avoid_hour',0)}")
+        total_so_far = sum(len(b.trades) for b in bots.values())
         if bar_num % 50000 == 0:
-            total_so_far = sum(len(b.trades) for b in bots.values())
             log.info(f"  Progress: {bar_num:,}/{total_bars:,} bars | {total_so_far} trades so far")
 
     # Close any open positions at end of data
@@ -933,7 +950,8 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
                     ))
                     written += 1
                 except Exception as e:
-                    log.debug(f"  fingerprint write error: {e}")
+                    log.warning(f"  fingerprint write error: {e}")
+                    break
         conn.commit()
         conn.close()
         log.info(f"  Wrote {written} fingerprints to DB")
