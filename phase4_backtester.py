@@ -613,7 +613,8 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
             cfg = bot.cfg
 
             # Update bull ETF prices
-            if sym in all_bars and ts in all_bars[sym].index:
+            has_new_bar = sym in all_bars and ts in all_bars[sym].index
+            if has_new_bar:
                 row = all_bars[sym].loc[ts]
                 bot.prices.append(float(row["close"]))
                 bot.volumes.append(float(row.get("volume", 0)))
@@ -746,7 +747,8 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                     bot.bear_ext_peak     = 0.0
 
             # ── LOOK FOR ENTRY ────────────────────────────────────────────
-            elif len(bot.prices) >= WARMUP_BARS:
+            # Only attempt entry when ETF has a fresh bar (prevents false bouncing signals)
+            elif len(bot.prices) >= WARMUP_BARS and has_new_bar:
                 if hour in cfg.get("avoid_hours", []):
                     continue
                 if vix_level >= VIX_PAUSE:
