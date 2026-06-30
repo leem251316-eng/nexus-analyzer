@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.1 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.2 -- NEXUS Phase4 Backtester
 =====================================================
+V1.2 fix (Jun 30 2026):
+  ✅ Exit priority reordered -- rsi-overbought was checked BEFORE the profit
+     ratchet, so on a mean-reversion entry (buy oversold, RSI climbs toward
+     overbought as the thesis plays out) almost every winner got cut the
+     instant profit ticked positive, before ever reaching early_ratchet.
+     Live backtest evidence: 298/321 wins (93%) were rsi-overbought exits
+     averaging ~+0.24%, while the 61 stop-losses averaged ~-1.7% (atr_stop)
+     -- a ~7:1 win/loss size mismatch that made a 73% WR system net
+     PnL-negative (avg -0.031%/trade) in both training and out-of-sample.
+     Ratchet now checked first; rsi-overbought is the fallback for trades
+     that hit RSI=70 without yet clearing early_ratchet (take the small
+     win/scratch rather than risk it reversing to red). Same bug existed
+     and was fixed identically in live phase4.py.
 V1.1 fixes (Jun 29 2026):
   ✅ Dangerous first DELETE removed from write_fingerprints() — the original
      DELETE WHERE mode IN (...) AND exit_ts IS NULL would wipe live open-position
@@ -719,16 +732,30 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                         exit_reason = "stop-loss"
 
                 # Regular exits (non-extended bear, and bull)
+                # V1.2 FIX (Jun 30 2026): rsi-overbought was checked BEFORE the
+                # ratchet, so on a mean-reversion entry (buy oversold, RSI moves
+                # toward overbought as the thesis plays out) almost every winner
+                # got cut the instant profit ticked positive and RSI crossed 70 --
+                # before ever reaching early_ratchet. Backtest evidence: 298/321
+                # wins (93%) were rsi-overbought exits averaging ~+0.24%, while
+                # the 61 stop-losses averaged ~-1.7% (atr_stop) -- a ~7:1 size
+                # mismatch that made a 73% WR system net PnL-negative.
+                # Fix: check the ratchet first. Once profit clears early_ratchet,
+                # the trail/late-ratchet mechanism governs the exit and is allowed
+                # to run the winner. rsi-overbought becomes the fallback for
+                # trades that hit RSI=70 but HAVEN'T yet cleared early_ratchet --
+                # i.e. "the reversion is done and we never got paid for it,
+                # take the small win/scratch now rather than risk it going red."
                 if not exit_reason:
                     active_ctx = get_signal_suite(active_prices, [])
-                    if active_ctx.get("rsi", 50) >= RSI_OB_EXIT and profit_pct > 0:
-                        exit_reason = "rsi-overbought"
-                    elif profit_pct >= early_r:
+                    if profit_pct >= early_r:
                         if profit_pct >= late_r or active_ctx.get("rsi", 50) >= 65:
                             bot.late_ratchet = True
                         trail = trail_t if bot.late_ratchet else trail_n
                         if drawdown >= trail:
                             exit_reason = "trail-tight" if bot.late_ratchet else "trail"
+                    elif active_ctx.get("rsi", 50) >= RSI_OB_EXIT and profit_pct > 0:
+                        exit_reason = "rsi-overbought"
                     elif bot.mode == "EXTENDED" and not is_bear and profit_pct > -0.005:
                         if not active_ctx.get("higher_lows", True):
                             exit_reason = "trend-break"
@@ -1129,13 +1156,13 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS PHASE4 BACKTESTER V1.1")
+    log.info(f"NEXUS PHASE4 BACKTESTER V1.2")
     log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
 
     send_alert(
-        f"⚡ PHASE4 BACKTESTER V1.1 STARTING\n"
+        f"⚡ PHASE4 BACKTESTER V1.2 STARTING\n"
         f"Bots: NUGT | SOXL | LABU | TQQQ\n"
         f"Bear pairs: DUST | SOXS | LABD | SQQQ\n"
         f"Period: {args.days} days | Slippage: {SLIPPAGE_PCT*100:.2f}%\n"
@@ -1196,7 +1223,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(validate_trades)} trades)"
 
     send_alert(
-        f"✅ PHASE4 BACKTESTER V1.1 COMPLETE\n"
+        f"✅ PHASE4 BACKTESTER V1.2 COMPLETE\n"
         f"──────────────────\n"
         f"Training WR: {train_wr}% ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"
