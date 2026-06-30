@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 """
-scanner_backtester.py V1.0 — NEXUS Scanner Backtester
+scanner_backtester.py V1.1 — NEXUS Scanner Backtester
 =======================================================
 Pulls 2yr 1-min Alpaca IEX bars for Scanner's 44-symbol universe, replays
 through the EXACT Scanner V2.4 signal engine (scan_for_entry, manage_scanner_
 exits, bucket key), writes fingerprints to scanner_trade_fingerprints,
 triggers pattern analysis.
+
+V1.1 fix (Jun 30 2026): First real run (15,362 trades, full 2yr) failed the
+DB write almost entirely -- only 5/15,362 rows landed. Root cause: vol_ratio
+was computed as latest_vol / avg_vol where avg_vol came from a pandas
+Series.mean(), which returns numpy.float64. Dividing produces numpy.float64
+even though the inputs upstream had been through Python's float(). psycopg2
+can't adapt numpy scalars -- it serialized them using numpy's own repr style
+("np.float64(5.0)") instead of a plain numeric literal, and Postgres tried
+to parse "np" as a schema name ("schema np does not exist"). Worse: the
+original write loop wrapped the ENTIRE per-trade insert loop in one
+try/except, so the single numpy-typed row anywhere in the batch rolled back
+the whole transaction -- 15,357 good trades silently vanished along with the
+one bad row. Fixed two ways: (1) vol_ratio cast to float() at its source
+(avg_vol and latest_vol both explicitly float()'d before division), and (2)
+defensive float()/int()/bool()/str() coercion on every field immediately
+before the SQL call as a second line of defense, with each row now
+committing independently so one bad row can never take down the batch again.
 
 Why this exists (Jun 30 2026): Scanner went live on day one with almost no
 backtest evidence -- SCANNER_VOL_MULT's comments reference per-symbol EV
@@ -289,9 +306,9 @@ def replay_scanner(all_bars: dict, validate_mode: bool = False,
                 continue
             window     = df["close"].iloc[i-10:i+1]
             vol_window = df["volume"].iloc[i-10:i+1]
-            avg_vol    = vol_window.iloc[:-1].mean()
-            latest_vol = vol_window.iloc[-1]
-            vol_ratio  = (latest_vol / avg_vol) if avg_vol > 0 else 0
+            avg_vol    = float(vol_window.iloc[:-1].mean())
+            latest_vol = float(vol_window.iloc[-1])
+            vol_ratio  = (latest_vol / avg_vol) if avg_vol > 0 else 0.0
             price_10m  = float(window.iloc[0])
             price_now  = float(window.iloc[-1])
             price_move = (price_now - price_10m) / price_10m if price_10m > 0 else 0
@@ -373,26 +390,62 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
             # fix (a blanket DELETE WHERE exit_ts IS NULL would wipe a live
             # open position's fingerprint if the backtest runs mid-trade).
             cur.execute("DELETE FROM scanner_trade_fingerprints WHERE trade_id LIKE 'bt_%'")
+            conn.commit()   # commit the delete on its own -- isolates it from
+                             # the per-row insert loop below, so a later insert
+                             # failure can never roll back the delete too.
+
             written = 0
+            failed  = 0
             for t in trades:
                 trade_id = f"bt_{secrets.token_hex(8)}"
-                cur.execute("""
-                    INSERT INTO scanner_trade_fingerprints
-                    (trade_id, symbol, entry_ts, exit_ts, entry_price,
-                     vol_ratio, price_move_pct, spy_bullish, hour_cdt, day_of_week,
-                     won, pnl_pct, exit_reason, hold_time_min, mfe, mae)
-                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (trade_id) DO NOTHING
-                """, (
-                    trade_id, t["symbol"],
-                    int(t["entry_ts"].timestamp()), int(t["exit_ts"].timestamp()),
-                    t["entry_price"], t["vol_ratio"], t["price_move_pct"],
-                    t["spy_bullish"], t["hour_cdt"], t["day_of_week"],
-                    t["won"], t["pnl_pct"], t["exit_reason"], t["hold_time_min"],
-                    t["mfe"], t["mae"],
-                ))
-                written += 1
-        conn.commit()
+                try:
+                    cur.execute("""
+                        INSERT INTO scanner_trade_fingerprints
+                        (trade_id, symbol, entry_ts, exit_ts, entry_price,
+                         vol_ratio, price_move_pct, spy_bullish, hour_cdt, day_of_week,
+                         won, pnl_pct, exit_reason, hold_time_min, mfe, mae)
+                        VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (trade_id) DO NOTHING
+                    """, (
+                        trade_id, str(t["symbol"]),
+                        int(t["entry_ts"].timestamp()), int(t["exit_ts"].timestamp()),
+                        # V1.1 fix (Jun 30 2026): explicit float()/int()/bool() on
+                        # every numeric field immediately before the query --
+                        # pandas/numpy operations upstream (e.g. Series.mean(),
+                        # division involving a numpy-derived value) can produce
+                        # numpy.float64/int64 even when the inputs were cast with
+                        # Python's float() earlier, because mixed numpy/Python
+                        # arithmetic upcasts to numpy's type. round() on a numpy
+                        # scalar also returns a numpy scalar, not a plain float --
+                        # it does NOT coerce back to Python's float like round()
+                        # on a plain float does. psycopg2 can't adapt numpy types
+                        # (it tried to interpret "np" from "np.float64(...)" as a
+                        # schema name -- "schema np does not exist"), so every
+                        # value crossing into the SQL boundary is explicitly
+                        # coerced here as a second, defensive line on top of the
+                        # float() casts already present earlier in the pipeline.
+                        float(t["entry_price"]), float(t["vol_ratio"]), float(t["price_move_pct"]),
+                        bool(t["spy_bullish"]), int(t["hour_cdt"]), int(t["day_of_week"]),
+                        bool(t["won"]), float(t["pnl_pct"]), str(t["exit_reason"]), int(t["hold_time_min"]),
+                        float(t["mfe"]), float(t["mae"]),
+                    ))
+                    written += 1
+                except Exception as row_err:
+                    # V1.1 fix: isolate per-row failures so one bad trade can't
+                    # silently roll back the entire batch -- the original bug
+                    # caused 15,357 of 15,362 trades to vanish because a SINGLE
+                    # numpy-typed field anywhere in the list aborted the whole
+                    # transaction. Each row now commits independently; a failure
+                    # here logs and skips, but every other row still lands.
+                    conn.rollback()
+                    failed += 1
+                    if failed <= 5:   # cap log spam if something is systemically wrong
+                        log.error(f"  row insert error [{t.get('symbol','?')}]: {row_err}")
+                    continue
+                conn.commit()
+
+        if failed > 0:
+            log.warning(f"  {failed}/{len(trades)} rows failed to write (see errors above)")
         log.info(f"  Wrote {written}/{len(trades)} fingerprints")
         return written
     except Exception as e:
@@ -515,7 +568,7 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("NEXUS SCANNER BACKTESTER V1.0")
+    log.info("NEXUS SCANNER BACKTESTER V1.1")
     log.info(f"Symbols: {len(SCANNER_UNIVERSE)} | Days: {args.days} | Slippage: {SLIPPAGE_PCT*100}%")
     log.info("Signal engine: scanner.py V2.4 exact replica")
     log.info("=" * 60)
@@ -526,7 +579,7 @@ def main():
 
     t0 = time.time()
     send_alert(
-        f"🔍 SCANNER BACKTESTER V1.0 STARTING\n"
+        f"🔍 SCANNER BACKTESTER V1.1 STARTING\n"
         f"Symbols: {len(SCANNER_UNIVERSE)} | Days: {args.days}\n"
         f"Signal engine: scanner.py V2.4 exact replica\n"
         f"ETA: ~15-25 min"
@@ -570,7 +623,7 @@ def main():
     train_wr = (sum(1 for t in train_trades if t["won"]) / len(train_trades) * 100) if train_trades else 0
     val_wr   = (sum(1 for t in val_trades if t["won"]) / len(val_trades) * 100) if val_trades else 0
     send_alert(
-        f"✅ SCANNER BACKTESTER V1.0 COMPLETE\n"
+        f"✅ SCANNER BACKTESTER V1.1 COMPLETE\n"
         f"──────────────────\n"
         f"Training: {len(train_trades)} trades | {train_wr:.1f}% WR\n"
         f"OOS:      {len(val_trades)} trades | {val_wr:.1f}% WR\n"
