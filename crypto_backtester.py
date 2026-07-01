@@ -393,7 +393,7 @@ def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
     total, mode = _compute_confidence_meanrev_bt(pair, closes_5m, volumes_5m, btc_closes)
     return total, mode, "MEAN_REVERSION"
 
-
+def compute_btc_realized_vol(btc_closes: list) -> float:
     """7-day BTC realized vol as % -- V5.0 regime gate."""
     if len(btc_closes) < 20:
         return 0.0
