@@ -97,6 +97,11 @@ CONF_FULL         = 75
 CONF_CAUTIOUS     = 55
 CONF_SKIP         = 40
 
+# V5.1: mirrors crypto.py MOM_RSI_MIN/MAX exactly -- keep these two files'
+# values in sync by hand if either changes.
+MOM_RSI_MIN = 50
+MOM_RSI_MAX = 78
+
 # Backtesting params
 SLIPPAGE_PCT      = 0.0005   # 0.05% half-spread
 WARMUP_BARS       = 60
@@ -197,10 +202,33 @@ def calc_vwap(closes: list, volumes: list) -> Optional[float]:
     vol = sum(volumes)
     return tpv / vol if vol > 0 else None
 
-def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
-                           btc_closes: list) -> Tuple[int, str]:
+def resample_5m_to_4h(closes_5m: list) -> list:
     """
-    Simplified confidence engine for backtesting.
+    V5.1: crypto_backtester.py only fetches 5m bars (see fetch_all_crypto_bars) --
+    no separate 4h API call exists. Rather than add a second Alpaca fetch per
+    pair (doubles fetch time, adds a second failure point), approximate 4h
+    closes by taking every 48th 5m close (48 * 5min = 240min = 4h). This is
+    a close-only resample, not true 4h OHLC aggregation -- fine for
+    calc_trend_structure (which only looks at closes), NOT a substitute for
+    real 4h bars if a future indicator needs 4h high/low/volume.
+    """
+    return closes_5m[::48]
+
+def detect_trend_regime_bt(closes_5m: list) -> str:
+    """V5.1: mirrors crypto.py SignalProcessor.detect_trend_regime(), using
+    the 5m-resampled 4h approximation above in place of a real 4h fetch."""
+    closes_4h_approx = resample_5m_to_4h(closes_5m)
+    t4 = calc_trend_structure(closes_4h_approx, lookback=20)
+    t5 = calc_trend_structure(closes_5m, lookback=20)
+    if t4.get("uptrend") and t5.get("higher_lows"):
+        return "TRENDING"
+    return "CHOPPY"
+
+def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
+                                    btc_closes: list) -> Tuple[int, str]:
+    """
+    Original V5.0 mean-reversion confidence engine, UNCHANGED -- renamed
+    from compute_confidence_bt so the new dispatcher below can route to it.
     Matches crypto.py V5.0 technical + macro layers.
     Historical/analyst components set to neutral (can't backtest those).
     Orderflow (L/S ratio, taker ratio) = 0 (real-time only).
@@ -276,7 +304,96 @@ def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
 
     return total, mode
 
-def compute_btc_realized_vol(btc_closes: list) -> float:
+def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list,
+                                     btc_closes: list) -> Tuple[int, str]:
+    """
+    V5.1: Momentum counterpart to _compute_confidence_meanrev_bt. Mirrors
+    crypto.py's _score_technical_momentum / _score_volume_momentum weighting
+    exactly (same +40/+10 caps) so FULL/CAUTIOUS/SKIP/BLOCK thresholds mean
+    the same thing on both paths. Only called when detect_trend_regime_bt()
+    returns TRENDING.
+    """
+    if len(closes_5m) < WARMUP_BARS:
+        return 0, "BLOCK"
+
+    rsi_dict = calc_multi_tf_rsi(closes_5m)
+    rsi_5m   = rsi_dict.get("5m")
+
+    # Hard gate: RSI outside the momentum band = skip (either not trending
+    # yet, or already exhausted -- mirrors crypto.py MOM_RSI_MIN/MAX)
+    if rsi_5m is None or not (MOM_RSI_MIN <= rsi_5m <= MOM_RSI_MAX):
+        return 0, "BLOCK"
+
+    score = 0
+
+    # Technical (max +40) -- count timeframes showing strength, not oversold
+    rsi_vals = [v for v in rsi_dict.values() if v is not None]
+    sc = sum(1 for r in rsi_vals if MOM_RSI_MIN <= r <= MOM_RSI_MAX)
+    if   sc >= 5: score += 20
+    elif sc == 4: score += 15
+    elif sc == 3: score += 10
+    elif sc == 2: score += 5
+
+    trend = calc_trend_structure(closes_5m)
+    if trend.get("higher_lows"):
+        score += 5
+
+    vwap = calc_vwap(closes_5m, volumes_5m)
+    if vwap and closes_5m[-1] > vwap:
+        score += 5
+
+    rsi_1m = rsi_dict.get("1m")
+    if (rsi_5m is not None and rsi_1m is not None
+            and MOM_RSI_MIN <= rsi_5m <= MOM_RSI_MAX and rsi_1m >= rsi_5m):
+        score += 5
+
+    tech_score = min(score, 40)
+
+    macro_score = 0
+    if btc_closes and len(btc_closes) >= 14:
+        btc_rsi = calc_rsi(btc_closes, 14) or 50
+        if   btc_rsi < 25: macro_score += 8
+        elif btc_rsi < 35: macro_score += 5
+        elif btc_rsi < 40: macro_score += 2
+        elif btc_rsi > 72: macro_score -= 5
+        elif btc_rsi > 65: macro_score -= 2
+
+    # Volume structure -- OBV confirming breakout, RSI position holding high
+    obv_mom = calc_obv_momentum(closes_5m, volumes_5m)
+    vol_score = 0
+    if obv_mom is not None:
+        if   obv_mom >  5.0: vol_score += 5
+        elif obv_mom >  1.0: vol_score += 2
+        elif obv_mom < -1.0: vol_score -= 4
+
+    hist_score = 7   # neutral placeholder, same as mean-reversion path
+
+    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score))
+
+    if   total >= CONF_FULL:     mode = "FULL"
+    elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
+    elif total >= CONF_SKIP:     mode = "SKIP"
+    else:                        mode = "BLOCK"
+
+    return total, mode
+
+def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
+                           btc_closes: list) -> Tuple[int, str, str]:
+    """
+    V5.1: Regime dispatcher. CHOPPY routes to the original, unmodified
+    mean-reversion engine; TRENDING routes to the new momentum engine.
+    Returns (score, mode, strategy) -- strategy is "MEAN_REVERSION" or
+    "MOMENTUM", recorded on the trade dict so results can be split out
+    and compared after a run.
+    """
+    regime = detect_trend_regime_bt(closes_5m)
+    if regime == "TRENDING":
+        total, mode = _compute_confidence_momentum_bt(pair, closes_5m, volumes_5m, btc_closes)
+        return total, mode, "MOMENTUM"
+    total, mode = _compute_confidence_meanrev_bt(pair, closes_5m, volumes_5m, btc_closes)
+    return total, mode, "MEAN_REVERSION"
+
+
     """7-day BTC realized vol as % -- V5.0 regime gate."""
     if len(btc_closes) < 20:
         return 0.0
@@ -356,6 +473,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
     entry_ts  = None
     conf_at_entry = 0
     mode_at_entry = ""
+    strategy_at_entry = ""
 
     is_btc_eth = pair in BTC_IS_ETH
 
@@ -413,6 +531,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     "won":         True,
                     "confidence":  conf_at_entry,
                     "mode":        mode_at_entry,
+                    "strategy":    strategy_at_entry,
                     "hour_utc":    hour,
                     "validate":    validate_mode,
                     "trade_id":    secrets.token_hex(8),
@@ -443,6 +562,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     "won":         profit_pct > 0,
                     "confidence":  conf_at_entry,
                     "mode":        mode_at_entry,
+                    "strategy":    strategy_at_entry,
                     "hour_utc":    hour,
                     "validate":    validate_mode,
                     "trade_id":    secrets.token_hex(8),
@@ -452,7 +572,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 mfe = mae    = 0.0
 
         else:
-            conf, mode = compute_confidence_bt(pair, closes_window, volumes_window, btc_window)
+            conf, mode, strategy = compute_confidence_bt(pair, closes_window, volumes_window, btc_window)
             if mode in ("FULL", "CAUTIOUS"):
                 in_pos          = True
                 entry_price     = price * (1 + SLIPPAGE_PCT)
@@ -463,6 +583,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 entry_ts        = times[i]
                 conf_at_entry   = conf
                 mode_at_entry   = mode
+                strategy_at_entry = strategy
 
     # Close any open at end
     if in_pos and closes:
@@ -480,6 +601,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
             "won":         profit_pct > 0,
             "confidence":  conf_at_entry,
             "mode":        mode_at_entry,
+            "strategy":    strategy_at_entry,
             "hour_utc":    hour,
             "validate":    validate_mode,
             "trade_id":    secrets.token_hex(8),
@@ -658,6 +780,7 @@ def main():
 
     all_trades  = []
     pair_summary = []
+    strategy_trades = {"MEAN_REVERSION": [], "MOMENTUM": []}
 
     for pair in pairs:
         if pair not in all_bars:
@@ -680,6 +803,9 @@ def main():
         non_partial = [t for t in all_t if t["exit_reason"] != "PARTIAL_TP"]
         wr        = round(wins / max(len(all_t), 1) * 100, 1)
         avg_pnl   = sum(t["pnl_pct"] for t in non_partial) / max(len(non_partial), 1)
+
+        for t in non_partial:
+            strategy_trades.setdefault(t.get("strategy", "MEAN_REVERSION"), []).append(t)
 
         log.info(f"  {pair}: {len(all_t)} trades | {wr}% WR | avg P&L: {avg_pnl:+.3f}%")
         all_trades.extend(train_trades)  # only write training to DB
@@ -716,11 +842,30 @@ def main():
         for p in sorted(pair_summary, key=lambda x: -x["wr"])
     ]
 
+    # V5.1: strategy comparison -- this is the actual answer to "did the
+    # momentum path help." MEAN_REVERSION numbers here should be close to
+    # what the pre-V5.1 backtester reported, since that path is unchanged;
+    # any material drift there would mean something in this edit leaked
+    # into the CHOPPY path and is worth a second look before trusting either.
+    strat_lines = []
+    for strat_name, trades_list in strategy_trades.items():
+        n = len(trades_list)
+        if n == 0:
+            strat_lines.append(f"  {strat_name}: 0 trades")
+            continue
+        w   = sum(1 for t in trades_list if t["won"])
+        pnl = sum(t["pnl_pct"] for t in trades_list) / n
+        strat_lines.append(f"  {strat_name}: {n} trades | {round(w/n*100,1)}% WR | avg {pnl:+.3f}%")
+
     print(f"\n{'='*60}")
     print(f"CRYPTO BACKTEST V3.0 COMPLETE")
     print(f"{'='*60}")
     print(f"Total trades: {total_t} | {bt_wr}% WR")
     print(f"Fingerprints: {written:,} | Pattern buckets: {buckets}")
+    print(f"--- By strategy ---")
+    for line in strat_lines:
+        print(line)
+    print(f"--- By pair ---")
     for p in sorted(pair_summary, key=lambda x: -x["wr"]):
         print(f"  {p['pair']:<12} {p['trades']:>6} trades | {p['wr']:>5.1f}% WR | "
               f"avg {p['avg_pnl']:+.3f}%")
@@ -731,6 +876,8 @@ def main():
         f"──────────────────\n"
         f"Overall WR: {bt_wr}% ({total_t} trades)\n"
         f"Fingerprints: {written:,} | Buckets: {buckets}\n"
+        f"──────────────────\n"
+        + "\n".join(strat_lines) + "\n"
         f"──────────────────\n"
         + "\n".join(sym_lines[:8]) + "\n"
         f"──────────────────\n"
