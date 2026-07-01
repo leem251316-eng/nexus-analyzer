@@ -378,15 +378,25 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
     return total, mode
 
 def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
-                           btc_closes: list) -> Tuple[int, str, str]:
+                           btc_closes: list, regime_window: Optional[list] = None) -> Tuple[int, str, str]:
     """
-    V5.1: Regime dispatcher. CHOPPY routes to the original, unmodified
+    V5.1.1: Regime dispatcher. CHOPPY routes to the original, unmodified
     mean-reversion engine; TRENDING routes to the new momentum engine.
+
+    regime_window: a SEPARATE, larger closes series used only for regime
+    detection. V5.1 originally reused closes_5m (the standard 120-bar
+    window everything else uses) for this -- but resample_5m_to_4h needs
+    ~960+ bars to produce the 20+ points calc_trend_structure requires,
+    so on a 120-bar window it silently always returned CHOPPY (2-3
+    resampled points, always under lookback). Falls back to closes_5m
+    if no regime_window is supplied, which reproduces that same silent
+    always-CHOPPY behavior -- callers should pass a real regime_window.
+
     Returns (score, mode, strategy) -- strategy is "MEAN_REVERSION" or
     "MOMENTUM", recorded on the trade dict so results can be split out
     and compared after a run.
     """
-    regime = detect_trend_regime_bt(closes_5m)
+    regime = detect_trend_regime_bt(regime_window if regime_window is not None else closes_5m)
     if regime == "TRENDING":
         total, mode = _compute_confidence_momentum_bt(pair, closes_5m, volumes_5m, btc_closes)
         return total, mode, "MOMENTUM"
@@ -484,6 +494,10 @@ def simulate_pair(pair: str, df: pd.DataFrame,
 
         closes_window  = closes[max(0, i-120):i+1]
         volumes_window = volumes[max(0, i-120):i+1]
+        # V5.1.1: regime detection needs ~960+ bars for a meaningful 4h
+        # resample (20 points * 48 bars/point) -- far more than the 120-bar
+        # window everything else uses. Separate, larger slice, regime-only.
+        regime_window  = closes[max(0, i-1050):i+1]
         btc_window     = []
         if btc_df is not None and not btc_df.empty and i < len(btc_df):
             btc_window = btc_df["close"].tolist()[max(0, i-120):i+1]
@@ -572,7 +586,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 mfe = mae    = 0.0
 
         else:
-            conf, mode, strategy = compute_confidence_bt(pair, closes_window, volumes_window, btc_window)
+            conf, mode, strategy = compute_confidence_bt(pair, closes_window, volumes_window, btc_window, regime_window)
             if mode in ("FULL", "CAUTIOUS"):
                 in_pos          = True
                 entry_price     = price * (1 + SLIPPAGE_PCT)
