@@ -108,6 +108,15 @@ SCORE_LOG: Dict[str, List[int]] = {"MEAN_REVERSION": [], "MOMENTUM": []}
 MOM_RSI_MIN = 50
 MOM_RSI_MAX = 78
 
+# V5.1.3: F&G constants -- matches crypto.py exactly. Backtester previously
+# never referenced fg at all; these were live-only, meaning the RSI gate
+# widening during extreme fear (the biggest single lever fg has) was never
+# simulated. See fetch_historical_fg() below for the data source.
+FNG_GREED_BLOCK = 80
+FNG_FEAR_LOOSE  = 20
+FNG_RSI_BONUS   = 15
+FNG_BASE        = "https://api.alternative.me"
+
 # Backtesting params
 SLIPPAGE_PCT      = 0.0005   # 0.05% half-spread
 WARMUP_BARS       = 60
@@ -231,17 +240,27 @@ def detect_trend_regime_bt(closes_5m: list) -> str:
     return "CHOPPY"
 
 def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
-                                    btc_closes: list) -> Tuple[int, str]:
+                                    btc_closes: list, fg: int = 50,
+                                    fg_momentum: float = 0.0, hist_score: int = 7) -> Tuple[int, str]:
     """
-    Original V5.0 mean-reversion confidence engine, UNCHANGED -- renamed
-    from compute_confidence_bt so the new dispatcher below can route to it.
+    Original V5.0 mean-reversion confidence engine -- V5.1.3 adds real F&G
+    (was completely absent before: no greed-block, no fear-driven gate
+    widening, no sentiment score). V5.1.4 makes hist_score a real parameter
+    -- caller now computes it from an actual walk-forward bucket lookup
+    (see simulate_pair) instead of every call getting a hardcoded neutral 7.
     Matches crypto.py V5.0 technical + macro layers.
-    Historical/analyst components set to neutral (can't backtest those).
+    Analyst component still neutral (can't backtest that -- needs live
+    Analyst service state, not something derivable from price history).
     Orderflow (L/S ratio, taker ratio) = 0 (real-time only).
     Returns (score, mode) where mode is FULL/CAUTIOUS/SKIP/BLOCK.
     """
+    if fg > FNG_GREED_BLOCK:
+        return 0, "BLOCK"
+
     recipe  = RECIPES.get(pair, {})
     max_rsi = recipe.get("rsi_entry_max", 40)
+    if fg < FNG_FEAR_LOOSE:
+        max_rsi += FNG_RSI_BONUS
     stop_pct = recipe.get("stop_pct", 0.015)
 
     if len(closes_5m) < WARMUP_BARS:
@@ -250,7 +269,7 @@ def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
     rsi_dict = calc_multi_tf_rsi(closes_5m)
     rsi_5m   = rsi_dict.get("5m")
 
-    # Hard gate: RSI above entry max = skip
+    # Hard gate: RSI above entry max (widened during extreme fear) = skip
     if rsi_5m is not None and rsi_5m > max_rsi:
         return 0, "BLOCK"
 
@@ -298,10 +317,13 @@ def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
         elif obv_mom < -5.0: vol_score -= 4
         elif obv_mom < -1.0: vol_score -= 2
 
-    # Historical: neutral at backtest time (no real bucket data yet)
-    hist_score = 7   # neutral placeholder
+    # Historical: real walk-forward bucket lookup, passed in by caller
+    # (was: hist_score = 7 flat placeholder, always, forever)
 
-    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score))
+    # V5.1.3: sentiment -- mirrors crypto.py _score_sentiment exactly
+    sent_score = _score_sentiment_bt(fg, fg_momentum)
+
+    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score + sent_score))
 
     if   total >= CONF_FULL:     mode = "FULL"
     elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
@@ -310,15 +332,40 @@ def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
 
     return total, mode
 
+def _score_sentiment_bt(fg: int, fg_momentum: float) -> int:
+    """V5.1.3: mirrors crypto.py ConfidenceEngine._score_sentiment exactly."""
+    score = 0
+    if   fg < 20:              score += 8
+    elif fg < 30:              score += 5
+    elif fg < 45:              score += 2
+    elif fg > FNG_GREED_BLOCK: score -= 8
+    elif fg > 70:              score -= 3
+
+    if   fg_momentum >  5: score += 7
+    elif fg_momentum >  2: score += 4
+    elif fg_momentum < -5: score -= 4
+    elif fg_momentum < -2: score -= 2
+
+    return min(score, 15)
+
 def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list,
-                                     btc_closes: list) -> Tuple[int, str]:
+                                     btc_closes: list, fg: int = 50,
+                                     fg_momentum: float = 0.0, hist_score: int = 7) -> Tuple[int, str]:
     """
     V5.1: Momentum counterpart to _compute_confidence_meanrev_bt. Mirrors
     crypto.py's _score_technical_momentum / _score_volume_momentum weighting
     exactly (same +40/+10 caps) so FULL/CAUTIOUS/SKIP/BLOCK thresholds mean
     the same thing on both paths. Only called when detect_trend_regime_bt()
     returns TRENDING.
+    V5.1.3: adds the same greed-block + sentiment score as the mean-reversion
+    path. Deliberately does NOT widen any RSI band for fear the way the
+    mean-reversion path does -- momentum's gate is about trend confirmation,
+    not an oversold level, so there's nothing analogous to widen. Fear/greed
+    still contributes via the sentiment score like everywhere else.
     """
+    if fg > FNG_GREED_BLOCK:
+        return 0, "BLOCK"
+
     if len(closes_5m) < WARMUP_BARS:
         return 0, "BLOCK"
 
@@ -372,9 +419,10 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
         elif obv_mom >  1.0: vol_score += 2
         elif obv_mom < -1.0: vol_score -= 4
 
-    hist_score = 7   # neutral placeholder, same as mean-reversion path
+    # hist_score comes in as a real parameter now (walk-forward bucket lookup)
+    sent_score = _score_sentiment_bt(fg, fg_momentum)
 
-    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score))
+    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score + sent_score))
 
     if   total >= CONF_FULL:     mode = "FULL"
     elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
@@ -384,30 +432,22 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
     return total, mode
 
 def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
-                           btc_closes: list, regime_window: Optional[list] = None) -> Tuple[int, str, str]:
+                           btc_closes: list, regime_window: Optional[list] = None,
+                           fg: int = 50, fg_momentum: float = 0.0,
+                           hist_score: int = 7) -> Tuple[int, str, str]:
     """
-    V5.1.1: Regime dispatcher. CHOPPY routes to the original, unmodified
-    mean-reversion engine; TRENDING routes to the new momentum engine.
-
-    regime_window: a SEPARATE, larger closes series used only for regime
-    detection. V5.1 originally reused closes_5m (the standard 120-bar
-    window everything else uses) for this -- but resample_5m_to_4h needs
-    ~960+ bars to produce the 20+ points calc_trend_structure requires,
-    so on a 120-bar window it silently always returned CHOPPY (2-3
-    resampled points, always under lookback). Falls back to closes_5m
-    if no regime_window is supplied, which reproduces that same silent
-    always-CHOPPY behavior -- callers should pass a real regime_window.
-
-    Returns (score, mode, strategy) -- strategy is "MEAN_REVERSION" or
-    "MOMENTUM", recorded on the trade dict so results can be split out
-    and compared after a run.
+    V5.1.4: Regime dispatcher. hist_score now comes from a real walk-forward
+    bucket lookup (see simulate_pair's bucket_stats), computed by the caller
+    since it needs the entry-time bucket key for later outcome recording --
+    dispatcher itself stays a pure function, no bucket state lives here.
+    Returns (score, mode, strategy).
     """
     regime = detect_trend_regime_bt(regime_window if regime_window is not None else closes_5m)
     if regime == "TRENDING":
-        total, mode = _compute_confidence_momentum_bt(pair, closes_5m, volumes_5m, btc_closes)
+        total, mode = _compute_confidence_momentum_bt(pair, closes_5m, volumes_5m, btc_closes, fg, fg_momentum, hist_score)
         SCORE_LOG["MOMENTUM"].append(total)
         return total, mode, "MOMENTUM"
-    total, mode = _compute_confidence_meanrev_bt(pair, closes_5m, volumes_5m, btc_closes)
+    total, mode = _compute_confidence_meanrev_bt(pair, closes_5m, volumes_5m, btc_closes, fg, fg_momentum, hist_score)
     SCORE_LOG["MEAN_REVERSION"].append(total)
     return total, mode, "MEAN_REVERSION"
 
@@ -431,6 +471,73 @@ def compute_btc_realized_vol(btc_closes: list) -> float:
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
+def fetch_historical_fg(days: int) -> Dict[str, int]:
+    """
+    V5.1.3: F&G is a DAILY index (alternative.me updates once/day, not
+    intraday) -- one API call for the whole run, returns {date_str: value}
+    so simulate_pair can do a fast dict lookup per bar instead of a network
+    call. Same endpoint/params live crypto.py already uses successfully
+    (fetch_fg_trend), just with a longer limit for the full backtest range.
+    Falls back to a flat 50 (neutral) per day on failure -- fails open,
+    same principle as everything else in this codebase: missing data
+    should never silently make the backtest MORE permissive than reality,
+    neutral is the safe default.
+    """
+    result: Dict[str, int] = {}
+    try:
+        r = requests.get(f"{FNG_BASE}/fng/", params={"limit": days + 5}, timeout=15)
+        data = r.json().get("data", [])
+        for d in data:
+            date_str = datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%d")
+            result[date_str] = int(d["value"])
+        log.info(f"Fetched {len(result)} days of F&G history")
+    except Exception as e:
+        log.warning(f"F&G history fetch failed, will default to neutral (50): {e}")
+    return result
+
+
+def compute_bucket_key(rsi_5m: Optional[float], fg: int, vwap_above: Optional[bool],
+                        uptrend: bool, higher_lows: bool, is_weekend: bool) -> str:
+    """
+    V5.1.4: bucket key for the walk-forward historical layer. Simplified
+    subset of crypto.py PatternMemory.get_historical_win_rate()'s full key
+    -- deliberately dropping session/btc_context/L-S-ratio/OI-change since
+    session needs a real intraday classifier this backtester doesn't have,
+    and L-S/OI are orderflow (unavailable historically, same as everywhere
+    else in this file). rsi/fg bands match live exactly so this stays
+    conceptually comparable, just coarser-grained.
+    """
+    rsi5 = rsi_5m if rsi_5m is not None else 99
+    rsi_b = ("rsi_lt25" if rsi5 < 25 else
+             "rsi_25_35" if rsi5 < 35 else
+             "rsi_35_40" if rsi5 < 40 else "rsi_gt40")
+    fg_b = "fg_fear" if fg < 30 else "fg_neutral" if fg < 60 else "fg_greed"
+    vwap_b = "above" if vwap_above else ("below" if vwap_above is not None else "unk")
+    return (f"{rsi_b}|{fg_b}|{vwap_b}|"
+            f"{'up' if uptrend else 'dn'}|"
+            f"{'hl' if higher_lows else 'no'}|"
+            f"{'wknd' if is_weekend else 'wkdy'}")
+
+
+def lookup_bucket_hist_score(bucket_stats: Dict[str, list], key: str, min_samples: int = 5) -> int:
+    """
+    V5.1.4: converts a bucket's win rate so far into a score contribution,
+    using crypto.py _score_historical's exact thresholds. Below min_samples,
+    falls back to the same flat neutral +7 this always used to be for
+    everyone -- "no data yet" should never LOOK like "proven good" or
+    "proven bad," same fail-safe principle as scanner.py's PM_MIN_BUCKET_TRADES.
+    """
+    outcomes = bucket_stats.get(key, [])
+    if len(outcomes) < min_samples:
+        return 7
+    wr = sum(outcomes) / len(outcomes)
+    if   wr >= 0.75: return 15
+    elif wr >= 0.65: return 10
+    elif wr >= 0.55: return 5
+    elif wr <= 0.35: return -5
+    return 0
+
+
 def fetch_all_crypto_bars(pairs: list, days: int) -> dict:
     """Fetch 5m bars from Alpaca CryptoHistoricalDataClient."""
     client   = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
@@ -468,8 +575,26 @@ def fetch_all_crypto_bars(pairs: list, days: int) -> dict:
 # ── Replay engine ─────────────────────────────────────────────────────────────
 def simulate_pair(pair: str, df: pd.DataFrame,
                   btc_df: Optional[pd.DataFrame] = None,
-                  validate_mode: bool = False) -> List[Dict]:
-    """Replay one pair's 5m bars through the confidence engine."""
+                  fg_by_date: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """
+    Replay one pair's 5m bars through the confidence engine.
+
+    V5.1.4: single chronological pass, not two separate train/validate
+    calls. The old structure ran validate_mode=False (full range) then
+    validate_mode=True (same full range, skip-trading the first 75%) as
+    two independent simulations -- harmless when historical scoring was a
+    flat constant, but wrong now that historical scoring LEARNS from
+    outcomes as it goes: a second independent pass would either re-learn
+    from scratch (losing everything the first pass learned) or need the
+    bucket state threaded between calls anyway. One pass, tag each trade
+    "validate" by whether its entry_bar fell in the last 25%, same
+    partition as before -- just no longer literally two simulations.
+
+    bucket_stats is per-pair, not pooled across pairs like live's PatternMemory
+    is. Pooling across pairs chronologically would need bars interleaved by
+    real timestamp across ALL pairs (a bigger restructure than tonight's
+    session) -- per-pair is the honest, bounded version of this.
+    """
     closes  = df["close"].tolist()
     volumes = df["volume"].tolist() if "volume" in df.columns else [0.0] * len(closes)
     times   = df.index.tolist()
@@ -479,7 +604,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
     tp_pct   = recipe.get("tp_pct",   0.025)
 
     total_bars = len(closes)
-    start_idx  = int(total_bars * 0.75) if validate_mode else 0
+    start_idx  = int(total_bars * 0.75)
 
     trades  = []
     in_pos  = False
@@ -492,14 +617,14 @@ def simulate_pair(pair: str, df: pd.DataFrame,
     conf_at_entry = 0
     mode_at_entry = ""
     strategy_at_entry = ""
+    bucket_key_at_entry = ""
+
+    bucket_stats: Dict[str, list] = {}
+    fg_by_date = fg_by_date or {}
 
     is_btc_eth = pair in BTC_IS_ETH
 
     for i in range(WARMUP_BARS, total_bars):
-        if validate_mode and i < start_idx:
-            # Still update price history during skip
-            pass
-
         closes_window  = closes[max(0, i-120):i+1]
         volumes_window = volumes[max(0, i-120):i+1]
         # V5.1.1: regime detection needs ~960+ bars for a meaningful 4h
@@ -513,6 +638,24 @@ def simulate_pair(pair: str, df: pd.DataFrame,
         price = closes[i]
         hour  = get_utc_hour(times[i])
 
+        # V5.1.3: F&G lookup for this bar's calendar date (daily index,
+        # not intraday -- same value used for every bar within a day).
+        # V5.1.4: momentum = simple 3-day delta off the same fetched series.
+        try:
+            date_str = times[i].strftime("%Y-%m-%d") if hasattr(times[i], "strftime") else None
+        except Exception:
+            date_str = None
+        fg_today = fg_by_date.get(date_str, 50) if date_str else 50
+        fg_momentum = 0.0
+        if date_str and fg_by_date:
+            try:
+                d_3ago = (times[i] - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+                fg_3ago = fg_by_date.get(d_3ago)
+                if fg_3ago is not None:
+                    fg_momentum = float(fg_today - fg_3ago)
+            except Exception:
+                fg_momentum = 0.0
+
         # V5.0: BTC realized vol regime gate (alts restricted when BTC vol > threshold)
         if not is_btc_eth and btc_window:
             btc_vol = compute_btc_realized_vol(btc_window[-120:])
@@ -521,9 +664,6 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     pass   # manage existing position normally
                 else:
                     continue   # skip new entries in alt when BTC vol high
-
-        if validate_mode and i < start_idx:
-            continue
 
         if in_pos:
             profit_pct = (price - entry_price) / entry_price
@@ -555,12 +695,14 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     "mode":        mode_at_entry,
                     "strategy":    strategy_at_entry,
                     "hour_utc":    hour,
-                    "validate":    validate_mode,
+                    "validate":    entry_bar >= start_idx,
                     "trade_id":    secrets.token_hex(8),
                 })
                 # Continue holding remaining half (entry_price unchanged, position half size)
                 # For simplicity, treat remaining half as continuing from current price
                 # (partial exit doesn't change entry_price in our simplified model)
+                # NOTE: bucket outcome NOT recorded here -- final exit below is
+                # the trade's true result; a partial doesn't represent it yet.
 
             # Full TP
             elif profit_pct >= tp_pct:
@@ -572,6 +714,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     exit_reason = "TIME_FAILSAFE"
 
             if exit_reason:
+                won = profit_pct > 0
                 trades.append({
                     "pair":        pair,
                     "entry_price": round(entry_price, 6),
@@ -581,20 +724,40 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     "hold_bars":   i - entry_bar,
                     "mfe":         round(mfe * 100, 3),
                     "mae":         round(mae * 100, 3),
-                    "won":         profit_pct > 0,
+                    "won":         won,
                     "confidence":  conf_at_entry,
                     "mode":        mode_at_entry,
                     "strategy":    strategy_at_entry,
                     "hour_utc":    hour,
-                    "validate":    validate_mode,
+                    "validate":    entry_bar >= start_idx,
                     "trade_id":    secrets.token_hex(8),
                 })
+                # V5.1.4: this is the walk-forward learning step -- record
+                # this trade's real outcome into the bucket it was entered
+                # under, so any LATER bar matching the same bucket benefits.
+                if bucket_key_at_entry:
+                    bucket_stats.setdefault(bucket_key_at_entry, []).append(won)
                 in_pos       = False
                 partial_done = False
                 mfe = mae    = 0.0
 
         else:
-            conf, mode, strategy = compute_confidence_bt(pair, closes_window, volumes_window, btc_window, regime_window)
+            trend  = calc_trend_structure(closes_window)
+            vwap   = calc_vwap(closes_window, volumes_window)
+            vwap_above = (closes_window[-1] > vwap) if vwap else None
+            is_weekend = times[i].weekday() >= 5 if hasattr(times[i], "weekday") else False
+            rsi_5m_now = calc_multi_tf_rsi(closes_window).get("5m")
+
+            bucket_key = compute_bucket_key(rsi_5m_now, fg_today, vwap_above,
+                                             trend.get("uptrend", False),
+                                             trend.get("higher_lows", False),
+                                             is_weekend)
+            hist_score = lookup_bucket_hist_score(bucket_stats, bucket_key)
+
+            conf, mode, strategy = compute_confidence_bt(
+                pair, closes_window, volumes_window, btc_window, regime_window,
+                fg_today, fg_momentum, hist_score
+            )
             if mode in ("FULL", "CAUTIOUS"):
                 in_pos          = True
                 entry_price     = price * (1 + SLIPPAGE_PCT)
@@ -605,7 +768,8 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 entry_ts        = times[i]
                 conf_at_entry   = conf
                 mode_at_entry   = mode
-                strategy_at_entry = strategy
+                strategy_at_entry   = strategy
+                bucket_key_at_entry = bucket_key
 
     # Close any open at end
     if in_pos and closes:
@@ -625,7 +789,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
             "mode":        mode_at_entry,
             "strategy":    strategy_at_entry,
             "hour_utc":    hour,
-            "validate":    validate_mode,
+            "validate":    entry_bar >= start_idx,
             "trade_id":    secrets.token_hex(8),
         })
 
@@ -764,7 +928,6 @@ def main():
     parser.add_argument("--days",      type=int,   default=365)
     parser.add_argument("--pairs",     nargs="+",  default=None)
     parser.add_argument("--dry-run",   action="store_true")
-    parser.add_argument("--no-validate", action="store_true")
     args = parser.parse_args()
 
     pairs   = args.pairs or ALL_PAIRS
@@ -778,18 +941,22 @@ def main():
     log.info("=" * 60)
     log.info(f"NEXUS CRYPTO BACKTESTER V3.0 — Alpaca Edition")
     log.info(f"Pairs: {pairs} | Days: {days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
-    log.info(f"V5.0: BTC vol regime gate | Partial exits | Walk-forward validation")
+    log.info(f"V5.1.4: F&G history | Walk-forward pattern memory | Single-pass replay")
     log.info("=" * 60)
 
     send_alert(
         f"🌙 NEXUS CRYPTO BACKTESTER V3.0 STARTING\n"
         f"Data source: Alpaca (replaces broken Coinbase API)\n"
         f"Pairs: {len(pairs)} | Days: {days}\n"
-        f"V5.0: BTC vol regime | Partial exits | Walk-forward\n"
-        f"ETA: ~15-25 min"
+        f"V5.1.4: F&G history | Walk-forward pattern memory\n"
+        f"ETA: ~10-20 min"
     )
 
     start_time = time.time()
+
+    # V5.1.3: one F&G fetch for the whole run, not per-bar
+    log.info("Fetching F&G history...")
+    fg_by_date = fetch_historical_fg(days)
 
     # Fetch all bars
     all_bars = fetch_all_crypto_bars(pairs, days)
@@ -812,15 +979,10 @@ def main():
         df = all_bars[pair]
         log.info(f"Simulating {pair} ({len(df):,} bars)...")
 
-        # Full training
-        train_trades = simulate_pair(pair, df, btc_df, validate_mode=False)
+        # V5.1.4: single walk-forward pass -- see simulate_pair docstring
+        # for why this replaced the old two-call train/validate structure.
+        all_t = simulate_pair(pair, df, btc_df, fg_by_date)
 
-        # Walk-forward validation
-        val_trades = []
-        if not args.no_validate:
-            val_trades = simulate_pair(pair, df, btc_df, validate_mode=True)
-
-        all_t     = train_trades + val_trades
         wins      = sum(1 for t in all_t if t["won"])
         non_partial = [t for t in all_t if t["exit_reason"] != "PARTIAL_TP"]
         wr        = round(wins / max(len(all_t), 1) * 100, 1)
@@ -830,7 +992,7 @@ def main():
             strategy_trades.setdefault(t.get("strategy", "MEAN_REVERSION"), []).append(t)
 
         log.info(f"  {pair}: {len(all_t)} trades | {wr}% WR | avg P&L: {avg_pnl:+.3f}%")
-        all_trades.extend(train_trades)  # only write training to DB
+        all_trades.extend(all_t)  # V5.1.4: single pass, all trades written
         pair_summary.append({
             "pair":   pair,
             "trades": len(all_t),
