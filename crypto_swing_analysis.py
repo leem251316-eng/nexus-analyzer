@@ -356,16 +356,16 @@ def _marginal_table(rows: List[Dict[str, Any]], field: str) -> Dict[Any, int]:
     return counts
 
 def print_marginal(title: str, field: str, lows: list, highs: list, baseline: list):
-    print(f"\n--- {title} ---")
+    print(f"\n--- {title} ---", flush=True)
     lc, hc, bc = (_marginal_table(lows, field), _marginal_table(highs, field),
                   _marginal_table(baseline, field))
     all_vals = sorted(set(lc) | set(hc) | set(bc), key=lambda x: str(x))
     nL, nH, nB = len(lows), len(highs), len(baseline)
-    print(f"  {'value':<10} {'LOWS':>16} {'HIGHS':>16} {'BASELINE':>16}")
+    print(f"  {'value':<10} {'LOWS':>16} {'HIGHS':>16} {'BASELINE':>16}", flush=True)
     for v in all_vals:
         l, h, b = lc.get(v, 0), hc.get(v, 0), bc.get(v, 0)
         print(f"  {str(v):<10} {l:>5} ({_pct(l,nL):>5.1f}%) {h:>5} ({_pct(h,nH):>5.1f}%) "
-              f"{b:>5} ({_pct(b,nB):>5.1f}%)")
+              f"{b:>5} ({_pct(b,nB):>5.1f}%)", flush=True)
 
 def print_numeric_summary(title: str, field: str, lows: list, highs: list, baseline: list):
     def stats(rows):
@@ -373,16 +373,16 @@ def print_numeric_summary(title: str, field: str, lows: list, highs: list, basel
         if not vals:
             return None
         return sum(vals) / len(vals), min(vals), max(vals), len(vals)
-    print(f"\n--- {title} (mean [min, max], n) ---")
+    print(f"\n--- {title} (mean [min, max], n) ---", flush=True)
     for label, rows in (("LOWS", lows), ("HIGHS", highs), ("BASELINE", baseline)):
         s = stats(rows)
         if s is None:
-            print(f"  {label:<10}: no data")
+            print(f"  {label:<10}: no data", flush=True)
         else:
-            print(f"  {label:<10}: {s[0]:.2f}  [{s[1]:.2f}, {s[2]:.2f}]  n={s[3]}")
+            print(f"  {label:<10}: {s[0]:.2f}  [{s[1]:.2f}, {s[2]:.2f}]  n={s[3]}", flush=True)
 
 def print_bucket_lift(label: str, group: list, baseline: list):
-    print(f"\n--- Full bucket key: {label} vs BASELINE (min {MIN_BUCKET_SAMPLES} samples, sorted by lift) ---")
+    print(f"\n--- Full bucket key: {label} vs BASELINE (min {MIN_BUCKET_SAMPLES} samples, sorted by lift) ---", flush=True)
     gb = _marginal_table(group, "bucket_key")
     bb = _marginal_table(baseline, "bucket_key")
     nG, nB = len(group), len(baseline)
@@ -398,9 +398,9 @@ def print_bucket_lift(label: str, group: list, baseline: list):
     rows.sort(key=lambda r: (-(r[5] if r[5] != float("inf") else 1e9), -r[1]))
     if not rows:
         print(f"  (no bucket had >= {MIN_BUCKET_SAMPLES} {label} samples -- expected with n={nG} "
-              f"points spread across a 6-dimension key; read the marginal tables above instead)")
+              f"points spread across a 6-dimension key; read the marginal tables above instead)", flush=True)
     for key, gc_, gp, bc_, bp, lift in rows[:15]:
-        print(f"  {key:<45} {label.lower()}={gc_:>3} ({gp:4.1f}%)  baseline={bc_:>4} ({bp:4.1f}%)  lift={lift:4.2f}x")
+        print(f"  {key:<45} {label.lower()}={gc_:>3} ({gp:4.1f}%)  baseline={bc_:>4} ({bp:4.1f}%)  lift={lift:4.2f}x", flush=True)
 
 
 def send_csv_via_telegram(path: str, caption: str):
@@ -434,6 +434,9 @@ def export_csv(path: str, lows: list, highs: list, baseline: list):
     fieldnames = ["point_type", "idx", "timestamp", "price", "rsi_5m", "rsi_1h", "fg",
                   "vwap_above", "vwap_dist_pct", "uptrend", "higher_lows", "is_weekend",
                   "regime", "vol_ratio_20", "bucket_key"]
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -511,11 +514,11 @@ def main():
         if f is not None:
             baseline_features.append(f)
 
-    print(f"\n{'='*60}")
-    print(f"SWING ANALYSIS -- {args.pair} -- {args.days}d @ {args.zigzag_pct}% zigzag")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"SWING ANALYSIS -- {args.pair} -- {args.days}d @ {args.zigzag_pct}% zigzag", flush=True)
+    print(f"{'='*60}", flush=True)
     print(f"Swing lows: {len(low_features)}  |  Swing highs: {len(high_features)}  |  "
-          f"Baseline: {len(baseline_features)}")
+          f"Baseline: {len(baseline_features)}", flush=True)
 
     print_numeric_summary("RSI (5m)", "rsi_5m", low_features, high_features, baseline_features)
     print_numeric_summary("Distance from VWAP (%)", "vwap_dist_pct", low_features, high_features, baseline_features)
@@ -528,16 +531,22 @@ def main():
     print_bucket_lift("LOWS", low_features, baseline_features)
     print_bucket_lift("HIGHS", high_features, baseline_features)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*60}", flush=True)
 
     if args.csv:
-        export_csv(args.csv, low_features, high_features, baseline_features)
-        send_csv_via_telegram(
-            args.csv,
-            f"Swing analysis: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
-            f"{len(low_features)} lows, {len(high_features)} highs, "
-            f"{len(baseline_features)} baseline"
-        )
+        try:
+            export_csv(args.csv, low_features, high_features, baseline_features)
+            send_csv_via_telegram(
+                args.csv,
+                f"Swing analysis: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
+                f"{len(low_features)} lows, {len(high_features)} highs, "
+                f"{len(baseline_features)} baseline"
+            )
+        except Exception as e:
+            # Fail-open: the console report above already ran to completion and
+            # is sitting in Deploy Logs either way. A CSV/Telegram hiccup here
+            # shouldn't turn a successful analysis into a crashed deployment.
+            log.error(f"CSV export/delivery failed: {e}")
 
     log.info("DONE.")
 
