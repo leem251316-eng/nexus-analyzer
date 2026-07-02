@@ -106,7 +106,23 @@ SCORE_LOG: Dict[str, List[int]] = {"MEAN_REVERSION": [], "MOMENTUM": []}
 # V5.1: mirrors crypto.py MOM_RSI_MIN/MAX exactly -- keep these two files'
 # values in sync by hand if either changes.
 MOM_RSI_MIN = 50
-MOM_RSI_MAX = 78
+# V5.1.5: was 78. Full-year run showed momentum's win rate was fine
+# (36.3%, close to mean-reversion's 37.1%) but its LOSSES ran bigger --
+# net -0.131% avg vs mean-reversion's ~breakeven +0.004%, same win rate.
+# 65-78 is buying into likely-exhausted strength, closer to a top than
+# a continuation. Narrowing to avoid that zone specifically -- this is
+# a reasoned hypothesis based on the shape of the loss, not a calibrated
+# fix. Needs a rerun to actually confirm it helps.
+MOM_RSI_MAX = 65
+
+# V5.1.5: momentum gets its own risk profile instead of borrowing the
+# pair's mean-reversion stop/TP wholesale. Multipliers (not flat values)
+# to keep each pair's own volatility character while shifting the whole
+# profile tighter -- momentum entries happen later in a move than a dip-buy,
+# so there's less room left to run either direction. Same caveat: reasoned
+# starting point, not backtested at these specific values yet.
+MOM_STOP_MULT = 0.7   # 30% tighter -- cut losers faster
+MOM_TP_MULT   = 0.6   # 40% closer -- take the shorter leg that's actually there
 
 # V5.1.3: F&G constants -- matches crypto.py exactly. Backtester previously
 # never referenced fg at all; these were live-only, meaning the RSI gate
@@ -618,6 +634,12 @@ def simulate_pair(pair: str, df: pd.DataFrame,
     mode_at_entry = ""
     strategy_at_entry = ""
     bucket_key_at_entry = ""
+    # V5.1.5: which stop/tp is actually active for the OPEN position --
+    # set at entry based on which strategy fired, used for every exit
+    # check while in_pos. Defaults to the pair's own values; only
+    # overridden to the tighter momentum profile when strategy=="MOMENTUM".
+    active_stop_pct = stop_pct
+    active_tp_pct   = tp_pct
 
     bucket_stats: Dict[str, list] = {}
     fg_by_date = fg_by_date or {}
@@ -674,11 +696,11 @@ def simulate_pair(pair: str, df: pd.DataFrame,
             exit_reason = None
 
             # Stop loss
-            if profit_pct <= -stop_pct:
+            if profit_pct <= -active_stop_pct:
                 exit_reason = "STOP_LOSS"
 
             # V5.0: Partial exit at 50% of TP
-            elif not partial_done and profit_pct >= tp_pct * PARTIAL_TP_MULT:
+            elif not partial_done and profit_pct >= active_tp_pct * PARTIAL_TP_MULT:
                 partial_done = True
                 # Record partial exit as its own trade
                 trades.append({
@@ -705,7 +727,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 # the trade's true result; a partial doesn't represent it yet.
 
             # Full TP
-            elif profit_pct >= tp_pct:
+            elif profit_pct >= active_tp_pct:
                 exit_reason = "TAKE_PROFIT"
 
             # Trend break / time failsafe (simplified)
@@ -770,6 +792,13 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 mode_at_entry   = mode
                 strategy_at_entry   = strategy
                 bucket_key_at_entry = bucket_key
+                # V5.1.5: momentum gets its own tighter risk profile
+                if strategy == "MOMENTUM":
+                    active_stop_pct = stop_pct * MOM_STOP_MULT
+                    active_tp_pct   = tp_pct * MOM_TP_MULT
+                else:
+                    active_stop_pct = stop_pct
+                    active_tp_pct   = tp_pct
 
     # Close any open at end
     if in_pos and closes:
