@@ -1,1709 +1,1144 @@
+#!/usr/bin/env python3
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.2
-4 dedicated bots: NUGT, SOXL, LABU, TQQQ
-Each reads full market context, selects a trading mode, executes independently.
+crypto_backtester.py V3.0 -- NEXUS Crypto Pattern Memory Seeder
+================================================================
+V3.0 (Jun 2026): Switched from broken Coinbase historical API to Alpaca
+crypto bars. Coinbase's candle API returns 0 candles on Railway IPs
+intermittently. Alpaca CryptoHistoricalDataClient is stable, proven, and
+already used by other NEXUS services.
 
-Trading Modes:
-  SCALP    — RSI dip + bounce. Quick target. Choppy/uncertain markets.
-  RIDE     — Sustained trend entry. Looser trail. Bull market confirmed.
-  EXTENDED — Multi-bar uptrend, higher lows locked in. Ride the full wave.
+V3.0 additions vs V2.0:
+  ✅ Data source: Alpaca crypto bars (BTC/USD format) instead of Coinbase API
+  ✅ BTC realized vol regime gate (V5.0): when 7d BTC vol > 5%, alt entries
+     blocked in backtest (matches live crypto.py V5.0 behavior)
+  ✅ Partial exit modeling (V5.0): at 50% of TP target, 50% position exited,
+     remaining half tracked to full TP/ATR trail
+  ✅ Walk-forward validation: train on 75%, validate on last 25%
+  ✅ Slippage modeling: 0.05% half-spread applied on entry
+  ✅ Exit reason breakdown including partial exits
 
-Bear pairs: each bot monitors bull RSI exhaustion -> flips to bear ETF on reversal.
-  NUGT -> DUST | SOXL -> SOXS | LABU -> LABD | TQQQ -> SQQQ
+Key design principle: match crypto.py V5.0 EXACTLY for the confidence engine
+(7 scoring layers) -- historical/analyst scores set to neutral (0.5) since
+we can't backtest those in historical simulation.
 
-Capital allocation (by EV from nexus_analyzer 2yr + 1yr backtest):
-  NUGT 30% | SOXL 25% | LABU 25% | TQQQ 20%
+Environment:
+  DATABASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY
+  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-V2.2 — Cross-service capital coordination (Jun 30 2026):
-  Confirmed: Phase4 and Berserker (main.py, separate Railway service/process,
-  nexus-commander/rare-perception) trade against the SAME live Alpaca account
-  -- one account was ever created; paper trading was layered on top of it,
-  never a second account. Each service was independently calling Alpaca's
-  buying_power and sizing trades with zero knowledge of the other's
-  outstanding orders. Added capital_coordinator.py, coordinating through
-  Postgres (both services already share DATABASE_URL). try_buy() now clamps
-  trade_size against get_available() before sizing, reserves immediately
-  before order submission, releases in a finally block immediately after --
-  whether the order succeeds or fails. Fails open throughout: any DB/
-  connection problem falls back to raw buying_power, uncoordinated, exactly
-  the pre-V2.2 behavior, rather than blocking a trade. Identical fix applied
-  to main.py (V10.25).
-
-V2.1 — Exit priority fix (Jun 30 2026):
-  rsi-overbought was checked BEFORE the profit ratchet. On a mean-reversion
-  entry (buy oversold, RSI climbs toward overbought as the thesis plays out),
-  that ordering let rsi-overbought cut almost every winner the instant profit
-  ticked positive -- before the position ever reached early_ratchet.
-  Backtest evidence (phase4_backtester.py V1.2, 2yr replay): 298/321 wins
-  (93%) were rsi-overbought exits averaging ~+0.24%, while the 61 stop-losses
-  averaged ~-1.7% (atr_stop) -- a ~7:1 win/loss size mismatch that made a
-  73% WR system net PnL-negative (avg -0.031%/trade) in both training and
-  out-of-sample. Ratchet is now checked first; rsi-overbought is the fallback
-  for trades that hit RSI=70 without yet clearing early_ratchet -- i.e. take
-  the small win/scratch now rather than risk it reversing to red. No change
-  to stop-loss priority (still checked first, unconditionally) or to any
-  entry-side logic, sizing, or gating.
-
-V2.0 — Full Alpaca migration (Jun 29 2026):
-  Webull broker layer completely removed.
-  Alpaca TradingClient handles all orders, positions, buying power.
-  Alpaca StockHistoricalDataClient replaces yfinance for all price bars.
-  yfinance kept as fallback only for ^VIX (not available on Alpaca IEX).
-  acct_id param removed throughout — Alpaca uses API key auth, not account IDs.
-  Fractional shares supported via Alpaca notional orders.
-
-V1.9 — Alpaca data feed replaces yfinance for price bars.
-V1.8 — Score + StochRSI fixes.
-V1.7 — RSI Wilder EWM fix.
-V1.6 — Complete entry/exit overhaul.
+Usage:
+  python crypto_backtester.py              # 365 days
+  python crypto_backtester.py --days 180  # 6 months
+  python crypto_backtester.py --dry-run   # no DB writes
+  python crypto_backtester.py --pairs BTC-USDC ETH-USDC
 """
 
 import os
+import sys
 import time
-import threading
-import traceback
-import requests
-import pandas as pd
-import numpy as np
+import math
+import secrets
+import argparse
+import logging
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List, Tuple, Any
 
-from capital_coordinator import CapitalCoordinator, NO_COORDINATION
+import pandas as pd
+import psycopg2
+import psycopg2.extras
+import requests
 
-try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
-    _alpaca_trade_ok = True
-except ImportError:
-    _alpaca_trade_ok = False
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-try:
-    from alpaca.data import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-    _alpaca_data_ok = True
-except ImportError:
-    _alpaca_data_ok = False
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [CRYPTO-BT] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("crypto_bt")
 
-try:
-    import psycopg2
-    import psycopg2.extras
-    _db_available = True
-except ImportError:
-    _db_available = False
+# ── Environment ───────────────────────────────────────────────────────────────
+DATABASE_URL     = os.environ.get("DATABASE_URL", "")
+ALPACA_API_KEY   = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET    = os.environ.get("ALPACA_SECRET_KEY", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ── Env ───────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
-DATABASE_URL      = os.environ.get("DATABASE_URL", "")
-ANALYST_URL       = os.environ.get("ANALYST_URL", "").rstrip("/")
-NEXUS_TOKEN       = os.environ.get("NEXUS_INTERNAL_TOKEN", "")
-SQQQ_ENABLED      = os.environ.get("PHASE4_SQQQ_ENABLED", "false").lower() == "true"
-ALPACA_API_KEY    = os.environ.get("APCA_API_KEY_ID", "")
-ALPACA_API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "")
-PAPER_MODE        = os.environ.get("APCA_PAPER", "false").lower() == "true"
+# ── Pairs ─────────────────────────────────────────────────────────────────────
+# Coinbase USDC pairs -> Alpaca slash format
+ALL_PAIRS = [
+    "BTC-USDC", "ETH-USDC", "SOL-USDC", "DOGE-USDC",
+    "XRP-USDC", "DOT-USDC", "ADA-USDC", "LTC-USDC",
+    "POL-USDC", "SUI-USDC",
+]
 
-CENTRAL  = ZoneInfo("America/Chicago")
-BOT_NAME = "PHASE4"
+ALPACA_SYM = {p: p.replace("-USDC", "/USD") for p in ALL_PAIRS}
+# Exceptions
+ALPACA_SYM["POL-USDC"] = "MATIC/USD"   # Alpaca uses MATIC for Polygon
 
-# ── Alpaca clients ────────────────────────────────────────────────────────────
-_trade_client = None
-_data_client  = None
-
-if _alpaca_trade_ok and ALPACA_API_KEY and ALPACA_API_SECRET:
-    try:
-        _trade_client = TradingClient(
-            api_key=ALPACA_API_KEY,
-            secret_key=ALPACA_API_SECRET,
-            paper=PAPER_MODE,
-        )
-        print(f"[PHASE4] Alpaca trading client ready (paper={PAPER_MODE})", flush=True)
-    except Exception as _e:
-        print(f"[PHASE4] ⚠ Alpaca trading client error: {_e}", flush=True)
-
-if _alpaca_data_ok and ALPACA_API_KEY and ALPACA_API_SECRET:
-    try:
-        _data_client = StockHistoricalDataClient(
-            api_key=ALPACA_API_KEY,
-            secret_key=ALPACA_API_SECRET,
-        )
-    except Exception as _e:
-        print(f"[PHASE4] ⚠ Alpaca data client error: {_e}", flush=True)
-
-# ── Per-symbol config ─────────────────────────────────────────────────────────
-BOT_CONFIGS = {
-    "NUGT": {
-        "bear_pair":      "DUST",
-        "underlying":     "GDX",
-        "budget_pct":     0.30,
-        "min_score":      5,
-        "atr_stop":       0.0213,
-        "early_ratchet":  0.0059,
-        "late_ratchet":   0.0111,
-        "trail_normal":   0.0039,
-        "trail_tight":    0.0027,
-        "avoid_hours":    [9],
-        "avoid_days":     [],
-        "best_signals":   ["rsi_lt40", "bb_squeeze", "below_ma20", "rsi14_lt35"],
-        "worst_signals":  ["near_lower_bb", "ema9_above_ema21"],
-        "ride_stop_mult": 1.3,
-        "ext_stop_mult":  1.8,
-    },
-    "SOXL": {
-        "bear_pair":      "SOXS",
-        "underlying":     "SMH",
-        "budget_pct":     0.25,
-        "min_score":      6,
-        "atr_stop":       0.0159,
-        "early_ratchet":  0.0051,
-        "late_ratchet":   0.0097,
-        "trail_normal":   0.0029,
-        "trail_tight":    0.0020,
-        "avoid_hours":    [],
-        "avoid_days":     [],
-        "best_signals":   ["far_below_bb", "rsi14_lt20", "rsi_lt25", "stochrsi_oversold", "near_lower_bb"],
-        "worst_signals":  ["macd_bullish", "below_ma20"],
-        "ride_stop_mult": 1.3,
-        "ext_stop_mult":  1.8,
-    },
-    "LABU": {
-        "bear_pair":      "LABD",
-        "underlying":     "XBI",
-        "budget_pct":     0.25,
-        "min_score":      6,
-        "atr_stop":       0.0193,
-        "early_ratchet":  0.0054,
-        "late_ratchet":   0.0101,
-        "trail_normal":   0.0035,
-        "trail_tight":    0.0024,
-        "avoid_hours":    [10, 13],
-        "avoid_days":     [],
-        "best_signals":   ["at_lower_bb", "rsi_lt25", "rsi14_lt20", "stochrsi_oversold", "far_below_bb"],
-        "worst_signals":  ["ema9_above_ema21", "near_lower_bb"],
-        "ride_stop_mult": 1.3,
-        "ext_stop_mult":  1.8,
-    },
-    "TQQQ": {
-        "bear_pair":      "SQQQ",
-        "underlying":     "QQQ",
-        "budget_pct":     0.20,
-        "min_score":      4,
-        "atr_stop":       0.0151,
-        "early_ratchet":  0.0051,
-        "late_ratchet":   0.0097,
-        "trail_normal":   0.0028,
-        "trail_tight":    0.0019,
-        "avoid_hours":    [10],
-        "avoid_days":     [],
-        "best_signals":   ["rsi_lt40", "macd_bullish", "near_lower_bb", "obv_falling", "ema9_above_ema21"],
-        "worst_signals":  ["williams_oversold", "bb_squeeze"],
-        "ride_stop_mult": 1.3,
-        "ext_stop_mult":  2.0,
-    },
+# ── Recipes (matches crypto.py V5.0 exactly) ─────────────────────────────────
+RECIPES: Dict[str, Dict] = {
+    "BTC-USDC":  {"stop_pct": 0.012, "tp_pct": 0.025, "rsi_entry_max": 38},
+    "ETH-USDC":  {"stop_pct": 0.015, "tp_pct": 0.030, "rsi_entry_max": 38},
+    "SOL-USDC":  {"stop_pct": 0.018, "tp_pct": 0.035, "rsi_entry_max": 40},
+    "DOGE-USDC": {"stop_pct": 0.020, "tp_pct": 0.040, "rsi_entry_max": 42},
+    "XRP-USDC":  {"stop_pct": 0.015, "tp_pct": 0.028, "rsi_entry_max": 30},
+    "DOT-USDC":  {"stop_pct": 0.018, "tp_pct": 0.032, "rsi_entry_max": 45},
+    "ADA-USDC":  {"stop_pct": 0.018, "tp_pct": 0.032, "rsi_entry_max": 40},
+    "LTC-USDC":  {"stop_pct": 0.014, "tp_pct": 0.026, "rsi_entry_max": 43},
+    "POL-USDC":  {"stop_pct": 0.020, "tp_pct": 0.038, "rsi_entry_max": 40},
+    "SUI-USDC":  {"stop_pct": 0.022, "tp_pct": 0.042, "rsi_entry_max": 42},
 }
 
-BEAR_RECIPES = {
-    "DUST": {
-        "underlying":     "GDX",
-        "min_score":      7,
-        "atr_stop":       0.0180,
-        "early_ratchet":  0.0134,
-        "trail":          0.0033,
-        "avoid_hours":    [11],
-        "best_signals":   ["obv_rising", "below_ma20", "macd_bullish", "far_below_bb"],
-        "worst_signals":  ["obv_falling", "near_lower_bb"],
-    },
-    "SOXS": {
-        "underlying":     "SMH",
-        "min_score":      9,
-        "atr_stop":       0.0177,
-        "early_ratchet":  0.0120,
-        "trail":          0.0032,
-        "avoid_hours":    [9],
-        "best_signals":   ["below_ma20", "rsi_lt25", "rsi14_lt20", "stochrsi_oversold", "near_lower_bb"],
-        "worst_signals":  ["obv_rising", "macd_bullish"],
-    },
-    "LABD": {
-        "underlying":     "XBI",
-        "min_score":      4,
-        "atr_stop":       0.0164,
-        "early_ratchet":  0.0032,
-        "trail":          0.0030,
-        "avoid_hours":    [11, 14],
-        "best_signals":   ["far_below_bb", "near_lower_bb", "obv_falling", "rsi_lt25", "macd_bullish"],
-        "worst_signals":  ["bb_squeeze", "below_ma20"],
-    },
-    "SQQQ": {
-        "underlying":     "QQQ",
-        "min_score":      5,
-        "atr_stop":       0.0178,
-        "early_ratchet":  0.0045,
-        "trail":          0.0030,
-        "avoid_hours":    [11, 13, 14],
-        "best_signals":   ["rsi_lt40", "rsi14_lt35", "bouncing"],
-        "worst_signals":  ["rsi_lt25", "at_lower_bb"],
-    },
-}
+# Confidence thresholds (matches crypto.py V5.0 defaults)
+CONF_FULL         = 75
+CONF_CAUTIOUS     = 55
+CONF_SKIP         = 40
 
-BEAR_EXTENDED_TP = {
-    "DUST": {"trail_activate": 0.020, "trail_stop": 0.010},
-    "SOXS": {"trail_activate": 0.020, "trail_stop": 0.010},
-}
+# V5.1.2: score visibility. 0 trades tells you nothing about WHY -- was
+# every bar scoring near 0, or clustering at 50 and just missing? Tracks
+# every score computed (not just ones that pass), split by strategy, so
+# the summary can show a real distribution instead of a pass/fail count.
+SCORE_LOG: Dict[str, List[int]] = {"MEAN_REVERSION": [], "MOMENTUM": []}
 
-SIGNAL_COMBO_BOOST_SYMBOLS = {
-    "SOXL": [("bb_squeeze", "stochrsi_oversold")],
-    "LABU": [("rsi14_lt20", "rsi_lt25")],
-    "TQQQ": [("bouncing", "obv_falling")],
-    "NUGT": [("bb_squeeze", "macd_bullish")],
-    "DUST": [("far_below_bb", "stochrsi_oversold")],
-    "SOXS": [("below_ma20", "rsi_lt25")],
-    "LABD": [("ema9_above_ema21", "stochrsi_oversold")],
-}
+# V5.2: momentum's thesis replaced entirely. Both the full 8-pair run and
+# the dedicated SOL sweep independently showed the same failure shape --
+# win rate was fine (36-45%), losses just ran bigger than wins. That's the
+# signature of buying an already-extended move (RSI 50-78 fires AFTER
+# strength is visible, which is exactly when it's most exhausted), not
+# catching a fresh one. Old MOM_RSI_MIN/MAX/STOP_MULT/TP_MULT retired --
+# replaced with a pullback-in-confirmed-uptrend thesis: same regime gate
+# (4h uptrend + 5m higher-lows, that part never failed), but the RSI
+# condition flips from "accelerating and elevated" to "cooled off from a
+# recent push, structure still intact." Classic trend-continuation entry,
+# not a new number on the old knob. UNTESTED on real data -- same
+# validation discipline as everything else, no shortcuts for a good story.
+MOM_PULLBACK_RSI_MIN = 40   # below this = let mean-reversion's oversold path handle it
+MOM_PULLBACK_RSI_MAX = 58   # above this = still extended, not a pullback yet
 
-VIX_CAUTION  = 28.0
-VIX_PAUSE    = 35.0
+# V5.2: risk parameters reset to baseline (no multiplier) rather than
+# carrying over last night's 0.7/0.6 tuning -- that tuning was calibrated
+# for the OLD (now-retired) entry thesis. Stacking an unproven risk profile
+# on an unproven new entry makes results impossible to read cleanly: a bad
+# outcome wouldn't tell you which of the two unknowns was the problem.
+MOM_STOP_MULT = 1.0
+MOM_TP_MULT   = 1.0
 
-# V2.4: daily_losses/daily_pnl were tracked and reset at midnight since
-# V2.2 but never actually READ anywhere -- boot log claimed "Daily limits"
-# as a live feature since V2.2, it wasn't. Per-bot, not account-wide:
-# matches how daily_pnl is already tracked (instance attr per SymbolBot),
-# and a bad day on one bot shouldn't necessarily silence the other three.
-# -6% is a reasoned default (room for normal stop-loss variance across a
-# few trades, stops before a bad day compounds), not backtested at this
-# specific value -- same caveat as every other first-pass number tonight.
-MAX_DAILY_LOSS_PCT = -6.0
+# V5.1.3: F&G constants -- matches crypto.py exactly. Backtester previously
+# never referenced fg at all; these were live-only, meaning the RSI gate
+# widening during extreme fear (the biggest single lever fg has) was never
+# simulated. See fetch_historical_fg() below for the data source.
+FNG_GREED_BLOCK = 80
+FNG_FEAR_LOOSE  = 20
+FNG_RSI_BONUS   = 15
+FNG_BASE        = "https://api.alternative.me"
 
-REVERSAL_HIGH_RSI    = 75
-REVERSAL_HIGH_DROP   = 0.008
-REVERSAL_OB_RSI      = 70
-REVERSAL_RSI_RESET   = 60
-REVERSAL_CONFIRM     = 0.005
-REVERSAL_MAX_WATCH   = 1800
-
-DWELL_MINUTES        = 30
-DWELL_FLAT_THRESHOLD = 0.001
-RSI_OVERBOUGHT_EXIT  = 70
-QQQ_BEAR_RSI_GATE      = 58
-QQQ_BEAR_RSI_GATE_LABD = 65
-
-PM_MIN_TRADES           = 15
-PM_ANALYSIS_INTERVAL    = 86400
-PM_MIN_BUCKET_TRADES    = 3
-WIN_RATE_GATE_THRESHOLD = 0.35
-
-BUYING_POWER_BUFFER  = 1.05
-WIN_COOLDOWN_SECS    = 180
-LOSS_COOLDOWN_SECS   = 900
-LOOP_INTERVAL        = 12
-WARMUP_BARS          = 40
-
-# ── Shared context data ───────────────────────────────────────────────────────
-_spy_prices:        list  = []
-_qqq_prices:        list  = []
-_vix_price:         float = 15.0
-_underlying_prices: dict  = {}
-_underlying_5m:     dict  = {}
-_context_lock               = threading.Lock()
-_analyst_scores_cache: dict  = {}
-_analyst_scores_ts:    float = 0.0
-_analyst_scores_ttl:   float = 20.0
-_analyst_lock                = threading.Lock()
-_phase4_memory = None
-_capital_coordinator = None  # CapitalCoordinator -- initialized in run(), see capital_coordinator.py
+# Backtesting params
+SLIPPAGE_PCT      = 0.0005   # 0.05% half-spread
+WARMUP_BARS       = 60
+PARTIAL_TP_MULT   = 0.50     # V5.0: partial exit at 50% of TP target
+BTC_VOL_THRESHOLD = 5.0      # V5.0: restrict alts when BTC 7d vol > 5%
+BTC_IS_ETH        = {"BTC-USDC", "ETH-USDC"}  # exempt from vol restriction
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def log(symbol, msg):
-    ts = datetime.now(tz=CENTRAL).strftime("%H:%M:%S")
-    print(f"[{symbol} | {ts}] {msg}", flush=True)
-
-def alert(msg):
+def send_alert(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
-    except Exception:
-        pass
-
-def is_market_hours() -> bool:
-    now = datetime.now(tz=CENTRAL)
-    return now.weekday() < 5 and 8 <= now.hour < 15
-
-# ── Alpaca broker functions ───────────────────────────────────────────────────
-def get_buying_power() -> float:
-    """Get available buying power from Alpaca account."""
-    if _trade_client is None:
-        return 0.0
-    try:
-        acct = _trade_client.get_account()
-        return float(acct.buying_power)
-    except Exception as e:
-        print(f"[P4 BROKER] buying_power error: {e}", flush=True)
-        return 0.0
-
-def get_all_positions() -> dict:
-    """Returns {symbol: position_object} for all open positions."""
-    if _trade_client is None:
-        return {}
-    try:
-        positions = _trade_client.get_all_positions()
-        return {p.symbol: p for p in positions}
-    except Exception as e:
-        print(f"[P4 BROKER] get_positions error: {e}", flush=True)
-        return {}
-
-def place_order(symbol: str, side: str, notional: float) -> bool:
-    """
-    Place a notional market order via Alpaca.
-    V2.0: Uses notional (dollar amount) instead of qty — supports fractional shares.
-    side: 'BUY' or 'SELL'
-    """
-    if _trade_client is None:
-        print(f"[P4 BROKER] No trade client — order skipped {symbol} {side}", flush=True)
-        return False
-    try:
-        req = MarketOrderRequest(
-            symbol=symbol,
-            notional=round(notional, 2),
-            side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=8
         )
-        _trade_client.submit_order(req)
-        return True
-    except Exception as e:
-        print(f"[P4 BROKER] order error {symbol} {side} ${notional}: {e}", flush=True)
-        return False
-
-def place_sell_all(symbol: str) -> bool:
-    """Close entire position in symbol via Alpaca."""
-    if _trade_client is None:
-        return False
-    try:
-        _trade_client.close_position(symbol)
-        return True
-    except Exception as e:
-        print(f"[P4 BROKER] close_position error {symbol}: {e}", flush=True)
-        return False
-
-# ── Price data (Alpaca + yfinance fallback) ───────────────────────────────────
-def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") -> tuple:
-    alpaca_sym = symbol.replace("^", "")
-
-    if _data_client is not None and not symbol.startswith("^"):
-        try:
-            tf       = TimeFrame.Minute if interval == "1m" else TimeFrame(5, "Min")
-            lookback = timedelta(days=2) if interval == "1m" else timedelta(days=7)
-            req      = StockBarsRequest(
-                symbol_or_symbols=alpaca_sym,
-                timeframe=tf,
-                start=datetime.now(timezone.utc) - lookback,
-                feed="iex",
-            )
-            df = _data_client.get_stock_bars(req).df
-            if df is not None and not df.empty:
-                if isinstance(df.index, pd.MultiIndex):
-                    df = df.xs(alpaca_sym, level="symbol")
-                prices  = df["close"].tail(bars).tolist()
-                volumes = df["volume"].tail(bars).tolist()
-                if prices:
-                    return prices, volumes
-        except Exception:
-            pass
-
-    # Fallback: yfinance (used for ^VIX and when Alpaca fails)
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        period = "1d" if interval == "1m" else "5d"
-        df     = ticker.history(period=period, interval=interval)
-        if not df.empty:
-            return df["Close"].tail(bars).tolist(), df["Volume"].tail(bars).tolist()
     except Exception:
         pass
-    return [], []
 
-def fetch_prices(symbol: str, bars: int = 40) -> list:
-    p, _ = fetch_prices_and_volumes(symbol, bars)
-    return p
-
-def get_current_price(symbol: str) -> float | None:
-    alpaca_sym = symbol.replace("^", "")
-    if _data_client is not None and not symbol.startswith("^"):
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=alpaca_sym,
-                timeframe=TimeFrame.Minute,
-                start=datetime.now(timezone.utc) - timedelta(minutes=5),
-                feed="iex",
-            )
-            df = _data_client.get_stock_bars(req).df
-            if df is not None and not df.empty:
-                if isinstance(df.index, pd.MultiIndex):
-                    df = df.xs(alpaca_sym, level="symbol")
-                if not df.empty:
-                    return float(df["close"].iloc[-1])
-        except Exception:
-            pass
+def get_utc_hour(ts) -> int:
+    if hasattr(ts, "hour"):
+        return ts.hour
     try:
-        import yfinance as yf
-        return float(yf.Ticker(symbol).fast_info.last_price)
+        return ts.to_pydatetime().replace(tzinfo=timezone.utc).hour
     except Exception:
-        return None
+        return 12
 
-# ── Signal computations ───────────────────────────────────────────────────────
-def compute_rsi(prices: list, period: int = 7) -> float | None:
-    if len(prices) < period + 1:
+# ── Signal engine (matches crypto.py V5.0 tech/macro components) ─────────────
+def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
         return None
-    s     = pd.Series(prices, dtype=float)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0)
-    loss  = (-delta.where(delta < 0, 0.0))
+    s        = pd.Series(closes, dtype=float)
+    delta    = s.diff()
+    gain     = delta.where(delta > 0, 0.0)
+    loss     = (-delta.where(delta < 0, 0.0))
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
     rs  = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
-    val = float(rsi.iloc[-1])
-    if not (0 < val < 100):
-        return None
-    return round(val, 2)
+    return float(rsi.iloc[-1])
 
-def compute_ma(prices: list, period: int = 20) -> float | None:
-    if len(prices) < period:
-        return None
-    return round(float(sum(prices[-period:]) / period), 4)
-
-def compute_ema(prices: list, period: int) -> float | None:
-    if len(prices) < period:
-        return None
-    s = pd.Series(prices)
-    return round(float(s.ewm(span=period, adjust=False).mean().iloc[-1]), 4)
-
-def compute_atr(prices: list, period: int = 14) -> float:
-    if len(prices) < period + 1:
-        return abs(prices[-1] * 0.015) if prices else 0.0
-    diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    return round(float(sum(diffs[-period:]) / period), 4)
-
-def compute_macd(prices: list) -> dict:
-    if len(prices) < 26:
-        return {"bullish": False, "macd_line": 0, "signal_line": 0, "histogram": 0}
-    s         = pd.Series(prices)
-    ema12     = s.ewm(span=12, adjust=False).mean()
-    ema26     = s.ewm(span=26, adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal    = macd_line.ewm(span=9, adjust=False).mean()
-    hist      = macd_line - signal
+def calc_multi_tf_rsi(closes_5m: list) -> dict:
+    """Approximate multi-TF RSI from 5m bars (backtest proxy)."""
+    rsi_5m = calc_rsi(closes_5m, 14)
+    # Use different lookback windows as proxy for different timeframes
+    rsi_1m  = calc_rsi(closes_5m[-20:],  7)  # short window
+    rsi_15m = calc_rsi(closes_5m[-60:], 14)  # medium
+    rsi_1h  = calc_rsi(closes_5m[-100:],14)  # longer
+    rsi_4h  = calc_rsi(closes_5m,       14)  # full dataset
     return {
-        "bullish":     float(macd_line.iloc[-1]) > float(signal.iloc[-1]),
-        "macd_line":   round(float(macd_line.iloc[-1]), 5),
-        "signal_line": round(float(signal.iloc[-1]), 5),
-        "histogram":   round(float(hist.iloc[-1]), 5),
+        "1m":  rsi_1m,
+        "5m":  rsi_5m,
+        "15m": rsi_15m,
+        "1h":  rsi_1h,
+        "4h":  rsi_4h,
     }
 
-def compute_bollinger(prices: list, period: int = 20, std_dev: float = 2.0) -> dict:
-    if len(prices) < period:
-        return {"upper": 0, "middle": 0, "lower": 0, "pct_b": 0.5,
-                "squeeze": False, "near_lower": False, "at_lower": False, "far_below": False}
-    s      = pd.Series(prices)
-    middle = float(s.rolling(period).mean().iloc[-1])
-    std    = float(s.rolling(period).std().iloc[-1])
-    upper  = middle + std_dev * std
-    lower  = middle - std_dev * std
-    price  = prices[-1]
-    band_w = upper - lower
-    pct_b  = (price - lower) / band_w if band_w > 0 else 0.5
-    squeeze = (band_w / price) < 0.02 if price > 0 else False
+def calc_obv_momentum(closes: list, volumes: list) -> Optional[float]:
+    if len(closes) < 10 or len(volumes) < 10:
+        return None
+    obv = [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:
+            obv.append(obv[-1] + volumes[i])
+        elif closes[i] < closes[i-1]:
+            obv.append(obv[-1] - volumes[i])
+        else:
+            obv.append(obv[-1])
+    if len(obv) < 6:
+        return None
+    recent = obv[-3:]
+    older  = obv[-6:-3]
+    if not older or sum(abs(x) for x in older) == 0:
+        return None
+    avg_r = sum(recent) / 3
+    avg_o = sum(older) / 3
+    return round((avg_r - avg_o) / (abs(avg_o) + 1) * 100, 3)
+
+def calc_trend_structure(closes: list, lookback: int = 20) -> dict:
+    if len(closes) < lookback:
+        return {"higher_lows": False, "uptrend": False}
+    prices = closes[-lookback:]
+    mid    = lookback // 2
+    fhl    = min(prices[:mid])
+    shl    = min(prices[mid:])
+    fhh    = max(prices[:mid])
+    shh    = max(prices[mid:])
     return {
-        "upper": round(upper, 4), "middle": round(middle, 4), "lower": round(lower, 4),
-        "pct_b": round(pct_b, 3), "squeeze": squeeze,
-        "near_lower": pct_b < 0.20, "at_lower": pct_b < 0.05,
-        "far_below": price < lower * 0.99,
+        "higher_lows": shl > fhl,
+        "uptrend":     shh > fhh and shl > fhl,
     }
 
-def compute_stochrsi(prices: list, rsi_period: int = 14, stoch_period: int = 14) -> dict:
-    if len(prices) < rsi_period + stoch_period + 5:
-        return {"k": 50, "d": 50, "oversold": False, "overbought": False}
-    s        = pd.Series(prices, dtype=float)
-    delta    = s.diff()
-    gain     = delta.where(delta > 0, 0.0)
-    loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi_ser  = 100 - (100 / (1 + rs))
-    min_rsi  = rsi_ser.rolling(stoch_period).min()
-    max_rsi  = rsi_ser.rolling(stoch_period).max()
-    denom    = max_rsi - min_rsi
-    stoch_k  = ((rsi_ser - min_rsi) / denom * 100).where(denom != 0, 50)
-    stoch_d  = stoch_k.rolling(3).mean()
-    k_val    = float(stoch_k.iloc[-1])
-    d_val    = float(stoch_d.iloc[-1])
-    return {
-        "k": round(k_val, 2), "d": round(d_val, 2),
-        "oversold":   k_val < 20 and d_val < 20,
-        "overbought": k_val > 80 and d_val > 80,
-    }
+def calc_vwap(closes: list, volumes: list) -> Optional[float]:
+    if len(closes) < 5 or len(volumes) < 5:
+        return None
+    tpv = sum(c * v for c, v in zip(closes, volumes))
+    vol = sum(volumes)
+    return tpv / vol if vol > 0 else None
 
-def compute_obv(prices: list, volumes: list) -> dict:
-    if len(prices) < 10 or len(volumes) < 10:
-        return {"rising": False, "obv_slope": 0}
-    n    = min(len(prices), len(volumes))
-    p, v = prices[-n:], volumes[-n:]
-    obv  = [0.0]
-    for i in range(1, len(p)):
-        obv.append(obv[-1] + v[i] if p[i] > p[i-1] else
-                   obv[-1] - v[i] if p[i] < p[i-1] else obv[-1])
-    recent = obv[-10:]
-    slope  = (recent[-1] - recent[0]) / (abs(recent[0]) + 1)
-    return {"rising": slope > 0, "obv_slope": round(slope, 4)}
+def resample_5m_to_4h(closes_5m: list) -> list:
+    """
+    V5.1: crypto_backtester.py only fetches 5m bars (see fetch_all_crypto_bars) --
+    no separate 4h API call exists. Rather than add a second Alpaca fetch per
+    pair (doubles fetch time, adds a second failure point), approximate 4h
+    closes by taking every 48th 5m close (48 * 5min = 240min = 4h). This is
+    a close-only resample, not true 4h OHLC aggregation -- fine for
+    calc_trend_structure (which only looks at closes), NOT a substitute for
+    real 4h bars if a future indicator needs 4h high/low/volume.
+    """
+    return closes_5m[::48]
 
-def compute_williams_r(prices: list, period: int = 14) -> dict:
-    if len(prices) < period:
-        return {"value": -50, "oversold": False}
-    recent = prices[-period:]
-    high, low, close = max(recent), min(recent), prices[-1]
-    wr_val = ((high - close) / (high - low) * -100) if (high - low) > 0 else -50
-    return {"value": round(wr_val, 2), "oversold": wr_val < -80}
+def detect_trend_regime_bt(closes_5m: list) -> str:
+    """V5.1: mirrors crypto.py SignalProcessor.detect_trend_regime(), using
+    the 5m-resampled 4h approximation above in place of a real 4h fetch."""
+    closes_4h_approx = resample_5m_to_4h(closes_5m)
+    t4 = calc_trend_structure(closes_4h_approx, lookback=20)
+    t5 = calc_trend_structure(closes_5m, lookback=20)
+    if t4.get("uptrend") and t5.get("higher_lows"):
+        return "TRENDING"
+    return "CHOPPY"
 
-def compute_cci(prices: list, period: int = 20) -> dict:
-    if len(prices) < period:
-        return {"value": 0, "oversold": False}
-    recent   = prices[-period:]
-    tp_mean  = sum(recent) / len(recent)
-    mean_dev = sum(abs(p - tp_mean) for p in recent) / len(recent)
-    cci_val  = (recent[-1] - tp_mean) / (0.015 * mean_dev) if mean_dev > 0 else 0
-    return {"value": round(cci_val, 2), "oversold": cci_val < -100}
+def _compute_confidence_meanrev_bt(pair: str, closes_5m: list, volumes_5m: list,
+                                    btc_closes: list, fg: int = 50,
+                                    fg_momentum: float = 0.0, hist_score: int = 7) -> Tuple[int, str]:
+    """
+    Original V5.0 mean-reversion confidence engine -- V5.1.3 adds real F&G
+    (was completely absent before: no greed-block, no fear-driven gate
+    widening, no sentiment score). V5.1.4 makes hist_score a real parameter
+    -- caller now computes it from an actual walk-forward bucket lookup
+    (see simulate_pair) instead of every call getting a hardcoded neutral 7.
+    Matches crypto.py V5.0 technical + macro layers.
+    Analyst component still neutral (can't backtest that -- needs live
+    Analyst service state, not something derivable from price history).
+    Orderflow (L/S ratio, taker ratio) = 0 (real-time only).
+    Returns (score, mode) where mode is FULL/CAUTIOUS/SKIP/BLOCK.
+    """
+    if fg > FNG_GREED_BLOCK:
+        return 0, "BLOCK"
 
-def check_higher_lows(prices: list, lookback: int = 20) -> bool:
-    if len(prices) < lookback:
-        return False
-    recent = prices[-lookback:]
-    lows   = [recent[i] for i in range(1, len(recent)-1)
-              if recent[i] <= recent[i-1] and recent[i] <= recent[i+1]]
-    return len(lows) >= 2 and lows[-1] > lows[-2]
+    recipe  = RECIPES.get(pair, {})
+    max_rsi = recipe.get("rsi_entry_max", 40)
+    if fg < FNG_FEAR_LOOSE:
+        max_rsi += FNG_RSI_BONUS
+    stop_pct = recipe.get("stop_pct", 0.015)
 
-# V2.3: ADX regime filter + volume confirmation. Was claimed live in the
-# V2.2 boot log ("ADX regime filter | Vol confirmation") but never actually
-# implemented -- only existed in phase4_backtester.py, which is what the
-# 298/321-win backtest evidence cited in this file's header was measuring.
-# Ported directly from phase4_backtester.py's compute_adx/
-# check_volume_confirmation, unchanged, so live finally matches what was
-# already backtested instead of drifting from it.
-ADX_TREND        = 20.0     # ADX < 20 = ranging = SCALP only
-VOL_CONFIRM_MULT = 1.2      # volume gate
+    if len(closes_5m) < WARMUP_BARS:
+        return 0, "BLOCK"
 
-def compute_adx(prices: list, period: int = 14) -> float:
-    if len(prices) < period * 2 + 5:
-        return 25.0
+    rsi_dict = calc_multi_tf_rsi(closes_5m)
+    rsi_5m   = rsi_dict.get("5m")
+
+    # Hard gate: RSI above entry max (widened during extreme fear) = skip
+    if rsi_5m is not None and rsi_5m > max_rsi:
+        return 0, "BLOCK"
+
+    score = 0
+
+    # Technical (max +40)
+    rsi_vals = [v for v in rsi_dict.values() if v is not None]
+    oc = sum(1 for r in rsi_vals if r < 40)
+    if   oc >= 5: score += 20
+    elif oc == 4: score += 15
+    elif oc == 3: score += 10
+    elif oc == 2: score += 5
+
+    trend = calc_trend_structure(closes_5m)
+    if trend.get("higher_lows"):
+        score += 5
+
+    vwap = calc_vwap(closes_5m, volumes_5m)
+    if vwap and closes_5m[-1] < vwap:
+        score += 5
+
+    # RSI bounce signal
+    rsi_1m = rsi_dict.get("1m")
+    if rsi_5m and rsi_1m and rsi_5m < 35 and rsi_1m > rsi_5m:
+        score += 5
+
+    tech_score = min(score, 40)
+
+    # Macro: BTC context (simplified -- use BTC price history)
+    macro_score = 0
+    if btc_closes and len(btc_closes) >= 14:
+        btc_rsi = calc_rsi(btc_closes, 14) or 50
+        if   btc_rsi < 25: macro_score += 8
+        elif btc_rsi < 35: macro_score += 5
+        elif btc_rsi < 40: macro_score += 2
+        elif btc_rsi > 72: macro_score -= 5
+        elif btc_rsi > 65: macro_score -= 2
+
+    # Volume structure
+    obv_mom = calc_obv_momentum(closes_5m, volumes_5m)
+    vol_score = 0
+    if obv_mom is not None:
+        if   obv_mom >  5.0: vol_score += 5
+        elif obv_mom >  1.0: vol_score += 2
+        elif obv_mom < -5.0: vol_score -= 4
+        elif obv_mom < -1.0: vol_score -= 2
+
+    # Historical: real walk-forward bucket lookup, passed in by caller
+    # (was: hist_score = 7 flat placeholder, always, forever)
+
+    # V5.1.3: sentiment -- mirrors crypto.py _score_sentiment exactly
+    sent_score = _score_sentiment_bt(fg, fg_momentum)
+
+    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score + sent_score))
+
+    if   total >= CONF_FULL:     mode = "FULL"
+    elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
+    elif total >= CONF_SKIP:     mode = "SKIP"
+    else:                        mode = "BLOCK"
+
+    return total, mode
+
+def _score_sentiment_bt(fg: int, fg_momentum: float) -> int:
+    """V5.1.3: mirrors crypto.py ConfidenceEngine._score_sentiment exactly."""
+    score = 0
+    if   fg < 20:              score += 8
+    elif fg < 30:              score += 5
+    elif fg < 45:              score += 2
+    elif fg > FNG_GREED_BLOCK: score -= 8
+    elif fg > 70:              score -= 3
+
+    if   fg_momentum >  5: score += 7
+    elif fg_momentum >  2: score += 4
+    elif fg_momentum < -5: score -= 4
+    elif fg_momentum < -2: score -= 2
+
+    return min(score, 15)
+
+def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list,
+                                     btc_closes: list, fg: int = 50,
+                                     fg_momentum: float = 0.0, hist_score: int = 7) -> Tuple[int, str]:
+    """
+    V5.2: Momentum's entry thesis, replaced. Old version bought RSI 50-78
+    ("strength") -- both the 8-pair run and the SOL sweep independently
+    showed this loses on average despite a fair win rate, the signature of
+    buying an already-extended move. New thesis: same TRENDING regime gate
+    (4h uptrend + 5m higher-lows -- that part never failed, untouched), but
+    the RSI condition now wants a PULLBACK within the confirmed uptrend
+    (cooled off from a recent push, structure intact) instead of elevated/
+    accelerating RSI. Classic trend-continuation entry. UNTESTED on real
+    data -- this is a new hypothesis, not a calibrated fix.
+    """
+    if fg > FNG_GREED_BLOCK:
+        return 0, "BLOCK"
+
+    if len(closes_5m) < WARMUP_BARS:
+        return 0, "BLOCK"
+
+    rsi_dict = calc_multi_tf_rsi(closes_5m)
+    rsi_5m   = rsi_dict.get("5m")
+    rsi_1m   = rsi_dict.get("1m")
+
+    # Hard gate: RSI must be in the "cooled off, not extended, not oversold"
+    # pullback band. Below MOM_PULLBACK_RSI_MIN is mean-reversion's territory
+    # (that path already handles genuine oversold). Above MOM_PULLBACK_RSI_MAX
+    # is still-extended strength -- the exact zone that just failed twice.
+    if rsi_5m is None or not (MOM_PULLBACK_RSI_MIN <= rsi_5m <= MOM_PULLBACK_RSI_MAX):
+        return 0, "BLOCK"
+
+    # Core pullback signal: short-term RSI has cooled BELOW medium-term RSI
+    # (1m < 5m) -- the opposite condition from the old "accelerating"
+    # version (1m >= 5m). This is what actually defines "pullback" here.
+    if rsi_1m is None or rsi_1m >= rsi_5m:
+        return 0, "BLOCK"
+
+    score = 0
+
+    # Technical (max +40) -- count timeframes sitting in the healthy
+    # pullback band (not extended, not broken down)
+    rsi_vals = [v for v in rsi_dict.values() if v is not None]
+    sc = sum(1 for r in rsi_vals if MOM_PULLBACK_RSI_MIN <= r <= MOM_PULLBACK_RSI_MAX)
+    if   sc >= 5: score += 20
+    elif sc == 4: score += 15
+    elif sc == 3: score += 10
+    elif sc == 2: score += 5
+
+    # Structural confirmation: bigger trend must still be genuinely intact,
+    # not just "was trending a while ago" -- this is what separates a
+    # healthy pullback from a trend actually breaking down.
+    trend = calc_trend_structure(closes_5m)
+    if trend.get("higher_lows"):
+        score += 10
+    if trend.get("uptrend"):
+        score += 5
+
+    # A pullback that's still holding above VWAP is a shallower, higher-
+    # quality pullback than one that's broken below it.
+    vwap = calc_vwap(closes_5m, volumes_5m)
+    if vwap and closes_5m[-1] > vwap:
+        score += 5
+
+    tech_score = min(score, 40)
+
+    macro_score = 0
+    if btc_closes and len(btc_closes) >= 14:
+        btc_rsi = calc_rsi(btc_closes, 14) or 50
+        if   btc_rsi < 25: macro_score += 8
+        elif btc_rsi < 35: macro_score += 5
+        elif btc_rsi < 40: macro_score += 2
+        elif btc_rsi > 72: macro_score -= 5
+        elif btc_rsi > 65: macro_score -= 2
+
+    # Volume on a pullback should be QUIET (selling drying up), not
+    # elevated (elevated volume on a dip is distribution, not a pause) --
+    # this is the inverse read from the old momentum path on purpose.
+    obv_mom = calc_obv_momentum(closes_5m, volumes_5m)
+    vol_score = 0
+    if obv_mom is not None:
+        if   -1.0 <= obv_mom <= 1.0: vol_score += 5   # quiet, healthy pause
+        elif obv_mom < -5.0:         vol_score -= 4   # heavy selling, not a pause
+
+    sent_score = _score_sentiment_bt(fg, fg_momentum)
+
+    total = max(0, min(100, tech_score + macro_score + vol_score + hist_score + sent_score))
+
+    if   total >= CONF_FULL:     mode = "FULL"
+    elif total >= CONF_CAUTIOUS: mode = "CAUTIOUS"
+    elif total >= CONF_SKIP:     mode = "SKIP"
+    else:                        mode = "BLOCK"
+
+    return total, mode
+
+def compute_confidence_bt(pair: str, closes_5m: list, volumes_5m: list,
+                           btc_closes: list, regime_window: Optional[list] = None,
+                           fg: int = 50, fg_momentum: float = 0.0,
+                           hist_score: int = 7) -> Tuple[int, str, str]:
+    """
+    V5.1.4: Regime dispatcher. hist_score now comes from a real walk-forward
+    bucket lookup (see simulate_pair's bucket_stats), computed by the caller
+    since it needs the entry-time bucket key for later outcome recording --
+    dispatcher itself stays a pure function, no bucket state lives here.
+    Returns (score, mode, strategy).
+    """
+    regime = detect_trend_regime_bt(regime_window if regime_window is not None else closes_5m)
+    if regime == "TRENDING":
+        total, mode = _compute_confidence_momentum_bt(pair, closes_5m, volumes_5m, btc_closes, fg, fg_momentum, hist_score)
+        SCORE_LOG["MOMENTUM"].append(total)
+        return total, mode, "MOMENTUM"
+    total, mode = _compute_confidence_meanrev_bt(pair, closes_5m, volumes_5m, btc_closes, fg, fg_momentum, hist_score)
+    SCORE_LOG["MEAN_REVERSION"].append(total)
+    return total, mode, "MEAN_REVERSION"
+
+def compute_btc_realized_vol(btc_closes: list) -> float:
+    """7-day BTC realized vol as % -- V5.0 regime gate."""
+    if len(btc_closes) < 20:
+        return 0.0
     try:
-        s      = pd.Series(prices)
-        pos_dm = s.diff().clip(lower=0)
-        neg_dm = (-s.diff()).clip(lower=0)
-        tr     = s.diff().abs()
-        atr_s  = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-        pdm_s  = pos_dm.ewm(alpha=1.0 / period, adjust=False).mean()
-        ndm_s  = neg_dm.ewm(alpha=1.0 / period, adjust=False).mean()
-        pdi    = 100 * pdm_s / atr_s.replace(0, float("nan"))
-        ndi    = 100 * ndm_s / atr_s.replace(0, float("nan"))
-        dx     = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, float("nan"))
-        adx    = dx.ewm(alpha=1.0 / period, adjust=False).mean()
-        val    = float(adx.iloc[-1])
-        return round(val, 2) if not (pd.isna(val) or val < 0) else 25.0
+        log_rets = [math.log(btc_closes[i] / btc_closes[i-1])
+                    for i in range(1, len(btc_closes)) if btc_closes[i-1] > 0]
+        if len(log_rets) < 10:
+            return 0.0
+        n   = len(log_rets)
+        mu  = sum(log_rets) / n
+        var = sum((r - mu) ** 2 for r in log_rets) / n
+        # bars are 5-min; bars_per_day = 288; annualize then convert to daily %
+        daily_vol = (var ** 0.5) * (288 ** 0.5)
+        return round(daily_vol * 100, 2)
     except Exception:
-        return 25.0
+        return 0.0
 
-def check_volume_confirmation(volumes: list, lookback: int = 10) -> bool:
-    if len(volumes) < lookback + 1:
-        return True
-    recent_vol = volumes[-1]
-    avg_vol    = sum(volumes[-lookback-1:-1]) / lookback
-    return avg_vol <= 0 or recent_vol >= avg_vol * VOL_CONFIRM_MULT
 
-# ── Context refresh thread ────────────────────────────────────────────────────
-def refresh_context_data():
-    all_underlyings = ["SMH", "GDX", "XBI", "QQQ", "^VIX"]
-    while True:
-        try:
-            spy_p, _ = fetch_prices_and_volumes("SPY", 40)
-            qqq_p, _ = fetch_prices_and_volumes("QQQ", 40)
-            with _context_lock:
-                if spy_p: _spy_prices[:] = spy_p
-                if qqq_p: _qqq_prices[:] = qqq_p
-            for sym in all_underlyings:
-                p1, _ = fetch_prices_and_volumes(sym, 40, "1m")
-                p5, _ = fetch_prices_and_volumes(sym, 60, "5m")
-                with _context_lock:
-                    if p1:
-                        if sym == "^VIX":
-                            globals()["_vix_price"] = p1[-1]
-                        else:
-                            _underlying_prices[sym] = p1
-                    if p5:
-                        _underlying_5m[sym] = p5
-        except Exception:
-            pass
-        time.sleep(30)
-
-def get_spy_context() -> dict:
-    with _context_lock:
-        prices = list(_spy_prices)
-    if len(prices) < 21:
-        return {"bullish": False, "strong": False, "overbought": False,
-                "momentum": 0, "rsi": 50, "above_ma20": False}
-    rsi        = compute_rsi(prices) or 50
-    ma20       = compute_ma(prices, 20) or prices[-1]
-    momentum   = (prices[-1] - prices[-6]) / prices[-6] if prices[-6] > 0 else 0
-    above_ma20 = prices[-1] > ma20
-    bullish    = above_ma20 and momentum > 0
-    strong     = above_ma20 and momentum > 0.005
-    return {
-        "bullish": bullish, "strong": strong,
-        "overbought": rsi > 72, "momentum": round(momentum * 100, 3),
-        "rsi": rsi, "above_ma20": above_ma20,
-    }
-
-def get_qqq_context() -> dict:
-    with _context_lock:
-        prices = list(_qqq_prices)
-    if len(prices) < 8:
-        return {"rsi": 50, "momentum": 0, "overbought": False, "oversold": False}
-    rsi      = compute_rsi(prices) or 50
-    momentum = (prices[-1] - prices[-6]) / prices[-6] if len(prices) >= 6 and prices[-6] > 0 else 0
-    return {
-        "rsi": rsi, "momentum": round(momentum * 100, 3),
-        "overbought": rsi > 68, "oversold": rsi < 35,
-    }
-
-def get_vix() -> float:
-    with _context_lock:
-        return _vix_price
-
-def get_underlying_context(underlying: str) -> dict:
-    with _context_lock:
-        prices_1m = list(_underlying_prices.get(underlying, []))
-        prices_5m = list(_underlying_5m.get(underlying, []))
-    result = {
-        "available": False, "rsi_1m": 50, "above_ema20_1m": False,
-        "trending_up_1m": False, "rsi_5m": 50, "above_ema20_5m": False,
-        "trending_up_5m": False, "at_high": False, "vol_expanding": False,
-        "tide_bullish": False, "tide_bearish": False,
-    }
-    if len(prices_1m) >= 21:
-        rsi_1m      = compute_rsi(prices_1m) or 50
-        ema20_1m    = compute_ema(prices_1m, 20) or prices_1m[-1]
-        momentum_1m = (prices_1m[-1] - prices_1m[-6]) / prices_1m[-6] if len(prices_1m) >= 6 and prices_1m[-6] > 0 else 0
-        result.update({
-            "available": True, "rsi_1m": rsi_1m,
-            "above_ema20_1m": prices_1m[-1] > ema20_1m,
-            "trending_up_1m": momentum_1m > 0,
-        })
-    if len(prices_5m) >= 21:
-        rsi_5m      = compute_rsi(prices_5m) or 50
-        ema20_5m    = compute_ema(prices_5m, 20) or prices_5m[-1]
-        momentum_5m = (prices_5m[-1] - prices_5m[-6]) / prices_5m[-6] if len(prices_5m) >= 6 and prices_5m[-6] > 0 else 0
-        hl_5m       = check_higher_lows(prices_5m, 15)
-        result.update({
-            "rsi_5m": rsi_5m,
-            "above_ema20_5m": prices_5m[-1] > ema20_5m,
-            "trending_up_5m": momentum_5m > 0 and hl_5m,
-        })
-        if len(prices_5m) >= 30:
-            recent_high   = max(prices_5m[-30:])
-            result["at_high"] = prices_5m[-1] >= recent_high * 0.995
-    if result["available"]:
-        result["tide_bullish"] = (
-            result["above_ema20_1m"] and result["trending_up_1m"] and
-            result.get("rsi_1m", 50) < 72
-        )
-        result["tide_bearish"] = (
-            not result["above_ema20_1m"] and not result["trending_up_1m"]
-        )
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def fetch_historical_fg(days: int) -> Dict[str, int]:
+    """
+    V5.1.3: F&G is a DAILY index (alternative.me updates once/day, not
+    intraday) -- one API call for the whole run, returns {date_str: value}
+    so simulate_pair can do a fast dict lookup per bar instead of a network
+    call. Same endpoint/params live crypto.py already uses successfully
+    (fetch_fg_trend), just with a longer limit for the full backtest range.
+    Falls back to a flat 50 (neutral) per day on failure -- fails open,
+    same principle as everything else in this codebase: missing data
+    should never silently make the backtest MORE permissive than reality,
+    neutral is the safe default.
+    """
+    result: Dict[str, int] = {}
+    try:
+        r = requests.get(f"{FNG_BASE}/fng/", params={"limit": days + 5}, timeout=15)
+        data = r.json().get("data", [])
+        for d in data:
+            date_str = datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%d")
+            result[date_str] = int(d["value"])
+        log.info(f"Fetched {len(result)} days of F&G history")
+    except Exception as e:
+        log.warning(f"F&G history fetch failed, will default to neutral (50): {e}")
     return result
 
-# ── Analyst bridge ────────────────────────────────────────────────────────────
-def fetch_analyst_scores() -> dict:
-    global _analyst_scores_cache, _analyst_scores_ts
-    now = time.time()
-    with _analyst_lock:
-        if now - _analyst_scores_ts < _analyst_scores_ttl and _analyst_scores_cache:
-            return dict(_analyst_scores_cache)
-    if not ANALYST_URL:
-        return {}
-    try:
-        headers = {"X-Nexus-Token": NEXUS_TOKEN} if NEXUS_TOKEN else {}
-        res     = requests.get(f"{ANALYST_URL}/scores", headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            with _analyst_lock:
-                _analyst_scores_cache = data
-                _analyst_scores_ts    = now
-            return data
-    except Exception:
-        pass
-    with _analyst_lock:
-        return dict(_analyst_scores_cache)
 
-def get_analyst_signal_boost(symbol: str, analyst_scores: dict) -> tuple:
-    sym_data = analyst_scores.get(symbol)
-    if not sym_data:
-        return 0, []
-    signals = sym_data.get("signals", [])
-    for combo_pair in SIGNAL_COMBO_BOOST_SYMBOLS.get(symbol, []):
-        sig_a, sig_b = combo_pair
-        a = any(sig_a.lower() in s.lower() for s in signals)
-        b = any(sig_b.lower() in s.lower() for s in signals)
-        if a and b:
-            return 2, signals
-        if a or b:
-            return 1, signals
-    return 0, signals
+def compute_bucket_key(rsi_5m: Optional[float], fg: int, vwap_above: Optional[bool],
+                        uptrend: bool, higher_lows: bool, is_weekend: bool) -> str:
+    """
+    V5.1.4: bucket key for the walk-forward historical layer. Simplified
+    subset of crypto.py PatternMemory.get_historical_win_rate()'s full key
+    -- deliberately dropping session/btc_context/L-S-ratio/OI-change since
+    session needs a real intraday classifier this backtester doesn't have,
+    and L-S/OI are orderflow (unavailable historically, same as everywhere
+    else in this file). rsi/fg bands match live exactly so this stays
+    conceptually comparable, just coarser-grained.
+    """
+    rsi5 = rsi_5m if rsi_5m is not None else 99
+    rsi_b = ("rsi_lt25" if rsi5 < 25 else
+             "rsi_25_35" if rsi5 < 35 else
+             "rsi_35_40" if rsi5 < 40 else "rsi_gt40")
+    fg_b = "fg_fear" if fg < 30 else "fg_neutral" if fg < 60 else "fg_greed"
+    vwap_b = "above" if vwap_above else ("below" if vwap_above is not None else "unk")
+    return (f"{rsi_b}|{fg_b}|{vwap_b}|"
+            f"{'up' if uptrend else 'dn'}|"
+            f"{'hl' if higher_lows else 'no'}|"
+            f"{'wknd' if is_weekend else 'wkdy'}")
 
-# ── Phase4Memory ─────────────────────────────────────────────────────────────
-class Phase4Memory:
-    def __init__(self, db_url: str):
-        self.db_url           = db_url
-        self._conn            = None
-        self._lock            = threading.Lock()
-        self._win_rates       = {}
-        self._last_analysis   = 0.0
-        self._enabled         = bool(db_url) and _db_available
 
-    def _get_conn(self):
-        if not self._enabled:
-            return None
+def lookup_bucket_hist_score(bucket_stats: Dict[str, list], key: str, min_samples: int = 5) -> int:
+    """
+    V5.1.4: converts a bucket's win rate so far into a score contribution,
+    using crypto.py _score_historical's exact thresholds. Below min_samples,
+    falls back to the same flat neutral +7 this always used to be for
+    everyone -- "no data yet" should never LOOK like "proven good" or
+    "proven bad," same fail-safe principle as scanner.py's PM_MIN_BUCKET_TRADES.
+    """
+    outcomes = bucket_stats.get(key, [])
+    if len(outcomes) < min_samples:
+        return 7
+    wr = sum(outcomes) / len(outcomes)
+    if   wr >= 0.75: return 15
+    elif wr >= 0.65: return 10
+    elif wr >= 0.55: return 5
+    elif wr <= 0.35: return -5
+    return 0
+
+
+def fetch_all_crypto_bars(pairs: list, days: int) -> dict:
+    """Fetch 5m bars from Alpaca CryptoHistoricalDataClient."""
+    client   = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+    end_dt   = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    result   = {}
+
+    log.info(f"Fetching {days}d 5-min crypto bars for {len(pairs)} pairs...")
+
+    for pair in pairs:
+        alpaca_sym = ALPACA_SYM.get(pair, pair.replace("-USDC", "/USD"))
         try:
-            if self._conn is None or self._conn.closed:
-                self._conn = psycopg2.connect(self.db_url)
-                self._conn.autocommit = False
-            return self._conn
-        except Exception as e:
-            print(f"[PM] DB connect error: {e}", flush=True)
-            return None
-
-    def init_tables(self):
-        if not self._enabled:
-            return
-        ddl = """
-        CREATE TABLE IF NOT EXISTS phase4_trade_fingerprints (
-            id              SERIAL PRIMARY KEY,
-            trade_id        VARCHAR(32) UNIQUE NOT NULL,
-            symbol          VARCHAR(10) NOT NULL,
-            bear_pair       VARCHAR(10),
-            is_bear_trade   BOOLEAN DEFAULT FALSE,
-            mode            VARCHAR(12),
-            entry_ts        BIGINT,
-            exit_ts         BIGINT,
-            entry_price     REAL,
-            symbol_rsi      REAL,
-            spy_rsi         REAL,
-            qqq_rsi         REAL,
-            spy_bullish     BOOLEAN,
-            spy_momentum    REAL,
-            qqq_overbought  BOOLEAN,
-            higher_lows     BOOLEAN,
-            above_ma20      BOOLEAN,
-            bb_squeeze      BOOLEAN,
-            stochrsi_oversold BOOLEAN,
-            macd_bullish    BOOLEAN,
-            obv_rising      BOOLEAN,
-            hour_cdt        INTEGER,
-            day_of_week     INTEGER,
-            analyst_score   INTEGER,
-            signal_boost    INTEGER,
-            entry_score     INTEGER,
-            reversal_quality INTEGER,
-            underlying_tide  BOOLEAN,
-            vix_at_entry    REAL,
-            won             BOOLEAN,
-            pnl_pct         REAL,
-            exit_reason     VARCHAR(50),
-            hold_time_min   INTEGER,
-            mfe             REAL,
-            mae             REAL,
-            created_at      TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_p4fp_symbol ON phase4_trade_fingerprints(symbol);
-        CREATE INDEX IF NOT EXISTS idx_p4fp_won    ON phase4_trade_fingerprints(won);
-        CREATE TABLE IF NOT EXISTS phase4_pattern_stats (
-            id           SERIAL PRIMARY KEY,
-            bucket_key   VARCHAR(200) UNIQUE NOT NULL,
-            win_rate     REAL NOT NULL,
-            sample_count INTEGER NOT NULL,
-            avg_pnl      REAL,
-            last_updated TIMESTAMPTZ DEFAULT NOW()
-        );
-        """
-        alter_ddl = """
-        ALTER TABLE phase4_trade_fingerprints
-            ADD COLUMN IF NOT EXISTS entry_score      INTEGER,
-            ADD COLUMN IF NOT EXISTS reversal_quality INTEGER,
-            ADD COLUMN IF NOT EXISTS underlying_tide  BOOLEAN,
-            ADD COLUMN IF NOT EXISTS vix_at_entry     REAL;
-        """
-        try:
-            with self._lock:
-                conn = self._get_conn()
-                if conn:
-                    with conn.cursor() as cur:
-                        cur.execute(ddl)
-                        cur.execute(alter_ddl)
-                    conn.commit()
-                    print("[PM] Phase4 pattern memory tables ready (V2.0)", flush=True)
-        except Exception as e:
-            print(f"[PM] init_tables error: {e}", flush=True)
-
-    def record_entry(self, trade_id, symbol, bear_pair, is_bear, mode,
-                     entry_price, sym_rsi, spy_ctx, qqq_ctx, sym_ctx,
-                     analyst_score=0, signal_boost=0, entry_score=0,
-                     reversal_quality=0, underlying_tide=False, vix=15.0):
-        if not self._enabled:
-            return
-        threading.Thread(target=self._write_entry, daemon=True, args=(
-            trade_id, symbol, bear_pair, is_bear, mode, entry_price,
-            sym_rsi, spy_ctx, qqq_ctx, sym_ctx,
-            analyst_score, signal_boost, entry_score, reversal_quality,
-            underlying_tide, vix
-        )).start()
-
-    def _write_entry(self, trade_id, symbol, bear_pair, is_bear, mode,
-                     entry_price, sym_rsi, spy_ctx, qqq_ctx, sym_ctx,
-                     analyst_score, signal_boost, entry_score, reversal_quality,
-                     underlying_tide, vix):
-        now = datetime.now(tz=CENTRAL)
-        try:
-            with self._lock:
-                conn = self._get_conn()
-                if not conn:
-                    return
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO phase4_trade_fingerprints
-                        (trade_id, symbol, bear_pair, is_bear_trade, mode,
-                         entry_ts, entry_price,
-                         symbol_rsi, spy_rsi, qqq_rsi,
-                         spy_bullish, spy_momentum, qqq_overbought,
-                         higher_lows, above_ma20,
-                         bb_squeeze, stochrsi_oversold, macd_bullish, obv_rising,
-                         hour_cdt, day_of_week,
-                         analyst_score, signal_boost,
-                         entry_score, reversal_quality, underlying_tide, vix_at_entry)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (trade_id) DO NOTHING
-                    """, (
-                        trade_id, symbol, bear_pair, is_bear, mode,
-                        int(time.time()), entry_price,
-                        sym_rsi, spy_ctx.get("rsi"), qqq_ctx.get("rsi"),
-                        spy_ctx.get("bullish"), spy_ctx.get("momentum"), qqq_ctx.get("overbought"),
-                        sym_ctx.get("higher_lows"), sym_ctx.get("above_ma20"),
-                        sym_ctx.get("bb_squeeze"), sym_ctx.get("stochrsi_oversold"),
-                        sym_ctx.get("macd_bullish"), sym_ctx.get("obv_rising"),
-                        now.hour, now.weekday(),
-                        analyst_score, signal_boost,
-                        entry_score, reversal_quality, underlying_tide, vix,
-                    ))
-                conn.commit()
-        except Exception as e:
-            print(f"[PM] write_entry error {trade_id}: {e}", flush=True)
-
-    def record_exit(self, trade_id, won, pnl_pct, exit_reason, hold_min,
-                    mfe=0.0, mae=0.0):
-        if not self._enabled:
-            return
-        threading.Thread(target=self._write_exit, daemon=True, args=(
-            trade_id, won, pnl_pct, exit_reason, hold_min, mfe, mae
-        )).start()
-
-    def _write_exit(self, trade_id, won, pnl_pct, exit_reason, hold_min, mfe, mae):
-        try:
-            with self._lock:
-                conn = self._get_conn()
-                if not conn:
-                    return
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE phase4_trade_fingerprints
-                        SET won=%s, pnl_pct=%s, exit_reason=%s,
-                            hold_time_min=%s, exit_ts=%s, mfe=%s, mae=%s
-                        WHERE trade_id=%s
-                    """, (won, round(pnl_pct * 100, 3), exit_reason,
-                          hold_min, int(time.time()),
-                          round(mfe * 100, 3), round(mae * 100, 3), trade_id))
-                conn.commit()
-        except Exception as e:
-            print(f"[PM] write_exit error {trade_id}: {e}", flush=True)
-
-    def run_analysis(self):
-        if not self._enabled:
-            return
-        try:
-            with self._lock:
-                conn = self._get_conn()
-                if not conn:
-                    return
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT symbol, is_bear_trade, mode, symbol_rsi,
-                               spy_bullish, qqq_overbought, hour_cdt,
-                               won, pnl_pct
-                        FROM phase4_trade_fingerprints WHERE won IS NOT NULL
-                    """)
-                    rows = cur.fetchall()
-
-            if len(rows) < PM_MIN_TRADES:
-                return
-
-            from collections import defaultdict
-            buckets  = defaultdict(list)
-            pnl_bkts = defaultdict(list)
-
-            for row in rows:
-                key = Phase4Memory._bucket_key(
-                    row["symbol"], row["is_bear_trade"], row["mode"] or "SCALP",
-                    row["symbol_rsi"] if row["symbol_rsi"] is not None else 99,
-                    {"bullish": row["spy_bullish"]},
-                    {"overbought": row["qqq_overbought"]},
-                    row["hour_cdt"] if row["hour_cdt"] is not None else 12,
-                )
-                buckets[key].append(bool(row["won"]))
-                if row["pnl_pct"] is not None:
-                    pnl_bkts[key].append(float(row["pnl_pct"]))
-
-            new_cache = {}
-            with self._lock:
-                conn = self._get_conn()
-                if not conn:
-                    return
-                with conn.cursor() as cur:
-                    for key, outcomes in buckets.items():
-                        if len(outcomes) < PM_MIN_BUCKET_TRADES:
-                            continue
-                        wr      = sum(outcomes) / len(outcomes)
-                        avg_pnl = sum(pnl_bkts[key]) / len(pnl_bkts[key]) if pnl_bkts[key] else None
-                        cur.execute("""
-                            INSERT INTO phase4_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
-                            VALUES (%s,%s,%s,%s)
-                            ON CONFLICT (bucket_key) DO UPDATE
-                            SET win_rate=EXCLUDED.win_rate, sample_count=EXCLUDED.sample_count,
-                                avg_pnl=EXCLUDED.avg_pnl, last_updated=NOW()
-                        """, (key, wr, len(outcomes), avg_pnl))
-                        new_cache[key] = wr
-                conn.commit()
-
-            self._win_rates     = new_cache
-            self._last_analysis = time.time()
-            total = len(rows)
-            wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
-            print(f"[PM] Analysis: {len(new_cache)} buckets | {total} trades | {wr:.1%} WR", flush=True)
-        except Exception as e:
-            print(f"[PM] analysis error: {e}", flush=True)
-
-    @staticmethod
-    def _bucket_key(symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour):
-        rsi_b  = ("rsi_lt30" if sym_rsi < 30 else "rsi_30_40" if sym_rsi < 40 else
-                  "rsi_40_55" if sym_rsi < 55 else "rsi_gt55")
-        spy_b  = "spy_bull" if spy_ctx.get("bullish") else "spy_bear"
-        qqq_b  = "qqq_ob"   if qqq_ctx.get("overbought") else "qqq_ok"
-        hr_b   = "hr_open"  if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
-        return f"{symbol}|{'bear' if is_bear else 'bull'}|{mode or 'SCALP'}|{rsi_b}|{spy_b}|{qqq_b}|{hr_b}"
-
-    def should_skip_entry(self, symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour):
-        key = self._bucket_key(symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour)
-        if key not in self._win_rates:
-            return False, 0.5, False
-        wr = self._win_rates[key]
-        return (wr < WIN_RATE_GATE_THRESHOLD), wr, True
-
-    def start_scheduler(self):
-        def _run():
-            time.sleep(300)
-            self.run_analysis()
-            while True:
-                time.sleep(PM_ANALYSIS_INTERVAL)
-                self.run_analysis()
-        threading.Thread(target=_run, daemon=True, name="p4-pattern-memory").start()
-
-
-# ── SymbolBot ─────────────────────────────────────────────────────────────────
-class SymbolBot:
-    def __init__(self, symbol: str, config: dict):
-        self.symbol      = symbol
-        self.bear_pair   = config["bear_pair"]
-        self.underlying  = config["underlying"]
-        self.budget_pct  = config["budget_pct"]
-        self.cfg         = config
-
-        self.prices:       list  = []
-        self.volumes:      list  = []
-        self.bear_prices:  list  = []
-        self.bear_volumes: list  = []
-        self.peak_price:   float = 0.0
-        self.entry_price:  float = 0.0
-        self.entry_time:   float = 0.0
-        self.trade_id:     str   = ""
-        self.mfe:          float = 0.0
-        self.mae:          float = 0.0
-        self.in_position:  bool  = False
-        self.active_sym:   str   = symbol
-        self.mode:         str   = "SCALP"
-        self.cooldown_until: float = 0.0
-
-        self._bear_ext_trailing:   bool  = False
-        self._bear_ext_peak:       float = 0.0
-        self._late_ratchet_active: bool  = False
-
-        self._entry_spy_ctx:       dict  = {}
-        self._entry_qqq_ctx:       dict  = {}
-        self._entry_sym_ctx:       dict  = {}
-        self._entry_rsi:           float = 50.0
-        self._entry_analyst_score: int   = 0
-        self._entry_signal_boost:  int   = 0
-        self._entry_score:         int   = 0
-        self._entry_rev_quality:   int   = 0
-        self._entry_tide:          bool  = False
-        self._entry_vix:           float = 15.0
-
-        self.reversal_state: dict = {"state": "IDLE"}
-        self.daily_wins:   int   = 0
-        self.daily_losses: int   = 0
-        self.daily_pnl:    float = 0.0
-
-    def is_on_cooldown(self) -> bool:
-        return time.time() < self.cooldown_until
-
-    def set_cooldown(self, secs: int):
-        self.cooldown_until = time.time() + secs
-
-    def refresh_prices(self):
-        p, v = fetch_prices_and_volumes(self.symbol, WARMUP_BARS + 5)
-        if p:
-            self.prices  = p
-            self.volumes = v
-        bp, bv = fetch_prices_and_volumes(self.bear_pair, WARMUP_BARS + 5)
-        if bp:
-            self.bear_prices  = bp
-            self.bear_volumes = bv
-
-    def get_signal_suite(self, prices: list, volumes: list) -> dict:
-        if len(prices) < 21:
-            return {
-                "rsi": 50, "rsi14": 50, "rsi21": 50,
-                "ma20": 0, "above_ma20": True, "below_ma20": False,
-                "trend_10bar": 0, "higher_lows": False, "bouncing": False,
-                "ema9": 0, "ema21": 0, "ema9_above_ema21": False,
-                "bb": {}, "bb_squeeze": False, "near_lower_bb": False,
-                "at_lower_bb": False, "far_below_bb": False,
-                "stochrsi": {}, "stochrsi_oversold": False,
-                "macd": {}, "macd_bullish": False,
-                "obv": {}, "obv_rising": False, "obv_falling": False,
-                "williams_r": {}, "williams_oversold": False,
-                "cci": {}, "cci_oversold": False,
-                "rsi_lt40": False, "rsi_lt25": False,
-                "rsi14_lt35": False, "rsi14_lt20": False, "rsi21_lt45": False,
-                "vol_confirmed": True, "adx": 25.0,
-            }
-        rsi7   = compute_rsi(prices, 7)  or 50
-        rsi14  = compute_rsi(prices, 14) or 50
-        rsi21  = compute_rsi(prices, 21) or 50
-        ma20   = compute_ma(prices, 20)  or prices[-1]
-        ema9   = compute_ema(prices, 9)  or prices[-1]
-        ema21v = compute_ema(prices, 21) or prices[-1]
-        trend10       = (prices[-1] - prices[-11]) / prices[-11] if len(prices) > 11 and prices[-11] > 0 else 0
-        above_ma20    = prices[-1] > ma20
-        ema9_above_21 = ema9 > ema21v
-        higher_l      = check_higher_lows(prices)
-        bouncing      = len(prices) >= 3 and prices[-1] > prices[-3]
-        bb       = compute_bollinger(prices)
-        stochrsi = compute_stochrsi(prices)
-        macd     = compute_macd(prices)
-        obv      = compute_obv(prices, volumes) if volumes else {"rising": False, "obv_slope": 0}
-        williams = compute_williams_r(prices)
-        cci      = compute_cci(prices)
-        adx      = compute_adx(prices)
-        vol_ok   = check_volume_confirmation(volumes) if volumes else True
-        return {
-            "rsi": rsi7, "rsi14": rsi14, "rsi21": rsi21,
-            "ma20": ma20, "above_ma20": above_ma20, "below_ma20": not above_ma20,
-            "trend_10bar": round(trend10 * 100, 3),
-            "higher_lows": higher_l, "bouncing": bouncing,
-            "ema9": ema9, "ema21": ema21v, "ema9_above_ema21": ema9_above_21,
-            "bb": bb, "bb_squeeze": bb.get("squeeze", False),
-            "near_lower_bb": bb.get("near_lower", False),
-            "at_lower_bb":   bb.get("at_lower", False),
-            "far_below_bb":  bb.get("far_below", False),
-            "stochrsi": stochrsi, "stochrsi_oversold": stochrsi.get("oversold", False),
-            "macd": macd,         "macd_bullish":      macd.get("bullish", False),
-            "obv": obv,           "obv_rising":        obv.get("rising", False),
-            "obv_falling": not obv.get("rising", True),
-            "williams_r": williams, "williams_oversold": williams.get("oversold", False),
-            "cci": cci,           "cci_oversold":       cci.get("oversold", False),
-            "rsi_lt40":   rsi7  < 40, "rsi_lt25":   rsi7  < 25,
-            "rsi14_lt35": rsi14 < 35, "rsi14_lt20": rsi14 < 20,
-            "rsi21_lt45": rsi21 < 45,
-            "vol_confirmed": vol_ok, "adx": adx,
-        }
-
-    def compute_entry_score(self, sym: str, sym_ctx: dict) -> int:
-        cfg   = self.cfg if sym == self.symbol else BEAR_RECIPES.get(sym, self.cfg)
-        best  = cfg.get("best_signals", [])
-        worst = cfg.get("worst_signals", [])
-        score = 0
-        for sig in best:
-            if sym_ctx.get(sig, False):
-                score += 1
-        for sig in worst:
-            if sym_ctx.get(sig, False):
-                score -= 1
-        if sym_ctx.get("rsi_lt25") and "rsi_lt25" in best:
-            score += 1
-        if sym_ctx.get("at_lower_bb") and "at_lower_bb" in best:
-            score += 1
-        return max(0, score)
-
-    def select_mode(self, spy_ctx: dict, sym_ctx: dict) -> str:
-        # V2.3: ranging market (ADX < 20) forces SCALP regardless of SPY
-        # context -- checked first, matching phase4_backtester.py's order.
-        if sym_ctx.get("adx", 25.0) < ADX_TREND:
-            return "SCALP"
-        if spy_ctx.get("overbought"):
-            return "SCALP"
-        if (spy_ctx.get("strong") and sym_ctx.get("trend_10bar", 0) > 0.3 and
-                sym_ctx.get("higher_lows") and sym_ctx.get("above_ma20")):
-            return "EXTENDED"
-        if spy_ctx.get("bullish") and (sym_ctx.get("above_ma20") or sym_ctx.get("trend_10bar", 0) > 0.1):
-            return "RIDE"
-        return "SCALP"
-
-    def get_exit_params(self) -> tuple:
-        if self.active_sym == self.bear_pair:
-            br      = BEAR_RECIPES.get(self.bear_pair, self.cfg)
-            sl      = br["atr_stop"]
-            early_r = br["early_ratchet"]
-            late_r  = early_r * 1.8
-            trail_n = br["trail"]
-            trail_t = round(trail_n * 0.7, 4)
-            return sl, early_r, late_r, trail_n, trail_t
-        sl      = self.cfg["atr_stop"]
-        early_r = self.cfg["early_ratchet"]
-        late_r  = self.cfg["late_ratchet"]
-        trail_n = self.cfg["trail_normal"]
-        trail_t = self.cfg["trail_tight"]
-        mult    = (self.cfg.get("ride_stop_mult", 1.3) if self.mode == "RIDE" else
-                   self.cfg.get("ext_stop_mult",  1.8) if self.mode == "EXTENDED" else 1.0)
-        return round(sl * mult, 4), early_r, late_r, trail_n, trail_t
-
-    def should_enter_bull(self, spy_ctx: dict, sym_ctx: dict, underlying_ctx: dict) -> tuple:
-        now = datetime.now(tz=CENTRAL)
-        if now.hour in self.cfg.get("avoid_hours", []):
-            return False, 0, "avoid_hour"
-        if now.weekday() in self.cfg.get("avoid_days", []):
-            return False, 0, "avoid_day"
-        vix = get_vix()
-        if vix >= VIX_PAUSE:
-            return False, 0, f"vix_pause({vix:.1f})"
-        if self.daily_pnl <= MAX_DAILY_LOSS_PCT:
-            return False, 0, f"daily_loss_limit({self.daily_pnl:.2f}%)"
-        if not sym_ctx.get("bouncing"):
-            return False, 0, "no_bounce"
-        if underlying_ctx.get("available") and underlying_ctx.get("tide_bearish"):
-            return False, 0, "tide_bearish"
-        if not sym_ctx.get("vol_confirmed", True):
-            return False, 0, "vol_not_confirmed"
-        score  = self.compute_entry_score(self.symbol, sym_ctx)
-        min_sc = self.cfg["min_score"]
-        if score < min_sc:
-            return False, score, f"score_{score}<{min_sc}"
-        return True, score, "ok"
-
-    def score_reversal_quality(self, bull_rsi: float, drop: float, bear_ctx: dict) -> int:
-        score = 0
-        if bull_rsi >= REVERSAL_HIGH_RSI:
-            score += 2
-        elif bull_rsi >= REVERSAL_OB_RSI:
-            score += 1
-        if drop >= REVERSAL_HIGH_DROP:
-            score += 1
-        if bear_ctx.get("rsi", 50) < 45:
-            score += 1
-        if bear_ctx.get("obv_rising"):
-            score += 1
-        underlying_ctx = get_underlying_context(
-            BEAR_RECIPES.get(self.bear_pair, {}).get("underlying", "QQQ"))
-        if underlying_ctx.get("at_high") and underlying_ctx.get("tide_bullish"):
-            score -= 2
-        return max(0, min(3, score))
-
-    def check_reversal(self) -> tuple:
-        if self.daily_pnl <= MAX_DAILY_LOSS_PCT:
-            return False, 0
-        if len(self.prices) < 8:
-            return False, 0
-        bull_rsi = compute_rsi(self.prices)
-        if bull_rsi is None:
-            return False, 0
-        state = self.reversal_state
-        now_t = time.time()
-        if state["state"] == "IDLE":
-            if bull_rsi >= REVERSAL_OB_RSI:
-                self.reversal_state = {"state": "WATCHING", "bull_peak": self.prices[-1], "watch_start": now_t}
-                log(self.symbol, f"👁 REVERSAL WATCH -> {self.bear_pair} | RSI={bull_rsi:.1f}")
-            return False, 0
-        if state["state"] == "WATCHING":
-            if now_t - state.get("watch_start", now_t) > REVERSAL_MAX_WATCH:
-                self.reversal_state = {"state": "IDLE"}
-                return False, 0
-            if bull_rsi < REVERSAL_RSI_RESET:
-                self.reversal_state = {"state": "IDLE"}
-                return False, 0
-            bull_peak = max(state.get("bull_peak", self.prices[-1]), self.prices[-1])
-            self.reversal_state["bull_peak"] = bull_peak
-            drop = (bull_peak - self.prices[-1]) / bull_peak if bull_peak > 0 else 0
-            if drop >= REVERSAL_CONFIRM:
-                if len(self.bear_prices) < 3 or self.bear_prices[-1] <= self.bear_prices[-3]:
-                    return False, 0
-                now_hour   = datetime.now(tz=CENTRAL).hour
-                bear_avoid = BEAR_RECIPES.get(self.bear_pair, {}).get("avoid_hours", [])
-                if now_hour in bear_avoid:
-                    return False, 0
-                if self.bear_pair == "SQQQ" and not SQQQ_ENABLED:
-                    return False, 0
-                qqq_ctx = get_qqq_context()
-                if qqq_ctx.get("oversold"):
-                    return False, 0
-                gate = QQQ_BEAR_RSI_GATE_LABD if self.bear_pair == "LABD" else QQQ_BEAR_RSI_GATE
-                if qqq_ctx.get("rsi", 50) < gate:
-                    return False, 0
-                bear_ctx   = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                bear_min   = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
-                bear_score = self.compute_entry_score(self.bear_pair, bear_ctx)
-                if bear_score < bear_min:
-                    return False, 0
-                if not bear_ctx.get("vol_confirmed", True):
-                    return False, 0
-                quality = self.score_reversal_quality(bull_rsi, drop, bear_ctx)
-                if quality == 0:
-                    return False, 0
-                log(self.symbol,
-                    f"🔁 REVERSAL -> {self.bear_pair} | drop={round(drop*100,2)}% | "
-                    f"bull_rsi={bull_rsi:.1f} | bear_score={bear_score} | quality={quality}")
-                self.reversal_state = {"state": "IDLE"}
-                return True, quality
-        return False, 0
-
-    def try_buy(self, sym: str, prices: list, volumes: list,
-                spy_ctx: dict, sym_ctx: dict, reversal_quality: int = 0) -> bool:
-        bp        = get_buying_power()
-        base_size = round(bp * self.budget_pct, 2)
-        if base_size < 1.00:
-            return False
-
-        is_bear     = (sym == self.bear_pair)
-        entry_score = self.compute_entry_score(sym, sym_ctx)
-        self.mode   = self.select_mode(spy_ctx, sym_ctx)
-
-        analyst_scores = fetch_analyst_scores()
-        analyst_entry  = analyst_scores.get(sym, {})
-        analyst_score  = analyst_entry.get("score", 0)
-        signal_boost, _ = get_analyst_signal_boost(sym, analyst_scores)
-
-        underlying     = self.cfg["underlying"] if not is_bear else BEAR_RECIPES.get(sym, {}).get("underlying", "QQQ")
-        underlying_ctx = get_underlying_context(underlying)
-        tide_bullish   = underlying_ctx.get("tide_bullish", False)
-        vix            = get_vix()
-        qqq_ctx        = get_qqq_context()
-
-        if _phase4_memory:
-            hour = datetime.now(tz=CENTRAL).hour
-            skip, wr, has_data = _phase4_memory.should_skip_entry(
-                self.symbol, is_bear, self.mode, sym_ctx.get("rsi", 50),
-                spy_ctx, qqq_ctx, hour
-            )
-            if skip:
-                log(self.symbol, f"🚫 WIN-RATE GATE: {sym} historical WR={wr:.0%}")
-                return False
-
-        size_mult = 1.0 if signal_boost == 2 else 0.8 if signal_boost == 1 else 0.6
-        if reversal_quality == 3:
-            size_mult = min(1.25, size_mult + 0.25)
-        elif reversal_quality == 1:
-            size_mult *= 0.5
-        if vix >= VIX_CAUTION:
-            size_mult *= 0.5
-            log(self.symbol, f"⚠ VIX={vix:.1f} — reducing size 50%")
-
-        trade_size = round(base_size * size_mult, 2)
-        if trade_size < 1.00:
-            return False
-
-        # V2.2: Cross-service capital coordination -- Berserker (main.py)
-        # trades against this SAME Alpaca account from a separate process.
-        # Clamp our intended spend against what's actually available once
-        # Berserker's outstanding reservations (if any) are accounted for.
-        # Fails open: if the coordinator can't reach the DB, available falls
-        # back to bp (raw buying power) unchanged.
-        if _capital_coordinator:
-            available = _capital_coordinator.get_available(bp)
-            if trade_size > available:
-                if available < 1.00:
-                    log(self.symbol, f"💰 CAPITAL COORD: ${available:.2f} available "
-                        f"(Berserker holding the rest) — skipping {sym}")
-                    return False
-                log(self.symbol, f"💰 CAPITAL COORD: trimmed ${trade_size:.2f} -> "
-                    f"${available:.2f} (Berserker reservation active)")
-                trade_size = round(available, 2)
-
-        price = prices[-1] if prices else get_current_price(sym)
-        if not price or price <= 0:
-            return False
-
-        boost_label = " 🔥COMBO" if signal_boost == 2 else " ✨sig" if signal_boost == 1 else ""
-        tide_label  = " 🌊TIDE"  if tide_bullish else ""
-        log(self.symbol,
-            f"📊 BUY signal | score={entry_score} | mode={self.mode} | "
-            f"RSI={sym_ctx['rsi']:.1f} | size_mult={size_mult:.0%} | "
-            f"analyst={analyst_score}{boost_label}{tide_label}")
-
-        # V2.2: Reserve against the shared account immediately before
-        # submitting, release immediately after -- closes the race window
-        # where Berserker (separate process, same Alpaca account) could read
-        # stale buying_power between now and Alpaca settling this order.
-        _res_id = _capital_coordinator.reserve(trade_size, symbol=sym) if _capital_coordinator else None
-        try:
-            success = place_order(sym, "BUY", trade_size)
-        finally:
-            if _capital_coordinator:
-                _capital_coordinator.release(_res_id)
-        if success:
-            import secrets
-            self.in_position           = True
-            self.active_sym            = sym
-            self.entry_price           = price
-            self.peak_price            = price
-            self.entry_time            = time.time()
-            self.mfe                   = 0.0
-            self.mae                   = 0.0
-            self.trade_id              = secrets.token_hex(8)
-            self._entry_spy_ctx        = spy_ctx
-            self._entry_qqq_ctx        = qqq_ctx
-            self._entry_sym_ctx        = sym_ctx
-            self._entry_rsi            = sym_ctx.get("rsi", 50)
-            self._entry_analyst_score  = analyst_score
-            self._entry_signal_boost   = signal_boost
-            self._entry_score          = entry_score
-            self._entry_rev_quality    = reversal_quality
-            self._entry_tide           = tide_bullish
-            self._entry_vix            = vix
-            self._bear_ext_trailing    = False
-            self._bear_ext_peak        = price
-            self._late_ratchet_active  = False
-
-            if _phase4_memory:
-                _phase4_memory.record_entry(
-                    self.trade_id, self.symbol, self.bear_pair,
-                    is_bear, self.mode, price,
-                    self._entry_rsi, spy_ctx, qqq_ctx, sym_ctx,
-                    analyst_score, signal_boost,
-                    entry_score, reversal_quality, tide_bullish, vix
-                )
-
-            log(self.symbol,
-                f"⚡ BUY: {sym} | ${trade_size:.2f} notional @ ~${round(price,2)} | "
-                f"mode={self.mode}{boost_label}")
-            alert(
-                f"⚡ PHASE4 BUY [{self.mode}]: {sym} | ${trade_size:.2f} @ ~${round(price,2)}"
-                f"\nscore={entry_score} | boost={signal_boost} | vix={vix:.1f}{boost_label}"
-            )
-            return True
-        return False
-
-    def try_sell(self, reason: str, pnl_pct: float) -> bool:
-        success = place_sell_all(self.active_sym)
-        if success:
-            emoji    = "✅" if pnl_pct > 0 else "🛑"
-            pnl_s    = f"+{round(pnl_pct*100,3)}%" if pnl_pct > 0 else f"{round(pnl_pct*100,3)}%"
-            hold_min = int((time.time() - self.entry_time) / 60) if self.entry_time > 0 else 0
-            log(self.symbol,
-                f"{emoji} SELL [{reason}]: {self.active_sym} | P&L: {pnl_s} | "
-                f"MFE: {round(self.mfe*100,2):+.2f}% | MAE: {round(self.mae*100,2):+.2f}% | "
-                f"held: {hold_min}m")
-            alert(f"{emoji} PHASE4 [{reason}]: {self.active_sym} | {pnl_s} | {hold_min}m")
-
-            if _phase4_memory and self.trade_id:
-                _phase4_memory.record_exit(
-                    self.trade_id, pnl_pct > 0, pnl_pct,
-                    reason, hold_min, self.mfe, self.mae
-                )
-
-            self.in_position          = False
-            self.peak_price           = 0.0
-            self.entry_price          = 0.0
-            self.entry_time           = 0.0
-            self.trade_id             = ""
-            self.mfe                  = 0.0
-            self.mae                  = 0.0
-            self._bear_ext_trailing   = False
-            self._bear_ext_peak       = 0.0
-            self._late_ratchet_active = False
-
-            if pnl_pct > 0:
-                self.daily_wins += 1
-                self.set_cooldown(WIN_COOLDOWN_SECS)
+            bars = client.get_crypto_bars(CryptoBarsRequest(
+                symbol_or_symbols=alpaca_sym,
+                timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+                start=start_dt,
+                end=end_dt,
+            ))
+            df = bars.df
+            if hasattr(df.index, "levels"):
+                df = df.xs(alpaca_sym, level=0)
+            if not df.empty:
+                result[pair] = df
+                log.info(f"  {pair} ({alpaca_sym}): {len(df):,} bars")
             else:
-                self.daily_losses += 1
-                self.set_cooldown(LOSS_COOLDOWN_SECS)
-            self.daily_pnl += pnl_pct * 100
-            return True
-        return False
-
-    def recover_position(self):
-        positions = get_all_positions()
-        for sym in [self.symbol, self.bear_pair]:
-            if sym in positions:
-                import secrets
-                pos              = positions[sym]
-                cost             = float(pos.avg_entry_price or 0)
-                self.in_position = True
-                self.active_sym  = sym
-                self.entry_price = cost
-                self.peak_price  = max(cost, get_current_price(sym) or cost)
-                self.trade_id    = secrets.token_hex(8)
-                self.entry_time  = time.time()
-                self.mfe         = 0.0
-                self.mae         = 0.0
-                spy_ctx          = get_spy_context()
-                sym_ctx          = self.get_signal_suite(self.prices, self.volumes)
-                self.mode        = self.select_mode(spy_ctx, sym_ctx)
-                self._bear_ext_trailing   = False
-                self._bear_ext_peak       = self.peak_price
-                self._late_ratchet_active = False
-                log(self.symbol,
-                    f"🔄 Recovered: {sym} | entry=${cost:.3f} | mode={self.mode}")
-                return
-
-    def run_loop(self):
-        log(self.symbol,
-            f"🚀 Bot online | bear={self.bear_pair} | underlying={self.underlying} | "
-            f"budget={int(self.budget_pct*100)}% | min_score={self.cfg['min_score']}")
-
-        # Warmup — keep retrying until we have bars
-        for attempt in range(30):
-            self.refresh_prices()
-            if len(self.prices) >= WARMUP_BARS:
-                log(self.symbol, f"✅ Warmed up | {len(self.prices)} bars")
-                break
-            log(self.symbol, f"⏳ Warming up: {len(self.prices)}/{WARMUP_BARS} bars")
-            time.sleep(12)
-        else:
-            log(self.symbol, f"⚠ Warmup timeout — continuing with {len(self.prices)} bars")
-
-        self.recover_position()
-
-        while True:
-            try:
-                if not is_market_hours():
-                    if self.in_position:
-                        log(self.symbol, "📌 Market closed — holding overnight")
-                    time.sleep(60)
-                    continue
-
-                self.refresh_prices()
-                spy_ctx        = get_spy_context()
-                sym_ctx        = self.get_signal_suite(self.prices, self.volumes)
-                underlying_ctx = get_underlying_context(self.underlying)
-                prices         = self.prices
-
-                if not prices:
-                    time.sleep(LOOP_INTERVAL)
-                    continue
-
-                if self.in_position:
-                    active_prices  = self.prices  if self.active_sym == self.symbol else self.bear_prices
-                    active_volumes = self.volumes  if self.active_sym == self.symbol else self.bear_volumes
-                    active_ctx     = self.get_signal_suite(active_prices, active_volumes)
-                    if not active_prices:
-                        time.sleep(LOOP_INTERVAL)
-                        continue
-
-                    price      = active_prices[-1]
-                    profit_pct = (price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
-                    drawdown   = (self.peak_price - price) / self.peak_price if self.peak_price > 0 else 0
-
-                    self.peak_price = max(self.peak_price, price)
-                    self.mfe        = max(self.mfe, profit_pct)
-                    self.mae        = min(self.mae, profit_pct)
-
-                    sl, early_r, late_r, trail_n, trail_t = self.get_exit_params()
-
-                    log(self.symbol,
-                        f"📊 {self.active_sym} | P&L={round(profit_pct*100,2):+.2f}% | "
-                        f"peak=${self.peak_price:.3f} | dd={round(drawdown*100,2):.2f}% | "
-                        f"mode={self.mode} | rsi={active_ctx.get('rsi',50):.0f}")
-
-                    ext_cfg = BEAR_EXTENDED_TP.get(self.active_sym) if self.active_sym == self.bear_pair else None
-                    if ext_cfg:
-                        self._bear_ext_peak = max(self._bear_ext_peak, price)
-                        if not self._bear_ext_trailing and profit_pct >= ext_cfg["trail_activate"]:
-                            self._bear_ext_trailing = True
-                            log(self.symbol, f"🎯 {self.active_sym} EXTENDED TP activated at +{profit_pct*100:.1f}%")
-                        if self._bear_ext_trailing:
-                            ext_dd = (self._bear_ext_peak - price) / self._bear_ext_peak if self._bear_ext_peak > 0 else 0
-                            if ext_dd >= ext_cfg["trail_stop"]:
-                                self.try_sell("ext-trail", profit_pct)
-                                time.sleep(LOOP_INTERVAL)
-                                continue
-                        if profit_pct <= -sl:
-                            self.try_sell("stop-loss", profit_pct)
-                    else:
-                        # V2.1 FIX (Jun 30 2026): ratchet now checked BEFORE
-                        # rsi-overbought. See module docstring for the full
-                        # rationale and backtest evidence -- in short, the old
-                        # order let rsi-overbought cut nearly every winner the
-                        # instant profit ticked positive (mean-reversion
-                        # entries naturally push RSI toward overbought as the
-                        # thesis plays out), so winners almost never reached
-                        # early_ratchet. 93% of wins were rsi-overbought exits
-                        # averaging ~+0.24%, against stop-losses averaging
-                        # ~-1.7% -- a ~7:1 mismatch that made a 73% WR system
-                        # net PnL-negative. Stop-loss priority is unchanged.
-                        if profit_pct <= -sl:
-                            self.try_sell("stop-loss", profit_pct)
-                        elif profit_pct >= early_r:
-                            rsi_now  = active_ctx.get("rsi", 50)
-                            obv_flat = not active_ctx.get("obv_rising") and not active_ctx.get("obv_falling")
-                            if (profit_pct >= late_r or rsi_now >= 65 or
-                                    (obv_flat and profit_pct >= early_r * 1.5)):
-                                self._late_ratchet_active = True
-                            trail  = trail_t if self._late_ratchet_active else trail_n
-                            if drawdown >= trail:
-                                reason = "trail-tight" if self._late_ratchet_active else "trail"
-                                self.try_sell(reason, profit_pct)
-                        elif active_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT and profit_pct > 0:
-                            log(self.symbol, f"🔄 RSI REVERSAL EXIT: RSI={active_ctx['rsi']:.0f}")
-                            self.try_sell("rsi-overbought", profit_pct)
-                        elif (self.mode == "EXTENDED" and self.active_sym == self.symbol and
-                              profit_pct > -0.005 and not active_ctx.get("higher_lows", True)):
-                            log(self.symbol, "📉 EXTENDED: trend break")
-                            self.try_sell("trend-break", profit_pct)
-                        elif self.entry_time > 0:
-                            held_min = (time.time() - self.entry_time) / 60
-                            if held_min >= DWELL_MINUTES and abs(profit_pct) < DWELL_FLAT_THRESHOLD:
-                                log(self.symbol, f"⏱ DWELL EXIT: {held_min:.0f}m | flat at {profit_pct*100:+.3f}%")
-                                self.try_sell("dwell", profit_pct)
-
-                elif not self.is_on_cooldown():
-                    rev_ok, rev_quality = self.check_reversal()
-                    if rev_ok:
-                        if not self.bear_prices:
-                            log(self.symbol, "⚠ Reversal but bear_prices empty — skip")
-                        else:
-                            bear_ctx = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                            self.try_buy(self.bear_pair, self.bear_prices, self.bear_volumes,
-                                         spy_ctx, bear_ctx, reversal_quality=rev_quality)
-                    else:
-                        should_enter, score, reason = self.should_enter_bull(
-                            spy_ctx, sym_ctx, underlying_ctx)
-                        if should_enter:
-                            self.try_buy(self.symbol, prices, self.volumes, spy_ctx, sym_ctx)
-                        elif score > 0:
-                            log(self.symbol,
-                                f"⏳ score={score} (need {self.cfg['min_score']}) | {reason}")
-
-            except Exception as e:
-                log(self.symbol, f"🔴 Loop error: {e}")
-                log(self.symbol, traceback.format_exc())
-
-            time.sleep(LOOP_INTERVAL)
-
-
-# ── Phase4 Service ────────────────────────────────────────────────────────────
-def run():
-    global _phase4_memory, _capital_coordinator
-    print("[PHASE4] NEXUS PHASE 4 V2.4 STARTING — Alpaca Edition", flush=True)
-    print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
-    print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
-    print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.4: Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit | Daily loss limit enforced ({MAX_DAILY_LOSS_PCT}%, per-bot)", flush=True)
-
-    # Auth check
-    print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
-    print(f"[PHASE4] Auth check: Secret={'SET' if ALPACA_API_SECRET else 'MISSING'}", flush=True)
-    print(f"[PHASE4] Alpaca clients ready (paper={PAPER_MODE})", flush=True)
-
-    if DATABASE_URL and _db_available:
-        _phase4_memory = Phase4Memory(DATABASE_URL)
-        _phase4_memory.init_tables()
-        _phase4_memory.start_scheduler()
-        print("[PHASE4] Pattern memory: DB connected", flush=True)
-    else:
-        _phase4_memory = Phase4Memory("")
-        print("[PHASE4] Pattern memory: disabled (no DATABASE_URL)", flush=True)
-
-    # V2.2: Capital coordinator -- Phase4 trades against the SAME live Alpaca
-    # account as Berserker (main.py, separate Railway service/process) with
-    # zero prior coordination. See capital_coordinator.py for full rationale.
-    _capital_coordinator = CapitalCoordinator(DATABASE_URL, service_name="phase4")
-    _capital_coordinator.init_table()
-
-    # Verify Alpaca account
-    if _trade_client:
-        try:
-            acct = _trade_client.get_account()
-            print(f"[PHASE4] Alpaca account: buying_power=${float(acct.buying_power):.2f} | paper={PAPER_MODE}", flush=True)
+                log.warning(f"  {pair}: EMPTY")
         except Exception as e:
-            print(f"[PHASE4] ⚠ Account check failed: {e}", flush=True)
-    else:
-        print("[PHASE4] ⚠ No Alpaca trade client — orders disabled", flush=True)
+            log.error(f"  {pair}: {e}")
+        time.sleep(0.3)
 
-    print(f"[PHASE4] Analyst bridge: {ANALYST_URL if ANALYST_URL else 'disabled'}", flush=True)
-    print(f"[PHASE4] VIX caution={VIX_CAUTION} / pause={VIX_PAUSE}", flush=True)
+    log.info(f"Fetched {len(result)}/{len(pairs)} pairs")
+    return result
 
-    ctx_thread = threading.Thread(target=refresh_context_data, daemon=True)
-    ctx_thread.start()
-    print("[PHASE4] Context refresh thread started — waiting 15s for data warmup...", flush=True)
-    time.sleep(15)
 
-    spy_status  = "✅" if len(_spy_prices) > 0 else "⚠ EMPTY"
-    soxl_status = "✅" if "SMH" in _underlying_prices else "⚠ EMPTY"
-    print(f"[PHASE4] Data check: SPY={spy_status} | SOXL={soxl_status}", flush=True)
+# ── Replay engine ─────────────────────────────────────────────────────────────
+def simulate_pair(pair: str, df: pd.DataFrame,
+                  btc_df: Optional[pd.DataFrame] = None,
+                  fg_by_date: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """
+    Replay one pair's 5m bars through the confidence engine.
 
-    bots    = []
-    threads = []
-    for symbol, config in BOT_CONFIGS.items():
-        bot = SymbolBot(symbol, config)
-        bots.append(bot)
-        t = threading.Thread(target=bot.run_loop, daemon=True, name=f"bot_{symbol}")
-        threads.append(t)
-        t.start()
-        print(f"[PHASE4] ✅ {symbol} bot started (underlying={config['underlying']}, min_score={config['min_score']})", flush=True)
-        time.sleep(2)
+    V5.1.4: single chronological pass, not two separate train/validate
+    calls. The old structure ran validate_mode=False (full range) then
+    validate_mode=True (same full range, skip-trading the first 75%) as
+    two independent simulations -- harmless when historical scoring was a
+    flat constant, but wrong now that historical scoring LEARNS from
+    outcomes as it goes: a second independent pass would either re-learn
+    from scratch (losing everything the first pass learned) or need the
+    bucket state threaded between calls anyway. One pass, tag each trade
+    "validate" by whether its entry_bar fell in the last 25%, same
+    partition as before -- just no longer literally two simulations.
 
-    from phase4_server import start_server
-    start_server(bots)
+    bucket_stats is per-pair, not pooled across pairs like live's PatternMemory
+    is. Pooling across pairs chronologically would need bars interleaved by
+    real timestamp across ALL pairs (a bigger restructure than tonight's
+    session) -- per-pair is the honest, bounded version of this.
+    """
+    closes  = df["close"].tolist()
+    volumes = df["volume"].tolist() if "volume" in df.columns else [0.0] * len(closes)
+    times   = df.index.tolist()
 
-    vix_now = get_vix()
-    alert(
-        f"⚡ PHASE4 V2.4 ONLINE — Alpaca Edition\n"
-        f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
-        f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
-        f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.4: Daily loss limit enforced ({MAX_DAILY_LOSS_PCT}%/bot)\n"
-        f"V2.3: ADX regime filter + vol confirmation now live\n"
-        f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
-        f"V2.1: Exit priority fix — ratchet before rsi-overbought"
+    recipe   = RECIPES.get(pair, {})
+    stop_pct = recipe.get("stop_pct", 0.015)
+    tp_pct   = recipe.get("tp_pct",   0.025)
+
+    total_bars = len(closes)
+    start_idx  = int(total_bars * 0.75)
+
+    trades  = []
+    in_pos  = False
+    entry_price = 0.0
+    peak_price  = 0.0
+    partial_done = False
+    mfe = mae = 0.0
+    entry_bar = 0
+    entry_ts  = None
+    conf_at_entry = 0
+    mode_at_entry = ""
+    strategy_at_entry = ""
+    bucket_key_at_entry = ""
+    # V5.1.5: which stop/tp is actually active for the OPEN position --
+    # set at entry based on which strategy fired, used for every exit
+    # check while in_pos. Defaults to the pair's own values; only
+    # overridden to the tighter momentum profile when strategy=="MOMENTUM".
+    active_stop_pct = stop_pct
+    active_tp_pct   = tp_pct
+
+    bucket_stats: Dict[str, list] = {}
+    fg_by_date = fg_by_date or {}
+
+    is_btc_eth = pair in BTC_IS_ETH
+
+    for i in range(WARMUP_BARS, total_bars):
+        closes_window  = closes[max(0, i-120):i+1]
+        volumes_window = volumes[max(0, i-120):i+1]
+        # V5.1.1: regime detection needs ~960+ bars for a meaningful 4h
+        # resample (20 points * 48 bars/point) -- far more than the 120-bar
+        # window everything else uses. Separate, larger slice, regime-only.
+        regime_window  = closes[max(0, i-1050):i+1]
+        btc_window     = []
+        if btc_df is not None and not btc_df.empty and i < len(btc_df):
+            btc_window = btc_df["close"].tolist()[max(0, i-120):i+1]
+
+        price = closes[i]
+        hour  = get_utc_hour(times[i])
+
+        # V5.1.3: F&G lookup for this bar's calendar date (daily index,
+        # not intraday -- same value used for every bar within a day).
+        # V5.1.4: momentum = simple 3-day delta off the same fetched series.
+        try:
+            date_str = times[i].strftime("%Y-%m-%d") if hasattr(times[i], "strftime") else None
+        except Exception:
+            date_str = None
+        fg_today = fg_by_date.get(date_str, 50) if date_str else 50
+        fg_momentum = 0.0
+        if date_str and fg_by_date:
+            try:
+                d_3ago = (times[i] - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+                fg_3ago = fg_by_date.get(d_3ago)
+                if fg_3ago is not None:
+                    fg_momentum = float(fg_today - fg_3ago)
+            except Exception:
+                fg_momentum = 0.0
+
+        # V5.0: BTC realized vol regime gate (alts restricted when BTC vol > threshold)
+        if not is_btc_eth and btc_window:
+            btc_vol = compute_btc_realized_vol(btc_window[-120:])
+            if btc_vol > BTC_VOL_THRESHOLD:
+                if in_pos:
+                    pass   # manage existing position normally
+                else:
+                    continue   # skip new entries in alt when BTC vol high
+
+        if in_pos:
+            profit_pct = (price - entry_price) / entry_price
+            mfe = max(mfe, profit_pct)
+            mae = min(mae, profit_pct)
+            peak_price = max(peak_price, price)
+
+            exit_reason = None
+
+            # Stop loss
+            if profit_pct <= -active_stop_pct:
+                exit_reason = "STOP_LOSS"
+
+            # V5.0: Partial exit at 50% of TP
+            elif not partial_done and profit_pct >= active_tp_pct * PARTIAL_TP_MULT:
+                partial_done = True
+                # Record partial exit as its own trade
+                trades.append({
+                    "pair":        pair,
+                    "entry_price": round(entry_price, 6),
+                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
+                    "pnl_pct":     round(profit_pct * 100, 3),
+                    "exit_reason": "PARTIAL_TP",
+                    "hold_bars":   i - entry_bar,
+                    "mfe":         round(mfe * 100, 3),
+                    "mae":         round(mae * 100, 3),
+                    "won":         True,
+                    "confidence":  conf_at_entry,
+                    "mode":        mode_at_entry,
+                    "strategy":    strategy_at_entry,
+                    "hour_utc":    hour,
+                    "validate":    entry_bar >= start_idx,
+                    "trade_id":    secrets.token_hex(8),
+                })
+                # Continue holding remaining half (entry_price unchanged, position half size)
+                # For simplicity, treat remaining half as continuing from current price
+                # (partial exit doesn't change entry_price in our simplified model)
+                # NOTE: bucket outcome NOT recorded here -- final exit below is
+                # the trade's true result; a partial doesn't represent it yet.
+
+            # Full TP
+            elif profit_pct >= active_tp_pct:
+                exit_reason = "TAKE_PROFIT"
+
+            # Trend break / time failsafe (simplified)
+            elif (i - entry_bar) >= 288:  # 24h failsafe at 5m bars
+                if abs(profit_pct) < 0.002:
+                    exit_reason = "TIME_FAILSAFE"
+
+            if exit_reason:
+                won = profit_pct > 0
+                trades.append({
+                    "pair":        pair,
+                    "entry_price": round(entry_price, 6),
+                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
+                    "pnl_pct":     round(profit_pct * 100, 3),
+                    "exit_reason": exit_reason,
+                    "hold_bars":   i - entry_bar,
+                    "mfe":         round(mfe * 100, 3),
+                    "mae":         round(mae * 100, 3),
+                    "won":         won,
+                    "confidence":  conf_at_entry,
+                    "mode":        mode_at_entry,
+                    "strategy":    strategy_at_entry,
+                    "hour_utc":    hour,
+                    "validate":    entry_bar >= start_idx,
+                    "trade_id":    secrets.token_hex(8),
+                })
+                # V5.1.4: this is the walk-forward learning step -- record
+                # this trade's real outcome into the bucket it was entered
+                # under, so any LATER bar matching the same bucket benefits.
+                if bucket_key_at_entry:
+                    bucket_stats.setdefault(bucket_key_at_entry, []).append(won)
+                in_pos       = False
+                partial_done = False
+                mfe = mae    = 0.0
+
+        else:
+            trend  = calc_trend_structure(closes_window)
+            vwap   = calc_vwap(closes_window, volumes_window)
+            vwap_above = (closes_window[-1] > vwap) if vwap else None
+            is_weekend = times[i].weekday() >= 5 if hasattr(times[i], "weekday") else False
+            rsi_5m_now = calc_multi_tf_rsi(closes_window).get("5m")
+
+            bucket_key = compute_bucket_key(rsi_5m_now, fg_today, vwap_above,
+                                             trend.get("uptrend", False),
+                                             trend.get("higher_lows", False),
+                                             is_weekend)
+            hist_score = lookup_bucket_hist_score(bucket_stats, bucket_key)
+
+            conf, mode, strategy = compute_confidence_bt(
+                pair, closes_window, volumes_window, btc_window, regime_window,
+                fg_today, fg_momentum, hist_score
+            )
+            if mode in ("FULL", "CAUTIOUS"):
+                in_pos          = True
+                entry_price     = price * (1 + SLIPPAGE_PCT)
+                peak_price      = entry_price
+                partial_done    = False
+                mfe = mae       = 0.0
+                entry_bar       = i
+                entry_ts        = times[i]
+                conf_at_entry   = conf
+                mode_at_entry   = mode
+                strategy_at_entry   = strategy
+                bucket_key_at_entry = bucket_key
+                # V5.1.5: momentum gets its own tighter risk profile
+                if strategy == "MOMENTUM":
+                    active_stop_pct = stop_pct * MOM_STOP_MULT
+                    active_tp_pct   = tp_pct * MOM_TP_MULT
+                else:
+                    active_stop_pct = stop_pct
+                    active_tp_pct   = tp_pct
+
+    # Close any open at end
+    if in_pos and closes:
+        price      = closes[-1]
+        profit_pct = (price - entry_price) / entry_price
+        trades.append({
+            "pair":        pair,
+            "entry_price": round(entry_price, 6),
+            "exit_price":  round(price, 6),
+            "pnl_pct":     round(profit_pct * 100, 3),
+            "exit_reason": "TIMEOUT",
+            "hold_bars":   total_bars - entry_bar,
+            "mfe":         round(mfe * 100, 3),
+            "mae":         round(mae * 100, 3),
+            "won":         profit_pct > 0,
+            "confidence":  conf_at_entry,
+            "mode":        mode_at_entry,
+            "strategy":    strategy_at_entry,
+            "hour_utc":    hour,
+            "validate":    entry_bar >= start_idx,
+            "trade_id":    secrets.token_hex(8),
+        })
+
+    return trades
+
+
+# ── DB write ──────────────────────────────────────────────────────────────────
+def write_fingerprints(all_records: List[Dict], dry_run: bool = False) -> int:
+    if dry_run or not DATABASE_URL:
+        log.info(f"  DRY RUN: would write {len(all_records)} fingerprints")
+        return len(all_records)
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        written = 0
+        with conn.cursor() as cur:
+            # Remove old backtest entries
+            cur.execute("""
+                DELETE FROM crypto_trade_fingerprints
+                WHERE trade_id LIKE 'bt_%' AND won IS NOT NULL
+            """)
+            for r in all_records:
+                trade_id = "bt_" + r["trade_id"]
+                try:
+                    pair = r["pair"]
+                    cur.execute("""
+                        INSERT INTO crypto_trade_fingerprints
+                        (trade_id, pair, entry_ts, exit_ts,
+                         rsi_5m, fg_value, session, is_weekend,
+                         confidence_score, entry_mode, entry_price,
+                         won, pnl_pct, exit_reason, hold_time_min,
+                         mfe, mae)
+                        VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s)
+                        ON CONFLICT (trade_id) DO UPDATE
+                        SET won=EXCLUDED.won, pnl_pct=EXCLUDED.pnl_pct,
+                            exit_reason=EXCLUDED.exit_reason,
+                            mfe=EXCLUDED.mfe, mae=EXCLUDED.mae
+                    """, (
+                        trade_id, pair,
+                        int(time.time()), int(time.time()),
+                        None, 50, "US", False,   # RSI, F&G, session
+                        r.get("confidence", 0),
+                        r.get("mode", "CAUTIOUS"),
+                        r.get("entry_price", 0),
+                        bool(r["won"]),
+                        round(r["pnl_pct"], 3),
+                        r["exit_reason"],
+                        r.get("hold_bars", 0) * 5,    # 5m bars * 5min = minutes
+                        round(r.get("mfe", 0), 3),
+                        round(r.get("mae", 0), 3),
+                    ))
+                    written += 1
+                except Exception as e:
+                    log.warning(f"fingerprint write error: {e}")
+                    break
+        conn.commit()
+        conn.close()
+        return written
+    except Exception as e:
+        log.error(f"DB write error: {e}")
+        return 0
+
+
+def run_pattern_analysis() -> Tuple[int, float]:
+    """Same as crypto.py PatternMemory.run_analysis()."""
+    if not DATABASE_URL:
+        return 0, 0.0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT rsi_5m, fg_value, session, is_weekend, vwap_position,
+                       trend_5m_up, higher_lows_5m, won, pnl_pct, mfe, mae, pair
+                FROM crypto_trade_fingerprints WHERE won IS NOT NULL
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            conn.close()
+            return 0, 0.0
+
+        from collections import defaultdict
+        buckets  = defaultdict(list)
+        pnl_bkts = defaultdict(list)
+
+        for row in rows:
+            rsi5  = row["rsi_5m"] or 99
+            fg    = row["fg_value"] or 50
+            rsi_b = ("rsi_lt25" if rsi5 < 25 else
+                     "rsi_25_35" if rsi5 < 35 else
+                     "rsi_35_40" if rsi5 < 40 else "rsi_gt40")
+            fg_b  = "fg_fear" if fg < 30 else "fg_neutral" if fg < 60 else "fg_greed"
+            key   = (f"{rsi_b}|{fg_b}|{row['session'] or 'UNK'}|"
+                     f"{row['vwap_position'] or 'unk'}|"
+                     f"{'up' if row['trend_5m_up'] else 'dn'}|"
+                     f"{'hl' if row['higher_lows_5m'] else 'no'}|"
+                     f"{'wknd' if row['is_weekend'] else 'wkdy'}|"
+                     f"btc_neu|sess_flat|ls_neu|oi_flat")
+            buckets[key].append(bool(row["won"]))
+            if row["pnl_pct"] is not None:
+                pnl_bkts[key].append(float(row["pnl_pct"]))
+
+        written = 0
+        with conn.cursor() as cur:
+            for key, outcomes in buckets.items():
+                if len(outcomes) < 3:
+                    continue
+                wr      = sum(outcomes) / len(outcomes)
+                avg_pnl = (sum(pnl_bkts[key]) / len(pnl_bkts[key]) if pnl_bkts[key] else None)
+                cur.execute("""
+                    INSERT INTO crypto_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (bucket_key) DO UPDATE
+                    SET win_rate=EXCLUDED.win_rate,
+                        sample_count=EXCLUDED.sample_count,
+                        avg_pnl=EXCLUDED.avg_pnl,
+                        last_updated=NOW()
+                """, (key, wr, len(outcomes), avg_pnl))
+                written += 1
+        conn.commit()
+
+        total = len(rows)
+        wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
+        conn.close()
+        log.info(f"  Pattern analysis: {written} buckets | {total} trades | {wr:.1%} WR")
+        return written, wr
+    except Exception as e:
+        log.error(f"Pattern analysis error: {e}")
+        return 0, 0.0
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="NEXUS Crypto Backtester V3.0")
+    parser.add_argument("--days",      type=int,   default=365)
+    parser.add_argument("--pairs",     nargs="+",  default=None)
+    parser.add_argument("--dry-run",   action="store_true")
+    args = parser.parse_args()
+
+    pairs   = args.pairs or ALL_PAIRS
+    days    = args.days
+    dry_run = args.dry_run
+
+    if not ALPACA_API_KEY:
+        log.error("Missing ALPACA_API_KEY")
+        sys.exit(1)
+
+    log.info("=" * 60)
+    log.info(f"NEXUS CRYPTO BACKTESTER V3.0 — Alpaca Edition")
+    log.info(f"Pairs: {pairs} | Days: {days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
+    log.info(f"V5.1.4: F&G history | Walk-forward pattern memory | Single-pass replay")
+    log.info("=" * 60)
+
+    send_alert(
+        f"🌙 NEXUS CRYPTO BACKTESTER V3.0 STARTING\n"
+        f"Data source: Alpaca (replaces broken Coinbase API)\n"
+        f"Pairs: {len(pairs)} | Days: {days}\n"
+        f"V5.1.4: F&G history | Walk-forward pattern memory\n"
+        f"ETA: ~10-20 min"
     )
-    print("[PHASE4] All bots running.", flush=True)
 
-    last_day = datetime.now(tz=CENTRAL).date()
-    while True:
-        today = datetime.now(tz=CENTRAL).date()
-        if today != last_day:
-            for bot in bots:
-                bot.daily_wins   = 0
-                bot.daily_losses = 0
-                bot.daily_pnl    = 0.0
-            last_day = today
-            print("[PHASE4] 🌅 Daily reset", flush=True)
-        time.sleep(60)
+    start_time = time.time()
+
+    # V5.1.3: one F&G fetch for the whole run, not per-bar
+    log.info("Fetching F&G history...")
+    fg_by_date = fetch_historical_fg(days)
+
+    # Fetch all bars
+    all_bars = fetch_all_crypto_bars(pairs, days)
+    if not all_bars:
+        log.error("No data fetched")
+        sys.exit(1)
+
+    # Get BTC bars for context
+    btc_df = all_bars.get("BTC-USDC")
+
+    all_trades  = []
+    pair_summary = []
+    strategy_trades = {"MEAN_REVERSION": [], "MOMENTUM": []}
+
+    for pair in pairs:
+        if pair not in all_bars:
+            log.warning(f"  {pair}: no data, skipping")
+            continue
+
+        df = all_bars[pair]
+        log.info(f"Simulating {pair} ({len(df):,} bars)...")
+
+        # V5.1.4: single walk-forward pass -- see simulate_pair docstring
+        # for why this replaced the old two-call train/validate structure.
+        all_t = simulate_pair(pair, df, btc_df, fg_by_date)
+
+        wins      = sum(1 for t in all_t if t["won"])
+        non_partial = [t for t in all_t if t["exit_reason"] != "PARTIAL_TP"]
+        wr        = round(wins / max(len(all_t), 1) * 100, 1)
+        avg_pnl   = sum(t["pnl_pct"] for t in non_partial) / max(len(non_partial), 1)
+
+        for t in non_partial:
+            strategy_trades.setdefault(t.get("strategy", "MEAN_REVERSION"), []).append(t)
+
+        log.info(f"  {pair}: {len(all_t)} trades | {wr}% WR | avg P&L: {avg_pnl:+.3f}%")
+        all_trades.extend(all_t)  # V5.1.4: single pass, all trades written
+        pair_summary.append({
+            "pair":   pair,
+            "trades": len(all_t),
+            "wins":   wins,
+            "wr":     wr,
+            "avg_pnl": avg_pnl,
+        })
+        time.sleep(0.5)
+
+    # Write to DB
+    written = 0
+    if all_trades:
+        log.info(f"Writing {len(all_trades)} fingerprints to DB...")
+        written = write_fingerprints(all_trades, dry_run)
+
+    # Pattern analysis
+    buckets = 0
+    overall_wr = 0.0
+    if not dry_run and DATABASE_URL and written > 0:
+        log.info("Running pattern analysis...")
+        buckets, overall_wr = run_pattern_analysis()
+
+    # Summary
+    elapsed = round(time.time() - start_time)
+    total_t = sum(p["trades"] for p in pair_summary)
+    total_w = sum(p["wins"]   for p in pair_summary)
+    bt_wr   = round(total_w / max(total_t, 1) * 100, 1)
+
+    sym_lines = [
+        f"  {p['pair']}: {p['wr']}% ({p['trades']}t)"
+        for p in sorted(pair_summary, key=lambda x: -x["wr"])
+    ]
+
+    # V5.1: strategy comparison -- this is the actual answer to "did the
+    # momentum path help." MEAN_REVERSION numbers here should be close to
+    # what the pre-V5.1 backtester reported, since that path is unchanged;
+    # any material drift there would mean something in this edit leaked
+    # into the CHOPPY path and is worth a second look before trusting either.
+    strat_lines = []
+    for strat_name, trades_list in strategy_trades.items():
+        n = len(trades_list)
+        if n == 0:
+            strat_lines.append(f"  {strat_name}: 0 trades")
+            continue
+        w   = sum(1 for t in trades_list if t["won"])
+        pnl = sum(t["pnl_pct"] for t in trades_list) / n
+        strat_lines.append(f"  {strat_name}: {n} trades | {round(w/n*100,1)}% WR | avg {pnl:+.3f}%")
+
+    print(f"\n{'='*60}")
+    print(f"CRYPTO BACKTEST V3.0 COMPLETE")
+    print(f"{'='*60}")
+    print(f"Total trades: {total_t} | {bt_wr}% WR")
+    print(f"Fingerprints: {written:,} | Pattern buckets: {buckets}")
+    print(f"--- By strategy (entries) ---")
+    for line in strat_lines:
+        print(line)
+    print(f"--- Score distribution (ALL bars evaluated, not just entries) ---")
+    bands = [(0,20),(20,40),(40,55),(55,75),(75,101)]
+    for strat_name, scores in SCORE_LOG.items():
+        n = len(scores)
+        if n == 0:
+            print(f"  {strat_name}: no bars evaluated")
+            continue
+        avg = sum(scores) / n
+        mx  = max(scores)
+        band_counts = []
+        for lo, hi in bands:
+            c = sum(1 for s in scores if lo <= s < hi)
+            band_counts.append(f"{lo}-{hi-1}:{c}")
+        print(f"  {strat_name}: n={n:,} avg={avg:.1f} max={mx} | " + " ".join(band_counts))
+    print(f"--- By pair ---")
+    for p in sorted(pair_summary, key=lambda x: -x["wr"]):
+        print(f"  {p['pair']:<12} {p['trades']:>6} trades | {p['wr']:>5.1f}% WR | "
+              f"avg {p['avg_pnl']:+.3f}%")
+    print(f"{'='*60}")
+
+    dist_lines = []
+    for strat_name, scores in SCORE_LOG.items():
+        n = len(scores)
+        if n == 0:
+            dist_lines.append(f"  {strat_name}: no bars")
+            continue
+        avg = sum(scores) / n
+        near_miss = sum(1 for s in scores if 45 <= s < 55)
+        dist_lines.append(f"  {strat_name}: avg={avg:.0f} max={max(scores)} near55={near_miss}")
+
+    send_alert(
+        f"✅ NEXUS CRYPTO BACKTESTER V3.0 COMPLETE\n"
+        f"──────────────────\n"
+        f"Overall WR: {bt_wr}% ({total_t} trades)\n"
+        f"Fingerprints: {written:,} | Buckets: {buckets}\n"
+        f"──────────────────\n"
+        + "\n".join(strat_lines) + "\n"
+        f"──────────────────\n"
+        f"Score dist (45-54 = near miss on CAUTIOUS):\n"
+        + "\n".join(dist_lines) + "\n"
+        f"──────────────────\n"
+        + "\n".join(sym_lines[:8]) + "\n"
+        f"──────────────────\n"
+        f"Elapsed: {elapsed}s"
+    )
+
+    log.info(f"DONE. {written} fingerprints | {buckets} buckets | {elapsed}s")
 
 
 if __name__ == "__main__":
-    run()
+    main()
