@@ -63,8 +63,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("meanrev_sweep")
 
-PAIR = "SOL-USDC"
-
+# V1.1: PAIR is now a --pair CLI argument (default SOL-USDC), not a fixed
+# constant -- reusing this same verified tool across pairs instead of
+# building a new script per pair.
 # ── The grid: mean-reversion's own parameters, this time ──────────────────────
 # SOL's baseline rsi_entry_max is 40 (RECIPES). Sweeping a delta around it
 # rather than absolute values keeps this readable and keeps the grid
@@ -384,9 +385,12 @@ def summarize(trades: List[Dict]) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SOL-USDC mean-reversion sweep")
+    parser = argparse.ArgumentParser(description="Mean-reversion parameter sweep")
     parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--pair", type=str, default="SOL-USDC",
+                         help="Which pair to sweep, e.g. ETH-USDC, BTC-USDC")
     args = parser.parse_args()
+    pair = args.pair
 
     if not ALPACA_API_KEY:
         log.error("Missing ALPACA_API_KEY")
@@ -394,14 +398,14 @@ def main():
 
     n_combos = len(MEANREV_RSI_DELTA_GRID) * len(RISK_MULT_GRID)
     log.info("=" * 60)
-    log.info(f"SOL-USDC MEAN-REVERSION SWEEP V1.0")
+    log.info(f"{pair} MEAN-REVERSION SWEEP V1.1")
     log.info(f"Grid: {len(MEANREV_RSI_DELTA_GRID)} RSI deltas x {len(RISK_MULT_GRID)} risk profiles = "
              f"{n_combos} combos | Days: {args.days}")
     log.info("Momentum FIXED at current pullback-thesis baseline -- not swept")
     log.info("=" * 60)
 
     send_alert(
-        f"🎯 SOL MEAN-REVERSION SWEEP STARTING\n"
+        f"🎯 {pair} MEAN-REVERSION SWEEP STARTING\n"
         f"{n_combos} combos | {args.days} days\n"
         f"Momentum unswept (fixed baseline)\n"
         f"ETA: building cache first, then fast per-combo replay"
@@ -409,23 +413,23 @@ def main():
 
     t0 = time.time()
     fg_by_date = fetch_historical_fg(args.days)
-    all_bars = fetch_all_crypto_bars([PAIR, "BTC-USDC"], args.days)
-    if PAIR not in all_bars:
-        log.error(f"No data for {PAIR}")
+    all_bars = fetch_all_crypto_bars([pair, "BTC-USDC"], args.days)
+    if pair not in all_bars:
+        log.error(f"No data for {pair}")
         sys.exit(1)
 
-    df = all_bars[PAIR]
+    df = all_bars[pair]
     btc_df = all_bars.get("BTC-USDC")
     total_bars = len(df)
     start_idx = int(total_bars * 0.75)
-    base_max_rsi = RECIPES.get(PAIR, {}).get("rsi_entry_max", 40)
+    base_max_rsi = RECIPES.get(pair, {}).get("rsi_entry_max", 40)
 
-    cache = build_signal_cache(PAIR, df, btc_df, fg_by_date)
+    cache = build_signal_cache(pair, df, btc_df, fg_by_date)
 
     results = []
     for rsi_delta in MEANREV_RSI_DELTA_GRID:
         for stop_mult, tp_mult in RISK_MULT_GRID:
-            trades = run_combo(PAIR, cache, rsi_delta, stop_mult, tp_mult, start_idx)
+            trades = run_combo(pair, cache, rsi_delta, stop_mult, tp_mult, start_idx)
             train_t = [t for t in trades if not t["validate"]]
             val_t   = [t for t in trades if t["validate"]]
 
@@ -448,7 +452,7 @@ def main():
     ranked = sorted(results, key=lambda r: r["mr_val"]["avg_pnl"], reverse=True)
 
     print(f"\n{'='*100}")
-    print(f"SOL-USDC MEAN-REVERSION SWEEP COMPLETE -- ranked by VALIDATION avg P&L")
+    print(f"{pair} MEAN-REVERSION SWEEP COMPLETE -- ranked by VALIDATION avg P&L")
     print(f"{'='*100}")
     print(f"{'RSI<=':<7}{'stop':<7}{'tp':<7}{'TRAIN n/wr/avg':<26}{'VAL n/wr/avg':<26}{'flag'}")
     for r in ranked:
@@ -465,7 +469,7 @@ def main():
 
     best = ranked[0]
     send_alert(
-        f"✅ SOL MEAN-REVERSION SWEEP COMPLETE\n"
+        f"✅ {pair} MEAN-REVERSION SWEEP COMPLETE\n"
         f"──────────────────\n"
         f"Best (by validation): RSI<={best['max_rsi']} stop={best['stop_mult']} tp={best['tp_mult']}\n"
         f"MR train: n={best['mr_train']['n']} {best['mr_train']['wr']}% {best['mr_train']['avg_pnl']:+.3f}%\n"
