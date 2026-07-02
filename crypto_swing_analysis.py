@@ -406,16 +406,21 @@ def format_bucket_lift(label: str, group: list, baseline: list) -> List[str]:
     return lines
 
 
-def send_csv_via_telegram(path: str, caption: str):
+def send_file_via_telegram(path: str, caption: str):
     """
-    Sends the CSV as a Telegram document via T-Bone instead of writing it to
-    /app/output for a retrieve_results.py-style log dump -- a few thousand
-    CSV rows copy-pasted out of Deploy Logs isn't a usable spreadsheet.
+    Sends any file as a Telegram document via T-Bone. Originally CSV-only;
+    now also used for the report itself, since Railway's log display has
+    proven unreliable for reading it across three straight runs (confirmed
+    not a buffering/ordering issue on this script's side -- isolated
+    log.info() calls seconds apart scrambled too, which rules out anything
+    fixable here). Telegram delivery has been clean every run so far;
+    routing the report through the same channel sidesteps the log viewer
+    entirely instead of continuing to guess at it.
     Fail-open, same as every other Telegram call in this codebase: missing
     creds or a failed send logs a warning and the run still exits clean.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_TOKEN/TELEGRAM_CHAT_ID not set -- skipping CSV delivery")
+        log.warning(f"TELEGRAM_TOKEN/TELEGRAM_CHAT_ID not set -- skipping delivery of {path}")
         return
     try:
         with open(path, "rb") as f:
@@ -536,28 +541,46 @@ def main():
     report += format_bucket_lift("HIGHS", high_features, baseline_features)
     report.append(f"\n{'='*60}")
 
-    # Single write for the whole report -- this is the actual fix. ~50
-    # separate print() calls, even flushed, were arriving at Railway's log
-    # collector as a rapid burst that got reordered in transit (log.info()
-    # setup lines stayed correctly ordered across two separate runs while
-    # these scrambled both times, which is what pointed at the transport
-    # layer rather than Python-side buffering). One write leaves nothing
-    # for anything downstream to reorder.
+    # This one print() call is left in place since it's harmless -- scrolling
+    # Railway's log view live may well render it fine, this was specifically
+    # about copy/export ordering. But it's no longer the thing relied on to
+    # actually read a result; see below.
     print("\n".join(report), flush=True)
+
+    # Report delivery via Telegram -- always attempted, independent of --csv.
+    # Three straight runs showed Railway's log display reordering this
+    # script's output regardless of flush=True or single-vs-many print()
+    # calls, including plain log.info() lines seconds apart with real work
+    # between them -- conclusively a transport/display issue, not anything
+    # in this process. Telegram delivery has been clean every run, so the
+    # report goes out the same way the CSV already does, instead of asking
+    # Railway's log viewer to be trustworthy for something it isn't.
+    try:
+        report_path = f"/tmp/swing_report_{args.pair.replace('-', '_')}.txt"
+        with open(report_path, "w") as f:
+            f.write("\n".join(report))
+        send_file_via_telegram(
+            report_path,
+            f"Swing report: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
+            f"{len(low_features)} lows, {len(high_features)} highs, "
+            f"{len(baseline_features)} baseline"
+        )
+    except Exception as e:
+        log.error(f"Report file/delivery failed: {e}")
 
     if args.csv:
         try:
             export_csv(args.csv, low_features, high_features, baseline_features)
-            send_csv_via_telegram(
+            send_file_via_telegram(
                 args.csv,
-                f"Swing analysis: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
+                f"Swing data: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
                 f"{len(low_features)} lows, {len(high_features)} highs, "
                 f"{len(baseline_features)} baseline"
             )
         except Exception as e:
-            # Fail-open: the console report above already ran to completion and
-            # is sitting in Deploy Logs either way. A CSV/Telegram hiccup here
-            # shouldn't turn a successful analysis into a crashed deployment.
+            # Fail-open: the report above already went out via Telegram either
+            # way. A CSV export/delivery hiccup here shouldn't turn a
+            # successful analysis into a crashed deployment.
             log.error(f"CSV export/delivery failed: {e}")
 
     log.info("DONE.")
