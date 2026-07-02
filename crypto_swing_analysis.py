@@ -1,56 +1,94 @@
 #!/usr/bin/env python3
 """
-crypto_swing_analysis.py V1.0 -- NEXUS Swing Point Condition Miner
-====================================================================
-Phase 1 of the swing-point idea: find confirmed swing highs/lows in one
-pair's real price history, snapshot the technical conditions AT each swing
-using the exact same indicator/bucket-key functions crypto_backtester.py
-already uses (so results are directly comparable to the 79 buckets already
-sitting in crypto_pattern_stats -- not a parallel taxonomy), then compare
-those conditions against a random baseline of non-swing bars.
+crypto_swing_precision_backtest.py V1.0 -- NEXUS Swing Gate Precision Backtest
+================================================================================
+Phase 1 (crypto_swing_analysis.py) measured ENRICHMENT: how much more common
+a condition is at a confirmed swing low than at a random bar. That's not the
+same as knowing what happens if you actually buy every time you SEE the
+condition, before knowing whether it's the real bottom or a bar on the way to
+a bigger drop. A bucket with 11x lift can still mean a ~2% real hit rate once
+every bar that ever matched it is counted, not just the handful that happened
+to be the exact low.
 
-Read-only. Does not trade. Does not write to any DB table -- console
-report + optional CSV export only, on purpose: crypto_backtester.py's own
-fingerprints already have a known, disclosed contamination risk with live
-mean-reversion scoring (different strategies writing into the same table
-live scoring reads from). This tool's job is exploratory; it shouldn't
-become a second source of that same problem.
+This is that test: takes the entry condition Phase 1 actually supports, adds
+BTC's existing stop/TP from crypto_backtester.py's RECIPES (reusing an
+already-used risk profile instead of inventing a new untested one), and walks
+it bar-by-bar through real price action, same discipline as every backtest
+in this codebase.
 
-THE ONE THING TO KEEP STRAIGHT WHILE READING RESULTS:
-  Confirming a bar WAS a swing point is necessarily retrospective -- you
-  can't know price is done falling until it turns back up. That's fine;
-  hindsight is exactly what labeling swing points requires, same as
-  labeling a historical trade a "win" only once you know the exit. What
-  has to stay causal is the FEATURE SNAPSHOT at that bar -- every RSI /
-  VWAP / trend / regime value below is computed using only bars up to and
-  including the swing bar itself, never bars after it. That boundary is
-  what makes this useful for a real-time Phase 2 rule instead of just a
-  description of the past.
+DERIVATION -- why this gate, not the full 6-dimension bucket key:
+  The dominant LOWS buckets across all five coins tested in Phase 1 all
+  shared the same core -- RSI<40, below VWAP, downtrend, NOT higher-lows --
+  while varying freely across F&G band and weekday/weekend. That means F&G
+  and weekend weren't doing real discriminating work on top of RSI/VWAP/
+  trend; they just rode along because RSI/VWAP/trend already selected for
+  fear-correlated conditions. Dropping them isn't a guess, it's what the
+  bucket table itself shows once you look at what's actually constant
+  across the high-lift rows versus what's just noise.
 
-WHAT THIS CAN'T TELL YOU BY ITSELF:
-  One coin at a few-percent zigzag over a year will likely land around
-  100-300 confirmed swings. Split across the full 6-dimension bucket key
-  that's mostly empty cells -- treat individual bucket hits as leads to
-  re-test on a second pair or a longer window, not conclusions. The
-  marginal (single-dimension) tables below have more real signal per
-  sample than the full bucket-key table; read those first.
+  Second simplification, worth stating precisely: calc_trend_structure's
+  `uptrend` is defined as (higher_high AND higher_low) -- i.e. uptrend
+  REQUIRES higher_lows as one of its two components. So "NOT uptrend AND
+  NOT higher_lows" collapses to just "NOT higher_lows" -- the "downtrend"
+  half of the bucket key ("dn") was never adding independent information
+  once "no" (not higher-lows) was already required. The real gate is three
+  independent conditions, not four:
 
-Environment: ALPACA_API_KEY, ALPACA_SECRET_KEY  (same as crypto_backtester.py)
+      RSI(5m) < 40   AND   price < VWAP(120-bar)   AND   NOT higher_lows(20-bar)
+
+  F&G is still recorded per-trade in the CSV for diagnostics -- not gated
+  on, since Phase 1 showed it doesn't discriminate direction -- so it's
+  possible to check after the fact whether it correlates with win rate
+  among triggered trades even though it isn't part of the decision.
+
+NOT out-of-sample in the strict sense. The gate's SHAPE (which of six
+possible dimensions to keep) was chosen after looking at swing_analysis's
+lift tables on this same year of BTC data. Two real mitigations, not proof:
+the RSI/F&G band boundaries themselves are pre-existing constants from
+crypto_backtester.py's compute_bucket_key, not fit to this data, and the
+same three-dimension pattern independently replicated on four other coins
+(ETH/SOL/ADA/DOGE) that weren't used to pick the gate's shape. First-75%/
+last-25% split is reported separately below, same convention
+crypto_backtester.py already uses for its own walk-forward check, so the
+most recent quarter alone is visible without pretending the full year is
+clean holdout.
+
+Runs TWO strategies side by side, same exits, same data:
+  SWING_GATE -- the three-condition gate derived above.
+  RSI_ONLY   -- BTC's existing live recipe gate (RSI < 38) alone. This is
+                what's already deployed; the comparison is the actual point
+                of this backtest, not just SWING_GATE's number in isolation.
+  (RSI_ONLY is a simplified stand-in for the full live confidence engine --
+  it does not replicate F&G gate-widening, sentiment scoring, or the
+  historical bucket layer. Testing against the full engine is a bigger,
+  separate undertaking; this is a fast sanity comparison, not a claim that
+  RSI_ONLY is exactly what's running in production.)
+
+Read-only. Does not trade, does not write to any DB table -- console report
+(single write, not the many-small-print()-calls approach that Railway's log
+viewer scrambled on the swing analysis script) + Telegram delivery of the
+report and, optionally, a per-trade CSV. Same delivery pattern as
+crypto_swing_analysis.py throughout, including the lesson from tonight:
+--csv is a flag, not a free-text path, so a stale filename from a copy-
+pasted command can't silently mislabel a different pair's data again.
+
+Environment: ALPACA_API_KEY, ALPACA_SECRET_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+(same as crypto_swing_analysis.py -- if that's already running on the spare
+Railway service, no new variables needed, just a different Start Command.)
 
 Usage:
-  python crypto_swing_analysis.py
-  python crypto_swing_analysis.py --pair ETH-USDC --days 180
-  python crypto_swing_analysis.py --zigzag-pct 1.5 --csv
+  python crypto_swing_precision_backtest.py
+  python crypto_swing_precision_backtest.py --days 180
+  python crypto_swing_precision_backtest.py --csv
 """
 
 import os
 import sys
 import csv
-import random
 import logging
 import argparse
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 import pandas as pd
 import requests
@@ -61,32 +99,34 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [SWING] %(message)s",
+    format="%(asctime)s [SWING-BT] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("swing")
+log = logging.getLogger("swing_precision")
 
-# ── Environment (matches crypto_backtester.py) ──────────────────────────────
+# ── Environment (matches crypto_swing_analysis.py / crypto_backtester.py) ───
 ALPACA_API_KEY   = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET    = os.environ.get("ALPACA_SECRET_KEY", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-ALPACA_SYM_OVERRIDES = {"POL-USDC": "MATIC/USD"}
-
-def to_alpaca_symbol(pair: str) -> str:
-    return ALPACA_SYM_OVERRIDES.get(pair, pair.replace("-USDC", "/USD"))
-
 FNG_BASE    = "https://api.alternative.me"
-WARMUP_BARS = 60     # matches crypto_backtester.py -- min bars before a snapshot is trusted
-WINDOW_BARS = 120    # matches simulate_pair's closes_window/volumes_window size
-REGIME_BARS = 1050   # matches simulate_pair's regime_window size
+WARMUP_BARS = 60    # matches crypto_backtester.py / crypto_swing_analysis.py
+WINDOW_BARS = 120   # matches simulate_pair's closes_window/volumes_window size
+SLIPPAGE_PCT = 0.0005  # 0.05% half-spread, matches crypto_backtester.py
+
+# BTC-USDC's existing recipe -- copied from crypto_backtester.py RECIPES so
+# this test uses the SAME risk parameters already validated elsewhere in the
+# system, instead of introducing a second untested free parameter alongside
+# the entry condition itself.
+BTC_STOP_PCT     = 0.012
+BTC_TP_PCT       = 0.025
+BTC_RSI_ENTRY_MAX = 38   # RECIPES["BTC-USDC"]["rsi_entry_max"] -- the RSI_ONLY comparison gate
 
 
 # =============================================================================
-# Indicator + bucket-key functions -- copied verbatim from crypto_backtester.py
-# so a swing's "rsi_lt25|fg_fear|below|up|hl|wkdy" means exactly what it means
-# in crypto_pattern_stats. If those change there, mirror the change here.
+# Indicator functions -- copied verbatim from crypto_backtester.py /
+# crypto_swing_analysis.py. If those change, mirror the change here.
 # =============================================================================
 
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
@@ -101,14 +141,6 @@ def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     rs  = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
-
-def calc_multi_tf_rsi(closes_5m: list) -> dict:
-    rsi_5m  = calc_rsi(closes_5m, 14)
-    rsi_1m  = calc_rsi(closes_5m[-20:],  7)
-    rsi_15m = calc_rsi(closes_5m[-60:], 14)
-    rsi_1h  = calc_rsi(closes_5m[-100:], 14)
-    rsi_4h  = calc_rsi(closes_5m,        14)
-    return {"1m": rsi_1m, "5m": rsi_5m, "15m": rsi_15m, "1h": rsi_1h, "4h": rsi_4h}
 
 def calc_trend_structure(closes: list, lookback: int = 20) -> dict:
     if len(closes) < lookback:
@@ -126,42 +158,16 @@ def calc_vwap(closes: list, volumes: list) -> Optional[float]:
     vol = sum(volumes)
     return tpv / vol if vol > 0 else None
 
-def resample_5m_to_4h(closes_5m: list) -> list:
-    return closes_5m[::48]
-
-def detect_trend_regime(closes_regime_window: list) -> str:
-    """Mirrors crypto_backtester.py detect_trend_regime_bt exactly."""
-    closes_4h_approx = resample_5m_to_4h(closes_regime_window)
-    t4 = calc_trend_structure(closes_4h_approx, lookback=20)
-    t5 = calc_trend_structure(closes_regime_window, lookback=20)
-    if t4.get("uptrend") and t5.get("higher_lows"):
-        return "TRENDING"
-    return "CHOPPY"
-
-def compute_bucket_key(rsi_5m: Optional[float], fg: int, vwap_above: Optional[bool],
-                        uptrend: bool, higher_lows: bool, is_weekend: bool) -> str:
-    rsi5 = rsi_5m if rsi_5m is not None else 99
-    rsi_b = ("rsi_lt25" if rsi5 < 25 else
-             "rsi_25_35" if rsi5 < 35 else
-             "rsi_35_40" if rsi5 < 40 else "rsi_gt40")
-    fg_b   = "fg_fear" if fg < 30 else "fg_neutral" if fg < 60 else "fg_greed"
-    vwap_b = "above" if vwap_above else ("below" if vwap_above is not None else "unk")
-    return (f"{rsi_b}|{fg_b}|{vwap_b}|"
-            f"{'up' if uptrend else 'dn'}|"
-            f"{'hl' if higher_lows else 'no'}|"
-            f"{'wknd' if is_weekend else 'wkdy'}")
-
 
 # =============================================================================
-# Data fetching -- same client/path as crypto_backtester.py fetch_all_crypto_bars,
-# scoped to one pair.
+# Data fetching -- same client/path as crypto_swing_analysis.py
 # =============================================================================
 
 def fetch_bars(pair: str, days: int) -> Optional[pd.DataFrame]:
     client   = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
     end_dt   = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days)
-    alpaca_sym = to_alpaca_symbol(pair)
+    alpaca_sym = pair.replace("-USDC", "/USD")
 
     log.info(f"Fetching {days}d 5-min bars for {pair} ({alpaca_sym})...")
     try:
@@ -185,7 +191,7 @@ def fetch_bars(pair: str, days: int) -> Optional[pd.DataFrame]:
 
 
 def fetch_historical_fg(days: int) -> Dict[str, int]:
-    """Identical to crypto_backtester.py fetch_historical_fg."""
+    """Identical to crypto_backtester.py / crypto_swing_analysis.py."""
     result: Dict[str, int] = {}
     try:
         r = requests.get(f"{FNG_BASE}/fng/", params={"limit": days + 5}, timeout=15)
@@ -200,225 +206,183 @@ def fetch_historical_fg(days: int) -> Dict[str, int]:
 
 
 # =============================================================================
-# Zigzag swing detection
+# Entry gates
 # =============================================================================
 
-def detect_zigzag_swings(closes: List[float], pct_threshold: float) -> List[Dict[str, Any]]:
-    """
-    Standard %-based zigzag over closes. A swing is confirmed once price
-    has retraced pct_threshold% from the running extreme in the opposite
-    direction. `idx` on each returned swing is the bar of the actual
-    extreme, not the later bar where the retrace confirmed it -- everything
-    downstream snapshots conditions AT idx using only bars up to idx, never
-    the confirmation bar or anything after it.
-    """
-    n = len(closes)
-    if n < 3:
-        return []
+def check_swing_gate(rsi_5m: Optional[float], vwap_above: Optional[bool], higher_lows: bool) -> bool:
+    """RSI<40, below VWAP, NOT higher-lows -- see DERIVATION in the module
+    docstring for why these three and not the full six-dimension bucket key."""
+    return (rsi_5m is not None and rsi_5m < 40
+            and vwap_above is False
+            and higher_lows is False)
 
-    swings: List[Dict[str, Any]] = []
-    trend: Optional[str] = None
-    extreme_idx = 0
-    extreme_price = closes[0]
+def check_rsi_only_gate(rsi_5m: Optional[float]) -> bool:
+    """The existing live recipe gate, in isolation: RSI < 38."""
+    return rsi_5m is not None and rsi_5m < BTC_RSI_ENTRY_MAX
 
-    for i in range(1, n):
+
+# =============================================================================
+# Simulation
+# =============================================================================
+
+def simulate_strategy(name: str, gate_fn, closes: List[float], volumes: List[float],
+                       times: list, fg_by_date: Dict[str, int],
+                       stop_pct: float, tp_pct: float) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Walks the bar series once. Enters whenever gate_fn(...) is True and flat,
+    exits on stop, target, or end-of-data. Mirrors crypto_backtester.py
+    simulate_pair's core loop (WARMUP_BARS, 120-bar window, slippage) minus
+    partial exits and the BTC-vol alt-restriction gate -- not applicable
+    here, this is BTC-only and testing one fixed rule, not the full
+    confidence engine.
+
+    Returns (trades, gate_fires) -- gate_fires counts bars where the gate
+    condition was true WHILE FLAT (i.e. real entry opportunities), separate
+    from the trade count, since one qualifying dip can span many consecutive
+    bars but should only ever produce one trade.
+    """
+    trades: List[Dict[str, Any]] = []
+    gate_fires = 0
+    in_pos = False
+    entry_price = 0.0
+    entry_bar = 0
+    entry_ts = None
+    entry_fg: Optional[int] = None
+    total_bars = len(closes)
+
+    for i in range(WARMUP_BARS, total_bars):
         price = closes[i]
 
-        if trend is None:
-            change_pct = (price - extreme_price) / extreme_price * 100
-            if change_pct >= pct_threshold:
-                trend = "up"
-                extreme_idx, extreme_price = i, price
-            elif change_pct <= -pct_threshold:
-                trend = "down"
-                extreme_idx, extreme_price = i, price
+        if in_pos:
+            profit_pct = (price - entry_price) / entry_price
+            exit_reason = None
+            if profit_pct <= -stop_pct:
+                exit_reason = "STOP_LOSS"
+            elif profit_pct >= tp_pct:
+                exit_reason = "TAKE_PROFIT"
+            elif i == total_bars - 1:
+                exit_reason = "END_OF_DATA"
+
+            if exit_reason:
+                exit_price = price * (1 - SLIPPAGE_PCT)
+                pnl_pct = (exit_price - entry_price) / entry_price * 100
+                trades.append({
+                    "strategy":    name,
+                    "entry_bar":   entry_bar,
+                    "entry_ts":    entry_ts,
+                    "exit_ts":     times[i],
+                    "entry_price": round(entry_price, 2),
+                    "exit_price":  round(exit_price, 2),
+                    "pnl_pct":     round(pnl_pct, 4),
+                    "won":         pnl_pct > 0,
+                    "exit_reason": exit_reason,
+                    "fg_at_entry": entry_fg,
+                })
+                in_pos = False
             continue
 
-        if trend == "up":
-            if price >= extreme_price:
-                extreme_idx, extreme_price = i, price
-                continue
-            retrace_pct = (extreme_price - price) / extreme_price * 100
-            if retrace_pct >= pct_threshold:
-                swings.append({"idx": extreme_idx, "price": extreme_price, "type": "HIGH"})
-                trend = "down"
-                extreme_idx, extreme_price = i, price
-        else:
-            if price <= extreme_price:
-                extreme_idx, extreme_price = i, price
-                continue
-            retrace_pct = (price - extreme_price) / extreme_price * 100
-            if retrace_pct >= pct_threshold:
-                swings.append({"idx": extreme_idx, "price": extreme_price, "type": "LOW"})
-                trend = "up"
-                extreme_idx, extreme_price = i, price
+        window_closes  = closes[max(0, i - WINDOW_BARS):i + 1]
+        window_volumes = volumes[max(0, i - WINDOW_BARS):i + 1]
 
-    return swings
+        rsi_5m = calc_rsi(window_closes, 14)
+        vwap   = calc_vwap(window_closes, window_volumes)
+        vwap_above = (window_closes[-1] > vwap) if vwap else None
+        trend  = calc_trend_structure(window_closes)
+        higher_lows = trend.get("higher_lows", False)
 
+        fires = gate_fn(rsi_5m, vwap_above, higher_lows) if name == "SWING_GATE" else gate_fn(rsi_5m)
+        if fires:
+            gate_fires += 1
+            entry_price = price * (1 + SLIPPAGE_PCT)
+            entry_bar = i
+            entry_ts = times[i]
+            try:
+                date_str = times[i].strftime("%Y-%m-%d") if hasattr(times[i], "strftime") else ""
+            except Exception:
+                date_str = ""
+            entry_fg = fg_by_date.get(date_str, 50)
+            in_pos = True
 
-# =============================================================================
-# Causal feature snapshot at a bar index
-# =============================================================================
-
-def snapshot_conditions(idx: int, closes: List[float], volumes: List[float],
-                         times: list, fg_by_date: Dict[str, int]) -> Optional[Dict[str, Any]]:
-    """
-    Every value here comes from closes[:idx+1] / volumes[:idx+1] only --
-    bars after idx never touch this function. Window sizes (120-bar snapshot,
-    1050-bar regime) match simulate_pair's exactly so a swing's numbers mean
-    the same thing as the equivalent live/backtest bar would show.
-    """
-    if idx < WARMUP_BARS:
-        return None
-
-    window_closes  = closes[max(0, idx - WINDOW_BARS):idx + 1]
-    window_volumes = volumes[max(0, idx - WINDOW_BARS):idx + 1]
-    regime_window  = closes[max(0, idx - REGIME_BARS):idx + 1]
-
-    rsi_dict = calc_multi_tf_rsi(window_closes)
-    rsi_5m   = rsi_dict.get("5m")
-    trend    = calc_trend_structure(window_closes)
-    vwap     = calc_vwap(window_closes, window_volumes)
-    vwap_above = (window_closes[-1] > vwap) if vwap else None
-    regime   = detect_trend_regime(regime_window)
-
-    ts = times[idx]
-    try:
-        date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else ""
-    except Exception:
-        date_str = ""
-    fg = fg_by_date.get(date_str, 50)
-    try:
-        is_weekend = ts.weekday() >= 5 if hasattr(ts, "weekday") else False
-    except Exception:
-        is_weekend = False
-
-    bucket_key = compute_bucket_key(rsi_5m, fg, vwap_above,
-                                     trend.get("uptrend", False),
-                                     trend.get("higher_lows", False),
-                                     is_weekend)
-
-    vwap_dist_pct = ((window_closes[-1] - vwap) / vwap * 100) if vwap else None
-    avg_vol_20 = (sum(window_volumes[-20:]) / 20) if len(window_volumes) >= 20 else None
-    vol_ratio  = (window_volumes[-1] / avg_vol_20) if (avg_vol_20 and window_volumes) else None
-
-    return {
-        "idx":           idx,
-        "timestamp":     ts,
-        "price":         window_closes[-1],
-        "rsi_5m":        round(rsi_5m, 1) if rsi_5m is not None else None,
-        "rsi_1h":        round(rsi_dict.get("1h"), 1) if rsi_dict.get("1h") is not None else None,
-        "fg":            fg,
-        "vwap_above":    vwap_above,
-        "vwap_dist_pct": round(vwap_dist_pct, 3) if vwap_dist_pct is not None else None,
-        "uptrend":       trend.get("uptrend", False),
-        "higher_lows":   trend.get("higher_lows", False),
-        "is_weekend":    is_weekend,
-        "regime":        regime,
-        "vol_ratio_20":  round(vol_ratio, 2) if vol_ratio is not None else None,
-        "bucket_key":    bucket_key,
-    }
-
-
-def build_baseline(n_bars: int, swing_indices: set, sample_size: int,
-                    seed: int, exclude_radius: int = 12) -> List[int]:
-    """
-    Random sample of bar indices NOT within exclude_radius bars of any
-    confirmed swing -- without this, "baseline" quietly includes the
-    shoulders of every swing and understates how distinctive swing
-    conditions actually are.
-    """
-    excluded = set()
-    for idx in swing_indices:
-        excluded.update(range(max(0, idx - exclude_radius), idx + exclude_radius + 1))
-
-    eligible = [i for i in range(WARMUP_BARS, n_bars) if i not in excluded]
-    rng = random.Random(seed)
-    if len(eligible) <= sample_size:
-        return eligible
-    return rng.sample(eligible, sample_size)
+    return trades, gate_fires
 
 
 # =============================================================================
 # Report
 # =============================================================================
 
-MIN_BUCKET_SAMPLES = 3  # below this, a bucket's swing frequency is noise, not signal
+def summarize(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not trades:
+        return {"n": 0, "wr": None, "avg_pnl": None}
+    n = len(trades)
+    wins = sum(1 for t in trades if t["won"])
+    avg_pnl = sum(t["pnl_pct"] for t in trades) / n
+    return {"n": n, "wr": round(wins / n * 100, 1), "avg_pnl": round(avg_pnl, 4)}
 
-def _pct(n: int, total: int) -> float:
-    return round(n / total * 100, 1) if total else 0.0
+def exit_breakdown(trades: List[Dict[str, Any]]) -> str:
+    if not trades:
+        return "no trades"
+    counts: Dict[str, int] = {}
+    for t in trades:
+        counts[t["exit_reason"]] = counts.get(t["exit_reason"], 0) + 1
+    return "  ".join(f"{k}x{v}" for k, v in sorted(counts.items()))
 
-def _marginal_table(rows: List[Dict[str, Any]], field: str) -> Dict[Any, int]:
-    counts: Dict[Any, int] = {}
-    for r in rows:
-        v = r.get(field)
-        counts[v] = counts.get(v, 0) + 1
-    return counts
-
-def format_marginal(title: str, field: str, lows: list, highs: list, baseline: list) -> List[str]:
-    lines = [f"\n--- {title} ---"]
-    lc, hc, bc = (_marginal_table(lows, field), _marginal_table(highs, field),
-                  _marginal_table(baseline, field))
-    all_vals = sorted(set(lc) | set(hc) | set(bc), key=lambda x: str(x))
-    nL, nH, nB = len(lows), len(highs), len(baseline)
-    lines.append(f"  {'value':<10} {'LOWS':>16} {'HIGHS':>16} {'BASELINE':>16}")
-    for v in all_vals:
-        l, h, b = lc.get(v, 0), hc.get(v, 0), bc.get(v, 0)
-        lines.append(f"  {str(v):<10} {l:>5} ({_pct(l,nL):>5.1f}%) {h:>5} ({_pct(h,nH):>5.1f}%) "
-                      f"{b:>5} ({_pct(b,nB):>5.1f}%)")
-    return lines
-
-def format_numeric_summary(title: str, field: str, lows: list, highs: list, baseline: list) -> List[str]:
-    def stats(rows):
-        vals = [r[field] for r in rows if r.get(field) is not None]
-        if not vals:
-            return None
-        return sum(vals) / len(vals), min(vals), max(vals), len(vals)
-    lines = [f"\n--- {title} (mean [min, max], n) ---"]
-    for label, rows in (("LOWS", lows), ("HIGHS", highs), ("BASELINE", baseline)):
-        s = stats(rows)
-        if s is None:
-            lines.append(f"  {label:<10}: no data")
+def fg_breakdown(trades: List[Dict[str, Any]]) -> List[str]:
+    """SWING_GATE win rate by F&G band at entry -- diagnostic only, F&G isn't
+    part of the gate decision, this just checks whether it correlates with
+    outcome among the trades that did trigger."""
+    bands = [("fear (<30)", lambda f: f < 30), ("neutral (30-59)", lambda f: 30 <= f < 60),
+             ("greed (60+)", lambda f: f >= 60)]
+    lines = []
+    for label, pred in bands:
+        sub = [t for t in trades if t["fg_at_entry"] is not None and pred(t["fg_at_entry"])]
+        s = summarize(sub)
+        if s["n"] == 0:
+            lines.append(f"  {label:<16}: no trades")
         else:
-            lines.append(f"  {label:<10}: {s[0]:.2f}  [{s[1]:.2f}, {s[2]:.2f}]  n={s[3]}")
+            lines.append(f"  {label:<16}: n={s['n']:<4} WR={s['wr']}%  avg={s['avg_pnl']:+.3f}%")
     return lines
 
-def format_bucket_lift(label: str, group: list, baseline: list) -> List[str]:
-    lines = [f"\n--- Full bucket key: {label} vs BASELINE (min {MIN_BUCKET_SAMPLES} samples, sorted by lift) ---"]
-    gb = _marginal_table(group, "bucket_key")
-    bb = _marginal_table(baseline, "bucket_key")
-    nG, nB = len(group), len(baseline)
-    rows = []
-    for key, g_count in gb.items():
-        if g_count < MIN_BUCKET_SAMPLES:
-            continue
-        g_pct = g_count / nG if nG else 0.0
-        b_count = bb.get(key, 0)
-        b_pct = b_count / nB if nB else 0.0
-        lift = (g_pct / b_pct) if b_pct > 0 else float("inf")
-        rows.append((key, g_count, g_pct * 100, b_count, b_pct * 100, lift))
-    rows.sort(key=lambda r: (-(r[5] if r[5] != float("inf") else 1e9), -r[1]))
-    if not rows:
-        lines.append(f"  (no bucket had >= {MIN_BUCKET_SAMPLES} {label} samples -- expected with n={nG} "
-                      f"points spread across a 6-dimension key; read the marginal tables above instead)")
-    for key, gc_, gp, bc_, bp, lift in rows[:15]:
-        lines.append(f"  {key:<45} {label.lower()}={gc_:>3} ({gp:4.1f}%)  baseline={bc_:>4} ({bp:4.1f}%)  lift={lift:4.2f}x")
+def format_strategy_block(label: str, trades: List[Dict[str, Any]], gate_fires: int,
+                           total_bars: int) -> List[str]:
+    split_idx = int(total_bars * 0.75)
+    last_q    = [t for t in trades if t["entry_bar"] >= split_idx]
+
+    full = summarize(trades)
+    late = summarize(last_q)
+
+    lines = [f"\n--- {label} ---"]
+    lines.append(f"  Gate fired while flat: {gate_fires:,} bars")
+    if full["n"] == 0:
+        lines.append("  Trades: 0 -- gate never fired into a flat position, nothing to report")
+        return lines
+    lines.append(f"  Trades:      {full['n']}")
+    lines.append(f"  Win rate:    {full['wr']}%")
+    lines.append(f"  Avg P&L:     {full['avg_pnl']:+.3f}%")
+    lines.append(f"  Exits:       {exit_breakdown(trades)}")
+    if late["n"] == 0:
+        lines.append("  Last 25% only: 0 trades")
+    else:
+        lines.append(f"  Last 25% only: n={late['n']}  WR={late['wr']}%  avg={late['avg_pnl']:+.3f}%")
     return lines
+
+
+def export_csv(path: str, all_trades: List[Dict[str, Any]]):
+    fieldnames = ["strategy", "entry_bar", "entry_ts", "exit_ts", "entry_price",
+                  "exit_price", "pnl_pct", "won", "exit_reason", "fg_at_entry"]
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for t in all_trades:
+            writer.writerow(t)
+    log.info(f"Wrote {len(all_trades)} rows to {path}")
 
 
 def send_file_via_telegram(path: str, caption: str):
-    """
-    Sends any file as a Telegram document via T-Bone. Originally CSV-only;
-    now also used for the report itself, since Railway's log display has
-    proven unreliable for reading it across three straight runs (confirmed
-    not a buffering/ordering issue on this script's side -- isolated
-    log.info() calls seconds apart scrambled too, which rules out anything
-    fixable here). Telegram delivery has been clean every run so far;
-    routing the report through the same channel sidesteps the log viewer
-    entirely instead of continuing to guess at it.
-    Fail-open, same as every other Telegram call in this codebase: missing
-    creds or a failed send logs a warning and the run still exits clean.
-    """
+    """Identical to crypto_swing_analysis.py's version. Fail-open: missing
+    creds or a failed send logs a warning, run still exits clean."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning(f"TELEGRAM_TOKEN/TELEGRAM_CHAT_ID not set -- skipping delivery of {path}")
         return
@@ -438,48 +402,28 @@ def send_file_via_telegram(path: str, caption: str):
         log.warning(f"Telegram send error: {e}")
 
 
-def export_csv(path: str, lows: list, highs: list, baseline: list):
-    fieldnames = ["point_type", "idx", "timestamp", "price", "rsi_5m", "rsi_1h", "fg",
-                  "vwap_above", "vwap_dist_pct", "uptrend", "higher_lows", "is_weekend",
-                  "regime", "vol_ratio_20", "bucket_key"]
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for point_type, rows in (("LOW", lows), ("HIGH", highs), ("BASELINE", baseline)):
-            for r in rows:
-                row = dict(r)
-                row["point_type"] = point_type
-                writer.writerow(row)
-    log.info(f"Wrote {len(lows) + len(highs) + len(baseline)} rows to {path}")
-
-
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="NEXUS Crypto Swing Point Condition Miner")
-    parser.add_argument("--pair",       default="BTC-USDC")
-    parser.add_argument("--days",       type=int, default=365)
-    parser.add_argument("--zigzag-pct", type=float, default=2.0,
-                         help="Min pct retrace to confirm a swing (default 2.0)")
-    parser.add_argument("--baseline-n", type=int, default=3000,
-                         help="Random non-swing bars sampled as control group")
-    parser.add_argument("--seed",       type=int, default=42)
-    parser.add_argument("--csv",        action="store_true",
-                         help="Also export and send the swing/baseline CSV")
+    parser = argparse.ArgumentParser(description="NEXUS Swing Gate Precision Backtest")
+    parser.add_argument("--pair", default="BTC-USDC", help="BTC-USDC only is validated for this gate")
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--csv",  action="store_true", help="Also export and send the per-trade CSV")
     args = parser.parse_args()
 
     if not ALPACA_API_KEY:
         log.error("Missing ALPACA_API_KEY")
         sys.exit(1)
 
+    if args.pair != "BTC-USDC":
+        log.warning(f"{args.pair}: this gate's shape was derived from BTC's dominant buckets -- "
+                    f"running it on another pair is a different, unvalidated question, not a repeat of tonight's test")
+
     log.info("=" * 60)
-    log.info(f"NEXUS SWING ANALYSIS V1.0 -- {args.pair}")
-    log.info(f"Days: {args.days} | Zigzag: {args.zigzag_pct}% | Baseline: {args.baseline_n}")
+    log.info(f"NEXUS SWING GATE PRECISION BACKTEST V1.0 -- {args.pair}")
+    log.info(f"Days: {args.days}")
     log.info("=" * 60)
 
     fg_by_date = fetch_historical_fg(args.days)
@@ -490,99 +434,66 @@ def main():
     closes  = df["close"].tolist()
     volumes = df["volume"].tolist() if "volume" in df.columns else [0.0] * len(closes)
     times   = df.index.tolist()
+    total_bars = len(closes)
 
-    log.info("Running zigzag swing detection...")
-    swings      = detect_zigzag_swings(closes, args.zigzag_pct)
-    swing_lows  = [s for s in swings if s["type"] == "LOW"]
-    swing_highs = [s for s in swings if s["type"] == "HIGH"]
-    log.info(f"Found {len(swing_lows)} swing lows, {len(swing_highs)} swing highs "
-             f"({len(swings)} total, {len(closes):,} bars scanned)")
+    log.info("Running SWING_GATE simulation...")
+    swing_trades, swing_fires = simulate_strategy(
+        "SWING_GATE", check_swing_gate, closes, volumes, times, fg_by_date, BTC_STOP_PCT, BTC_TP_PCT
+    )
+    log.info(f"  {len(swing_trades)} trades")
 
-    if len(swings) < 10:
-        log.warning("Fewer than 10 swings found -- consider a smaller --zigzag-pct")
-
-    log.info("Snapshotting conditions at each swing (causal-only)...")
-    low_features = []
-    for s in swing_lows:
-        f = snapshot_conditions(s["idx"], closes, volumes, times, fg_by_date)
-        if f is not None:
-            low_features.append(f)
-
-    high_features = []
-    for s in swing_highs:
-        f = snapshot_conditions(s["idx"], closes, volumes, times, fg_by_date)
-        if f is not None:
-            high_features.append(f)
-
-    swing_idx_set = {s["idx"] for s in swings}
-    baseline_idx  = build_baseline(len(closes), swing_idx_set, args.baseline_n, args.seed)
-    log.info(f"Sampling {len(baseline_idx)} baseline (non-swing) bars...")
-    baseline_features = []
-    for i in baseline_idx:
-        f = snapshot_conditions(i, closes, volumes, times, fg_by_date)
-        if f is not None:
-            baseline_features.append(f)
+    log.info("Running RSI_ONLY simulation...")
+    rsi_trades, rsi_fires = simulate_strategy(
+        "RSI_ONLY", check_rsi_only_gate, closes, volumes, times, fg_by_date, BTC_STOP_PCT, BTC_TP_PCT
+    )
+    log.info(f"  {len(rsi_trades)} trades")
 
     report: List[str] = []
     report.append(f"\n{'='*60}")
-    report.append(f"SWING ANALYSIS -- {args.pair} -- {args.days}d @ {args.zigzag_pct}% zigzag")
+    report.append(f"SWING GATE PRECISION BACKTEST -- {args.pair} -- {args.days}d")
     report.append(f"{'='*60}")
-    report.append(f"Swing lows: {len(low_features)}  |  Swing highs: {len(high_features)}  |  "
-                   f"Baseline: {len(baseline_features)}")
+    report.append("Gate: RSI(5m) < 40  AND  below VWAP(120)  AND  NOT higher_lows(20)")
+    report.append(f"Exits: stop -{BTC_STOP_PCT*100:.1f}%  /  target +{BTC_TP_PCT*100:.1f}%  "
+                   f"(BTC-USDC recipe, crypto_backtester.py)")
+    report.append(f"Bars scanned: {total_bars:,}  |  Walk-forward split at bar {int(total_bars*0.75):,} (75%)")
 
-    report += format_numeric_summary("RSI (5m)", "rsi_5m", low_features, high_features, baseline_features)
-    report += format_numeric_summary("Distance from VWAP (%)", "vwap_dist_pct", low_features, high_features, baseline_features)
-    report += format_numeric_summary("Fear & Greed index", "fg", low_features, high_features, baseline_features)
-    report += format_numeric_summary("Volume vs 20-bar avg (ratio)", "vol_ratio_20", low_features, high_features, baseline_features)
-    report += format_marginal("VWAP position", "vwap_above", low_features, high_features, baseline_features)
-    report += format_marginal("Regime", "regime", low_features, high_features, baseline_features)
-    report += format_marginal("Higher lows", "higher_lows", low_features, high_features, baseline_features)
-    report += format_marginal("Weekend", "is_weekend", low_features, high_features, baseline_features)
-    report += format_bucket_lift("LOWS", low_features, baseline_features)
-    report += format_bucket_lift("HIGHS", high_features, baseline_features)
+    report += format_strategy_block("SWING_GATE", swing_trades, swing_fires, total_bars)
+    report += format_strategy_block("RSI_ONLY (existing live gate, isolated)", rsi_trades, rsi_fires, total_bars)
+
+    if swing_trades:
+        report.append(f"\n--- SWING_GATE win rate by F&G at entry (diagnostic -- not gated on) ---")
+        report += fg_breakdown(swing_trades)
+
     report.append(f"\n{'='*60}")
+    report.append("NOT strict out-of-sample -- see module docstring DERIVATION note. "
+                   "Last-25% split above is the closest thing to a fresh look this run offers.")
+    report.append(f"{'='*60}")
 
-    # This one print() call is left in place since it's harmless -- scrolling
-    # Railway's log view live may well render it fine, this was specifically
-    # about copy/export ordering. But it's no longer the thing relied on to
-    # actually read a result; see below.
     print("\n".join(report), flush=True)
 
-    # Report delivery via Telegram -- always attempted, independent of --csv.
-    # Three straight runs showed Railway's log display reordering this
-    # script's output regardless of flush=True or single-vs-many print()
-    # calls, including plain log.info() lines seconds apart with real work
-    # between them -- conclusively a transport/display issue, not anything
-    # in this process. Telegram delivery has been clean every run, so the
-    # report goes out the same way the CSV already does, instead of asking
-    # Railway's log viewer to be trustworthy for something it isn't.
     try:
-        report_path = f"/tmp/swing_report_{args.pair.replace('-', '_')}.txt"
+        report_path = f"/tmp/swing_precision_report_{args.pair.replace('-', '_').lower()}.txt"
         with open(report_path, "w") as f:
             f.write("\n".join(report))
         send_file_via_telegram(
             report_path,
-            f"Swing report: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
-            f"{len(low_features)} lows, {len(high_features)} highs, "
-            f"{len(baseline_features)} baseline"
+            f"Swing gate precision backtest: {args.pair} {args.days}d\n"
+            f"SWING_GATE: {len(swing_trades)} trades  |  RSI_ONLY: {len(rsi_trades)} trades"
         )
     except Exception as e:
         log.error(f"Report file/delivery failed: {e}")
 
     if args.csv:
-        csv_path = f"/tmp/swings_{args.pair.replace('-', '_').lower()}.csv"
+        all_trades = swing_trades + rsi_trades
+        csv_path = f"/tmp/swing_precision_trades_{args.pair.replace('-', '_').lower()}.csv"
         try:
-            export_csv(csv_path, low_features, high_features, baseline_features)
+            export_csv(csv_path, all_trades)
             send_file_via_telegram(
                 csv_path,
-                f"Swing data: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
-                f"{len(low_features)} lows, {len(high_features)} highs, "
-                f"{len(baseline_features)} baseline"
+                f"Swing gate precision trades: {args.pair} {args.days}d\n"
+                f"SWING_GATE: {len(swing_trades)}  |  RSI_ONLY: {len(rsi_trades)}"
             )
         except Exception as e:
-            # Fail-open: the report above already went out via Telegram either
-            # way. A CSV export/delivery hiccup here shouldn't turn a
-            # successful analysis into a crashed deployment.
             log.error(f"CSV export/delivery failed: {e}")
 
     log.info("DONE.")
