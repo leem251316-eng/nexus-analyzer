@@ -103,26 +103,28 @@ CONF_SKIP         = 40
 # the summary can show a real distribution instead of a pass/fail count.
 SCORE_LOG: Dict[str, List[int]] = {"MEAN_REVERSION": [], "MOMENTUM": []}
 
-# V5.1: mirrors crypto.py MOM_RSI_MIN/MAX exactly -- keep these two files'
-# values in sync by hand if either changes.
-MOM_RSI_MIN = 50
-# V5.1.5: was 78. Full-year run showed momentum's win rate was fine
-# (36.3%, close to mean-reversion's 37.1%) but its LOSSES ran bigger --
-# net -0.131% avg vs mean-reversion's ~breakeven +0.004%, same win rate.
-# 65-78 is buying into likely-exhausted strength, closer to a top than
-# a continuation. Narrowing to avoid that zone specifically -- this is
-# a reasoned hypothesis based on the shape of the loss, not a calibrated
-# fix. Needs a rerun to actually confirm it helps.
-MOM_RSI_MAX = 65
+# V5.2: momentum's thesis replaced entirely. Both the full 8-pair run and
+# the dedicated SOL sweep independently showed the same failure shape --
+# win rate was fine (36-45%), losses just ran bigger than wins. That's the
+# signature of buying an already-extended move (RSI 50-78 fires AFTER
+# strength is visible, which is exactly when it's most exhausted), not
+# catching a fresh one. Old MOM_RSI_MIN/MAX/STOP_MULT/TP_MULT retired --
+# replaced with a pullback-in-confirmed-uptrend thesis: same regime gate
+# (4h uptrend + 5m higher-lows, that part never failed), but the RSI
+# condition flips from "accelerating and elevated" to "cooled off from a
+# recent push, structure still intact." Classic trend-continuation entry,
+# not a new number on the old knob. UNTESTED on real data -- same
+# validation discipline as everything else, no shortcuts for a good story.
+MOM_PULLBACK_RSI_MIN = 40   # below this = let mean-reversion's oversold path handle it
+MOM_PULLBACK_RSI_MAX = 58   # above this = still extended, not a pullback yet
 
-# V5.1.5: momentum gets its own risk profile instead of borrowing the
-# pair's mean-reversion stop/TP wholesale. Multipliers (not flat values)
-# to keep each pair's own volatility character while shifting the whole
-# profile tighter -- momentum entries happen later in a move than a dip-buy,
-# so there's less room left to run either direction. Same caveat: reasoned
-# starting point, not backtested at these specific values yet.
-MOM_STOP_MULT = 0.7   # 30% tighter -- cut losers faster
-MOM_TP_MULT   = 0.6   # 40% closer -- take the shorter leg that's actually there
+# V5.2: risk parameters reset to baseline (no multiplier) rather than
+# carrying over last night's 0.7/0.6 tuning -- that tuning was calibrated
+# for the OLD (now-retired) entry thesis. Stacking an unproven risk profile
+# on an unproven new entry makes results impossible to read cleanly: a bad
+# outcome wouldn't tell you which of the two unknowns was the problem.
+MOM_STOP_MULT = 1.0
+MOM_TP_MULT   = 1.0
 
 # V5.1.3: F&G constants -- matches crypto.py exactly. Backtester previously
 # never referenced fg at all; these were live-only, meaning the RSI gate
@@ -368,16 +370,15 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
                                      btc_closes: list, fg: int = 50,
                                      fg_momentum: float = 0.0, hist_score: int = 7) -> Tuple[int, str]:
     """
-    V5.1: Momentum counterpart to _compute_confidence_meanrev_bt. Mirrors
-    crypto.py's _score_technical_momentum / _score_volume_momentum weighting
-    exactly (same +40/+10 caps) so FULL/CAUTIOUS/SKIP/BLOCK thresholds mean
-    the same thing on both paths. Only called when detect_trend_regime_bt()
-    returns TRENDING.
-    V5.1.3: adds the same greed-block + sentiment score as the mean-reversion
-    path. Deliberately does NOT widen any RSI band for fear the way the
-    mean-reversion path does -- momentum's gate is about trend confirmation,
-    not an oversold level, so there's nothing analogous to widen. Fear/greed
-    still contributes via the sentiment score like everywhere else.
+    V5.2: Momentum's entry thesis, replaced. Old version bought RSI 50-78
+    ("strength") -- both the 8-pair run and the SOL sweep independently
+    showed this loses on average despite a fair win rate, the signature of
+    buying an already-extended move. New thesis: same TRENDING regime gate
+    (4h uptrend + 5m higher-lows -- that part never failed, untouched), but
+    the RSI condition now wants a PULLBACK within the confirmed uptrend
+    (cooled off from a recent push, structure intact) instead of elevated/
+    accelerating RSI. Classic trend-continuation entry. UNTESTED on real
+    data -- this is a new hypothesis, not a calibrated fix.
     """
     if fg > FNG_GREED_BLOCK:
         return 0, "BLOCK"
@@ -387,33 +388,45 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
 
     rsi_dict = calc_multi_tf_rsi(closes_5m)
     rsi_5m   = rsi_dict.get("5m")
+    rsi_1m   = rsi_dict.get("1m")
 
-    # Hard gate: RSI outside the momentum band = skip (either not trending
-    # yet, or already exhausted -- mirrors crypto.py MOM_RSI_MIN/MAX)
-    if rsi_5m is None or not (MOM_RSI_MIN <= rsi_5m <= MOM_RSI_MAX):
+    # Hard gate: RSI must be in the "cooled off, not extended, not oversold"
+    # pullback band. Below MOM_PULLBACK_RSI_MIN is mean-reversion's territory
+    # (that path already handles genuine oversold). Above MOM_PULLBACK_RSI_MAX
+    # is still-extended strength -- the exact zone that just failed twice.
+    if rsi_5m is None or not (MOM_PULLBACK_RSI_MIN <= rsi_5m <= MOM_PULLBACK_RSI_MAX):
+        return 0, "BLOCK"
+
+    # Core pullback signal: short-term RSI has cooled BELOW medium-term RSI
+    # (1m < 5m) -- the opposite condition from the old "accelerating"
+    # version (1m >= 5m). This is what actually defines "pullback" here.
+    if rsi_1m is None or rsi_1m >= rsi_5m:
         return 0, "BLOCK"
 
     score = 0
 
-    # Technical (max +40) -- count timeframes showing strength, not oversold
+    # Technical (max +40) -- count timeframes sitting in the healthy
+    # pullback band (not extended, not broken down)
     rsi_vals = [v for v in rsi_dict.values() if v is not None]
-    sc = sum(1 for r in rsi_vals if MOM_RSI_MIN <= r <= MOM_RSI_MAX)
+    sc = sum(1 for r in rsi_vals if MOM_PULLBACK_RSI_MIN <= r <= MOM_PULLBACK_RSI_MAX)
     if   sc >= 5: score += 20
     elif sc == 4: score += 15
     elif sc == 3: score += 10
     elif sc == 2: score += 5
 
+    # Structural confirmation: bigger trend must still be genuinely intact,
+    # not just "was trending a while ago" -- this is what separates a
+    # healthy pullback from a trend actually breaking down.
     trend = calc_trend_structure(closes_5m)
     if trend.get("higher_lows"):
+        score += 10
+    if trend.get("uptrend"):
         score += 5
 
+    # A pullback that's still holding above VWAP is a shallower, higher-
+    # quality pullback than one that's broken below it.
     vwap = calc_vwap(closes_5m, volumes_5m)
     if vwap and closes_5m[-1] > vwap:
-        score += 5
-
-    rsi_1m = rsi_dict.get("1m")
-    if (rsi_5m is not None and rsi_1m is not None
-            and MOM_RSI_MIN <= rsi_5m <= MOM_RSI_MAX and rsi_1m >= rsi_5m):
         score += 5
 
     tech_score = min(score, 40)
@@ -427,15 +440,15 @@ def _compute_confidence_momentum_bt(pair: str, closes_5m: list, volumes_5m: list
         elif btc_rsi > 72: macro_score -= 5
         elif btc_rsi > 65: macro_score -= 2
 
-    # Volume structure -- OBV confirming breakout, RSI position holding high
+    # Volume on a pullback should be QUIET (selling drying up), not
+    # elevated (elevated volume on a dip is distribution, not a pause) --
+    # this is the inverse read from the old momentum path on purpose.
     obv_mom = calc_obv_momentum(closes_5m, volumes_5m)
     vol_score = 0
     if obv_mom is not None:
-        if   obv_mom >  5.0: vol_score += 5
-        elif obv_mom >  1.0: vol_score += 2
-        elif obv_mom < -1.0: vol_score -= 4
+        if   -1.0 <= obv_mom <= 1.0: vol_score += 5   # quiet, healthy pause
+        elif obv_mom < -5.0:         vol_score -= 4   # heavy selling, not a pause
 
-    # hist_score comes in as a real parameter now (walk-forward bucket lookup)
     sent_score = _score_sentiment_bt(fg, fg_momentum)
 
     total = max(0, min(100, tech_score + macro_score + vol_score + hist_score + sent_score))
