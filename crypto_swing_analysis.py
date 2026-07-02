@@ -40,7 +40,7 @@ Environment: ALPACA_API_KEY, ALPACA_SECRET_KEY  (same as crypto_backtester.py)
 Usage:
   python crypto_swing_analysis.py
   python crypto_swing_analysis.py --pair ETH-USDC --days 180
-  python crypto_swing_analysis.py --zigzag-pct 1.5 --csv swings_btc.csv
+  python crypto_swing_analysis.py --zigzag-pct 1.5 --csv
 """
 
 import os
@@ -469,7 +469,8 @@ def main():
     parser.add_argument("--baseline-n", type=int, default=3000,
                          help="Random non-swing bars sampled as control group")
     parser.add_argument("--seed",       type=int, default=42)
-    parser.add_argument("--csv",        default=None, help="Optional CSV export path")
+    parser.add_argument("--csv",        action="store_true",
+                         help="Also export and send the swing/baseline CSV")
     args = parser.parse_args()
 
     if not ALPACA_API_KEY:
@@ -569,10 +570,11 @@ def main():
         log.error(f"Report file/delivery failed: {e}")
 
     if args.csv:
+        csv_path = f"/tmp/swings_{args.pair.replace('-', '_').lower()}.csv"
         try:
-            export_csv(args.csv, low_features, high_features, baseline_features)
+            export_csv(csv_path, low_features, high_features, baseline_features)
             send_file_via_telegram(
-                args.csv,
+                csv_path,
                 f"Swing data: {args.pair} {args.days}d @ {args.zigzag_pct}% zigzag\n"
                 f"{len(low_features)} lows, {len(high_features)} highs, "
                 f"{len(baseline_features)} baseline"
