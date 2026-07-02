@@ -355,34 +355,36 @@ def _marginal_table(rows: List[Dict[str, Any]], field: str) -> Dict[Any, int]:
         counts[v] = counts.get(v, 0) + 1
     return counts
 
-def print_marginal(title: str, field: str, lows: list, highs: list, baseline: list):
-    print(f"\n--- {title} ---", flush=True)
+def format_marginal(title: str, field: str, lows: list, highs: list, baseline: list) -> List[str]:
+    lines = [f"\n--- {title} ---"]
     lc, hc, bc = (_marginal_table(lows, field), _marginal_table(highs, field),
                   _marginal_table(baseline, field))
     all_vals = sorted(set(lc) | set(hc) | set(bc), key=lambda x: str(x))
     nL, nH, nB = len(lows), len(highs), len(baseline)
-    print(f"  {'value':<10} {'LOWS':>16} {'HIGHS':>16} {'BASELINE':>16}", flush=True)
+    lines.append(f"  {'value':<10} {'LOWS':>16} {'HIGHS':>16} {'BASELINE':>16}")
     for v in all_vals:
         l, h, b = lc.get(v, 0), hc.get(v, 0), bc.get(v, 0)
-        print(f"  {str(v):<10} {l:>5} ({_pct(l,nL):>5.1f}%) {h:>5} ({_pct(h,nH):>5.1f}%) "
-              f"{b:>5} ({_pct(b,nB):>5.1f}%)", flush=True)
+        lines.append(f"  {str(v):<10} {l:>5} ({_pct(l,nL):>5.1f}%) {h:>5} ({_pct(h,nH):>5.1f}%) "
+                      f"{b:>5} ({_pct(b,nB):>5.1f}%)")
+    return lines
 
-def print_numeric_summary(title: str, field: str, lows: list, highs: list, baseline: list):
+def format_numeric_summary(title: str, field: str, lows: list, highs: list, baseline: list) -> List[str]:
     def stats(rows):
         vals = [r[field] for r in rows if r.get(field) is not None]
         if not vals:
             return None
         return sum(vals) / len(vals), min(vals), max(vals), len(vals)
-    print(f"\n--- {title} (mean [min, max], n) ---", flush=True)
+    lines = [f"\n--- {title} (mean [min, max], n) ---"]
     for label, rows in (("LOWS", lows), ("HIGHS", highs), ("BASELINE", baseline)):
         s = stats(rows)
         if s is None:
-            print(f"  {label:<10}: no data", flush=True)
+            lines.append(f"  {label:<10}: no data")
         else:
-            print(f"  {label:<10}: {s[0]:.2f}  [{s[1]:.2f}, {s[2]:.2f}]  n={s[3]}", flush=True)
+            lines.append(f"  {label:<10}: {s[0]:.2f}  [{s[1]:.2f}, {s[2]:.2f}]  n={s[3]}")
+    return lines
 
-def print_bucket_lift(label: str, group: list, baseline: list):
-    print(f"\n--- Full bucket key: {label} vs BASELINE (min {MIN_BUCKET_SAMPLES} samples, sorted by lift) ---", flush=True)
+def format_bucket_lift(label: str, group: list, baseline: list) -> List[str]:
+    lines = [f"\n--- Full bucket key: {label} vs BASELINE (min {MIN_BUCKET_SAMPLES} samples, sorted by lift) ---"]
     gb = _marginal_table(group, "bucket_key")
     bb = _marginal_table(baseline, "bucket_key")
     nG, nB = len(group), len(baseline)
@@ -397,10 +399,11 @@ def print_bucket_lift(label: str, group: list, baseline: list):
         rows.append((key, g_count, g_pct * 100, b_count, b_pct * 100, lift))
     rows.sort(key=lambda r: (-(r[5] if r[5] != float("inf") else 1e9), -r[1]))
     if not rows:
-        print(f"  (no bucket had >= {MIN_BUCKET_SAMPLES} {label} samples -- expected with n={nG} "
-              f"points spread across a 6-dimension key; read the marginal tables above instead)", flush=True)
+        lines.append(f"  (no bucket had >= {MIN_BUCKET_SAMPLES} {label} samples -- expected with n={nG} "
+                      f"points spread across a 6-dimension key; read the marginal tables above instead)")
     for key, gc_, gp, bc_, bp, lift in rows[:15]:
-        print(f"  {key:<45} {label.lower()}={gc_:>3} ({gp:4.1f}%)  baseline={bc_:>4} ({bp:4.1f}%)  lift={lift:4.2f}x", flush=True)
+        lines.append(f"  {key:<45} {label.lower()}={gc_:>3} ({gp:4.1f}%)  baseline={bc_:>4} ({bp:4.1f}%)  lift={lift:4.2f}x")
+    return lines
 
 
 def send_csv_via_telegram(path: str, caption: str):
@@ -514,24 +517,33 @@ def main():
         if f is not None:
             baseline_features.append(f)
 
-    print(f"\n{'='*60}", flush=True)
-    print(f"SWING ANALYSIS -- {args.pair} -- {args.days}d @ {args.zigzag_pct}% zigzag", flush=True)
-    print(f"{'='*60}", flush=True)
-    print(f"Swing lows: {len(low_features)}  |  Swing highs: {len(high_features)}  |  "
-          f"Baseline: {len(baseline_features)}", flush=True)
+    report: List[str] = []
+    report.append(f"\n{'='*60}")
+    report.append(f"SWING ANALYSIS -- {args.pair} -- {args.days}d @ {args.zigzag_pct}% zigzag")
+    report.append(f"{'='*60}")
+    report.append(f"Swing lows: {len(low_features)}  |  Swing highs: {len(high_features)}  |  "
+                   f"Baseline: {len(baseline_features)}")
 
-    print_numeric_summary("RSI (5m)", "rsi_5m", low_features, high_features, baseline_features)
-    print_numeric_summary("Distance from VWAP (%)", "vwap_dist_pct", low_features, high_features, baseline_features)
-    print_numeric_summary("Fear & Greed index", "fg", low_features, high_features, baseline_features)
-    print_numeric_summary("Volume vs 20-bar avg (ratio)", "vol_ratio_20", low_features, high_features, baseline_features)
-    print_marginal("VWAP position", "vwap_above", low_features, high_features, baseline_features)
-    print_marginal("Regime", "regime", low_features, high_features, baseline_features)
-    print_marginal("Higher lows", "higher_lows", low_features, high_features, baseline_features)
-    print_marginal("Weekend", "is_weekend", low_features, high_features, baseline_features)
-    print_bucket_lift("LOWS", low_features, baseline_features)
-    print_bucket_lift("HIGHS", high_features, baseline_features)
+    report += format_numeric_summary("RSI (5m)", "rsi_5m", low_features, high_features, baseline_features)
+    report += format_numeric_summary("Distance from VWAP (%)", "vwap_dist_pct", low_features, high_features, baseline_features)
+    report += format_numeric_summary("Fear & Greed index", "fg", low_features, high_features, baseline_features)
+    report += format_numeric_summary("Volume vs 20-bar avg (ratio)", "vol_ratio_20", low_features, high_features, baseline_features)
+    report += format_marginal("VWAP position", "vwap_above", low_features, high_features, baseline_features)
+    report += format_marginal("Regime", "regime", low_features, high_features, baseline_features)
+    report += format_marginal("Higher lows", "higher_lows", low_features, high_features, baseline_features)
+    report += format_marginal("Weekend", "is_weekend", low_features, high_features, baseline_features)
+    report += format_bucket_lift("LOWS", low_features, baseline_features)
+    report += format_bucket_lift("HIGHS", high_features, baseline_features)
+    report.append(f"\n{'='*60}")
 
-    print(f"\n{'='*60}", flush=True)
+    # Single write for the whole report -- this is the actual fix. ~50
+    # separate print() calls, even flushed, were arriving at Railway's log
+    # collector as a rapid burst that got reordered in transit (log.info()
+    # setup lines stayed correctly ordered across two separate runs while
+    # these scrambled both times, which is what pointed at the transport
+    # layer rather than Python-side buffering). One write leaves nothing
+    # for anything downstream to reorder.
+    print("\n".join(report), flush=True)
 
     if args.csv:
         try:
