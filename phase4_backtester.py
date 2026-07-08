@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.2 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.3 -- NEXUS Phase4 Backtester
 =====================================================
+V1.3 fix (Jul 8 2026): EXIT slippage. Entries paid the 0.05% half-spread
+since V1.0 but exits were booked at the raw bar close -- every recorded
+trade was ~0.05% optimistic, and 'won' was labeled off the gross move.
+Both exit sites (signal exits and end-of-data timeout) now sell at
+price * (1 - SLIPPAGE_PCT) and label wins off the slipped PnL.
+
 V1.2 fix (Jun 30 2026):
   ✅ Exit priority reordered -- rsi-overbought was checked BEFORE the profit
      ratchet, so on a mean-reversion entry (buy oversold, RSI climbs toward
@@ -767,19 +773,25 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
 
                 if exit_reason:
                     hold_min = (bar_num - bot.entry_bar)
+                    # V1.3: EXIT slippage. Entries paid the half-spread since
+                    # V1.0; exits were booked at the raw bar close, so every
+                    # trade's PnL was ~0.05% optimistic. Sells cross the
+                    # spread against you -- record the slipped PnL.
+                    exit_px    = price * (1 - SLIPPAGE_PCT)
+                    final_pnl  = (exit_px - bot.entry_price) / bot.entry_price
                     bot.trades.append({
                         "symbol":       sym,
                         "active_sym":   bot.active_sym,
                         "is_bear":      is_bear,
                         "mode":         bot.mode,
                         "entry_price":  round(bot.entry_price, 4),
-                        "exit_price":   round(price, 4),
-                        "pnl_pct":      round(profit_pct * 100, 3),
+                        "exit_price":   round(exit_px, 4),
+                        "pnl_pct":      round(final_pnl * 100, 3),
                         "exit_reason":  exit_reason,
                         "hold_min":     hold_min,
                         "mfe":          round(bot.mfe * 100, 3),
                         "mae":          round(bot.mae * 100, 3),
-                        "won":          profit_pct > 0,
+                        "won":          final_pnl > 0,
                         "hour_entry":   hour,
                         "spy_bullish":  spy_ctx.get("bullish", False),
                         "qqq_ob":       qqq_ctx.get("overbought", False),
@@ -907,14 +919,15 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
             active_prices = list(bot.bear_prices) if bot.active_sym == bot.bear_pair else list(bot.prices)
             if active_prices:
                 price      = active_prices[-1]
-                profit_pct = (price - bot.entry_price) / bot.entry_price
+                exit_px    = price * (1 - SLIPPAGE_PCT)   # V1.3: exit slippage
+                profit_pct = (exit_px - bot.entry_price) / bot.entry_price
                 bot.trades.append({
                     "symbol":      sym,
                     "active_sym":  bot.active_sym,
                     "is_bear":     bot.active_sym == bot.bear_pair,
                     "mode":        bot.mode,
                     "entry_price": round(bot.entry_price, 4),
-                    "exit_price":  round(price, 4),
+                    "exit_price":  round(exit_px, 4),
                     "pnl_pct":     round(profit_pct * 100, 3),
                     "exit_reason": "timeout",
                     "hold_min":    bar_num - bot.entry_bar,
