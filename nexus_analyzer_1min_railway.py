@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-nexus_analyzer_1min_railway.py V3.0 — NEXUS Berserker Backtester
+nexus_analyzer_1min_railway.py V3.1 — NEXUS Berserker Backtester
 =================================================================
 Runs every Sunday 11pm UTC as Railway cron worker (genuine-reverence).
 Pulls 2yr 1-min Alpaca IEX bars, replays through the EXACT Berserker
 V10.19 signal engine, writes fingerprints to berserker_trade_fingerprints.
+
+V3.1 fix (Jul 8 2026): EXIT slippage applied at both exit sites (signal
+exits + end-of-data force-close); pnl_pct and the won label now include
+the sell-side half-spread. Entries already paid it since V3.0.
+KNOWN, DELIBERATE simplification (unchanged): exit engine is TP/SL only
+-- no trailing stop, no EOD autoclose, unbounded holds -- so bt_ bucket
+win rates come from a DIFFERENT exit engine than live Berserker runs.
+Acceptable for bootstrap seeding; the bt_ scaffolding retires per service
+at its 30-live-trade checkpoint. Do not tune live exit params from these.
 
 V3.0 upgrades (Jun 2026):
   ✅ VIX regime gate: VIXY bars fetched alongside SPY/QQQ.
@@ -442,15 +451,21 @@ def replay_berserker(all_bars: dict,
 
                 if exit_reason:
                     hold_min = bar_num - entry_bar[sym]
+                    # V3.1: EXIT slippage -- entries paid the half-spread,
+                    # exits were booked at the raw bar close. Sells cross
+                    # the spread against you; the recorded PnL and the won
+                    # label now reflect it.
+                    exit_px   = price * (1 - SLIPPAGE_PCT)
+                    final_pnl = (exit_px - entry_price[sym]) / entry_price[sym]
                     trades.append({
                         "trade_id":     "bt_" + secrets.token_hex(8),
                         "symbol":       sym,
                         "entry_price":  round(entry_price[sym], 4),
-                        "exit_price":   round(price, 4),
-                        "pnl_pct":      round(profit_pct * 100, 3),
+                        "exit_price":   round(exit_px, 4),
+                        "pnl_pct":      round(final_pnl * 100, 3),
                         "exit_reason":  exit_reason,
                         "hold_min":     hold_min,
-                        "won":          profit_pct > 0,
+                        "won":          final_pnl > 0,
                         "rsi_at_entry": entry_rsi[sym],
                         "spy_bullish":  entry_spy_bull[sym],
                         "spy_rsi":       entry_spy_rsi[sym],
@@ -510,13 +525,14 @@ def replay_berserker(all_bars: dict,
     # Force-close any open at end
     for sym in SYMBOLS:
         if in_position[sym] and price_hist[sym]:
-            price = list(price_hist[sym])[-1]
-            profit_pct = (price - entry_price[sym]) / entry_price[sym]
+            price      = list(price_hist[sym])[-1]
+            exit_px    = price * (1 - SLIPPAGE_PCT)   # V3.1: exit slippage
+            profit_pct = (exit_px - entry_price[sym]) / entry_price[sym]
             trades.append({
                 "trade_id":    "bt_" + secrets.token_hex(8),
                 "symbol":      sym,
                 "entry_price": round(entry_price[sym], 4),
-                "exit_price":  round(price, 4),
+                "exit_price":  round(exit_px, 4),
                 "pnl_pct":     round(profit_pct * 100, 3),
                 "exit_reason": "timeout",
                 "hold_min":    bar_num - entry_bar[sym],
