@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.3 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.4 -- NEXUS Phase4 Backtester
 =====================================================
+V1.4 fix (Jul 8 2026, evening): DATA TRUTH.
+  - adjustment=ALL on all bar fetches. The entire Phase4 universe is
+    leveraged ETFs that reverse-split constantly -- raw bars (alpaca-py's
+    default) are riddled with fake 4-5x discontinuities that fire phantom
+    stops/TPs and corrupt every indicator window they touch.
+  - VIX proxy rebuilt on SPY realized vol (see get_vix_from_spy) --
+    VIXY*1.5 latched the VIX gates shut permanently after VIXY's
+    mid-window reverse split. VIXY dropped from the fetch list.
+  - Results from runs before this fix are time-skewed (entries only where
+    the latch hadn't tripped yet) -- do NOT re-derive bear min_scores from
+    them; wait for the first post-V1.4 run.
+
 V1.3 fix (Jul 8 2026): EXIT slippage. Entries paid the 0.05% half-spread
 since V1.0 but exits were booked at the raw bar close -- every recorded
 trade was ~0.05% optimistic, and 'won' was labeled off the gross move.
@@ -86,7 +98,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,7 +120,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BULL_ETFS    = ["NUGT", "SOXL", "LABU", "TQQQ"]
 BEAR_ETFS    = ["DUST", "SOXS", "LABD", "SQQQ"]
 UNDERLYINGS  = ["GDX", "SMH", "XBI", "QQQ"]
-CONTEXT_SYMS = ["SPY", "VIXY"]
+CONTEXT_SYMS = ["SPY"]   # V1.4: VIXY dropped -- VIX proxy now from SPY realized vol
 ALL_SYMBOLS  = BULL_ETFS + BEAR_ETFS + UNDERLYINGS + CONTEXT_SYMS
 
 # ── Bot configs (exact copy from phase4.py V2.0) ──────────────────────────────
@@ -483,10 +495,28 @@ def get_qqq_context(qqq_prices: list) -> dict:
     rsi = compute_rsi(qqq_prices) or 50
     return {"rsi": rsi, "overbought": rsi > 68, "oversold": rsi < 35}
 
-def get_vix_from_vixy(vixy_prices: list) -> float:
-    if not vixy_prices:
+def get_vix_from_spy(spy_prices: list) -> float:
+    """
+    V1.4: VIX proxy from SPY realized vol (annualized stdev of the last 30
+    1-min log returns), replacing VIXY*1.5. VIXY has no stable price scale
+    across a multi-year window (decay + ~annual reverse splits); on raw
+    bars a split day jumped the proxy 4-5x and latched the VIX gates shut
+    for the rest of the replay -- the same defect that flatlined the
+    Berserker backtester's second half on Jul 8. Realized vol is
+    self-calibrating at every point in history and typically reads a few
+    points UNDER implied, so VIX_CAUTION/VIX_PAUSE act slightly
+    conservative -- acceptable for a regime gate.
+    """
+    if len(spy_prices) < 31:
         return 15.0
-    return vixy_prices[-1] * 1.5   # VIXY ~$10-25, VIX ~$15-40; 1.5x is correct ratio
+    import math as _m
+    win  = spy_prices[-31:]
+    rets = [_m.log(win[j] / win[j-1]) for j in range(1, len(win)) if win[j-1] > 0]
+    if len(rets) < 2:
+        return 15.0
+    mu  = sum(rets) / len(rets)
+    var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
+    return (var ** 0.5) * ((390 * 252) ** 0.5) * 100
 
 def get_underlying_ctx(und_prices: list) -> dict:
     if len(und_prices) < 21:
@@ -531,6 +561,8 @@ def fetch_all_bars(days: int) -> dict:
                 start=start_dt,
                 end=end_dt,
                 feed=DataFeed.IEX,
+                adjustment=Adjustment.ALL,   # V1.4: leveraged ETFs reverse-split
+                # constantly -- raw bars are full of fake 4-5x discontinuities
             ))
             df = bars.df
             if hasattr(df.index, "levels"):
@@ -618,7 +650,6 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
     # Shared context histories
     spy_hist   = deque(maxlen=80)
     qqq_hist   = deque(maxlen=80)
-    vixy_hist  = deque(maxlen=20)
 
     # Init bots
     bots = {sym: BotState(sym, cfg) for sym, cfg in BOT_CONFIGS.items()}
@@ -630,8 +661,8 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
     for bar_idx, ts in enumerate(all_ts):
         bar_num += 1
 
-        # Update context (SPY, QQQ, VIXY)
-        for ctx_sym, hist in [("SPY", spy_hist), ("QQQ", qqq_hist), ("VIXY", vixy_hist)]:
+        # Update context (SPY, QQQ) -- V1.4: VIXY dropped
+        for ctx_sym, hist in [("SPY", spy_hist), ("QQQ", qqq_hist)]:
             if ctx_sym in all_bars and ts in all_bars[ctx_sym].index:
                 row = all_bars[ctx_sym].loc[ts]
                 hist.append(float(row["close"]))
@@ -646,7 +677,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
         # Compute shared context (lagged — use history up to but not including current bar)
         spy_ctx   = get_spy_context(list(spy_hist))
         qqq_ctx   = get_qqq_context(list(qqq_hist))
-        vix_level = get_vix_from_vixy(list(vixy_hist))
+        vix_level = get_vix_from_spy(list(spy_hist))   # V1.4
 
         for sym, bot in bots.items():
             cfg = bot.cfg
@@ -1169,7 +1200,7 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS PHASE4 BACKTESTER V1.2")
+    log.info(f"NEXUS PHASE4 BACKTESTER V1.4")
     log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
