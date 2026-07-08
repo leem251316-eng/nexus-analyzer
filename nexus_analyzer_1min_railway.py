@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-nexus_analyzer_1min_railway.py V3.1 — NEXUS Berserker Backtester
+nexus_analyzer_1min_railway.py V3.2 — NEXUS Berserker Backtester
 =================================================================
 Runs every Sunday 11pm UTC as Railway cron worker (genuine-reverence).
 Pulls 2yr 1-min Alpaca IEX bars, replays through the EXACT Berserker
 V10.19 signal engine, writes fingerprints to berserker_trade_fingerprints.
+
+V3.2 fix (Jul 8 2026, evening): DATA TRUTH.
+  - Bars now fetched with adjustment=ALL. Raw bars (the alpaca-py default)
+    put MSTR's and SMCI's 10:1 splits INSIDE the 730d window as fake -90%
+    crashes.
+  - VIX proxy rebuilt: SPY realized vol (annualized stdev of last 30 1-min
+    log returns), replacing VIXY*1.5. VIXY's reverse splits latched
+    vix_blocking permanently mid-replay -- the Jul 8 run put all 3,026
+    trades in the first half of the window and zero after, so walk-forward
+    validation ran on nothing. VIXY dropped from the fetch list.
 
 V3.1 fix (Jul 8 2026): EXIT slippage applied at both exit sites (signal
 exits + end-of-data force-close); pnl_pct and the won label now include
@@ -51,6 +61,7 @@ import os
 import sys
 import time
 import secrets
+import math
 import argparse
 import logging
 from collections import defaultdict, deque
@@ -65,7 +76,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -289,7 +300,7 @@ def fetch_all_bars(days: int) -> dict:
     client   = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
     end_dt   = datetime.now(timezone.utc).replace(hour=21, minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=days)
-    all_syms = SYMBOLS + ["SPY", "QQQ", "VIXY"]
+    all_syms = SYMBOLS + ["SPY", "QQQ"]   # V3.2: VIXY dropped (proxy now from SPY)
 
     log.info(f"Fetching {days}d 1-min bars for {len(all_syms)} symbols...")
     log.info(f"Range: {start_dt.strftime('%Y-%m-%d')} -> {end_dt.strftime('%Y-%m-%d')}")
@@ -303,6 +314,8 @@ def fetch_all_bars(days: int) -> dict:
                 start=start_dt,
                 end=end_dt,
                 feed=DataFeed.IEX,
+                adjustment=Adjustment.ALL,   # V3.2: raw bars put MSTR/SMCI 10:1
+                # splits INSIDE the 730d window -- fake -90% crashes mid-replay
             ))
             df = bars.df
             if hasattr(df.index, "levels"):
@@ -351,7 +364,7 @@ def replay_berserker(all_bars: dict,
     log.info(f"  {label}: {total_bars:,} market-hours timestamps | validate_start={validate_start}")
 
     # Price histories
-    price_hist:   Dict[str, deque] = {s: deque(maxlen=100) for s in SYMBOLS + ["SPY", "QQQ", "VIXY"]}
+    price_hist:   Dict[str, deque] = {s: deque(maxlen=100) for s in SYMBOLS + ["SPY", "QQQ"]}
     trump_prices: Dict[str, deque] = {s: price_hist[s] for s in TRUMP_THEME}
 
     # Per-symbol trade state
@@ -385,19 +398,32 @@ def replay_berserker(all_bars: dict,
         dow  = get_day_of_week(dt_utc)
 
         # Update all price histories
-        for sym in list(SYMBOLS) + ["SPY", "QQQ", "VIXY"]:
+        for sym in list(SYMBOLS) + ["SPY", "QQQ"]:
             if sym in all_bars and ts in all_bars[sym].index:
                 row = all_bars[sym].loc[ts]
                 price_hist[sym].append(float(row["close"]))
 
-        # VIX approximation via VIXY (V3.0)
-        # VIXY is a 1x VIX futures ETF trading $10-25 while VIX is 12-40.
-        # Real multiplier is ~1.5x (not 10x). Keeps threshold at 25 consistent
-        # with main.py V10.19's VIX_BLOCK_THRESHOLD.
-        if price_hist["VIXY"]:
-            vixy = list(price_hist["VIXY"])[-1]
-            raw_vix = vixy * 1.5
-            vix_smooth = vix_smooth * 0.7 + raw_vix * 0.3
+        # V3.2: VIX proxy from SPY REALIZED VOL, not VIXY*1.5. VIXY has no
+        # stable price scale across a 2-year window: it decays ~70-90%/yr
+        # and reverse-splits ~annually. On raw bars the split day jumps the
+        # proxy 4-5x and LATCHES vix_blocking for the rest of the replay --
+        # tonight's Jul 8 run generated all 3,026 trades in the first half
+        # of the window and ZERO after (validation ran on nothing). On
+        # adjusted bars the early-window VIXY price is inflated instead --
+        # same latch, other end. No constant multiplier exists. Annualized
+        # realized vol of SPY 1-min returns is self-calibrating at every
+        # point in history and lands on a VIX-comparable scale (typically
+        # reads a few points UNDER implied -- the 25 threshold is therefore
+        # a slightly conservative gate; fine for a regime block).
+        _spyp = list(price_hist["SPY"])
+        if len(_spyp) >= 31:
+            _rets = [math.log(_spyp[j] / _spyp[j-1])
+                     for j in range(len(_spyp) - 30, len(_spyp)) if _spyp[j-1] > 0]
+            if len(_rets) >= 2:
+                _mu  = sum(_rets) / len(_rets)
+                _var = sum((r - _mu) ** 2 for r in _rets) / (len(_rets) - 1)
+                raw_vix = (_var ** 0.5) * ((390 * 252) ** 0.5) * 100
+                vix_smooth = vix_smooth * 0.7 + raw_vix * 0.3
         vix_blocking = vix_smooth > VIX_BLOCK_THRESHOLD
 
         # SPY context for fingerprinting and sector health gate
@@ -697,7 +723,7 @@ def build_report(trades: List[Dict], validate_mode: bool = False) -> str:
 
     lines = [
         f"\n{'='*60}",
-        f"BERSERKER BACKTEST V3.0 — {label}",
+        f"BERSERKER BACKTEST V3.2 — {label}",
         f"{'='*60}",
         f"Trades: {total} | {len(wins)}W {total-len(wins)}L | {wr}% WR",
         f"Avg PnL: {avg_pnl:+.3f}% | MFE: +{avg_mfe:.3f}% | MAE: {avg_mae:.3f}%",
@@ -745,13 +771,13 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS BERSERKER BACKTESTER V3.0")
+    log.info(f"NEXUS BERSERKER BACKTESTER V3.2")
     log.info(f"Symbols: {len(SYMBOLS)} | Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
     log.info(f"V3.0: VIX gate | Earnings blackout | Regime | Walk-forward | Slippage")
     log.info("=" * 60)
 
     send_alert(
-        f"🔥 NEXUS BERSERKER BACKTESTER V3.0 STARTING\n"
+        f"🔥 NEXUS BERSERKER BACKTESTER V3.2 STARTING\n"
         f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
         f"V3.0: VIX gate | Earnings | Regime | Walk-forward | Slippage\n"
         f"Signal engine: V10.19 exact replica\n"
@@ -815,7 +841,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(val_trades)} trades)"
 
     send_alert(
-        f"✅ NEXUS BERSERKER BACKTESTER V3.0 COMPLETE\n"
+        f"✅ NEXUS BERSERKER BACKTESTER V3.2 COMPLETE\n"
         f"──────────────────\n"
         f"Training: {train_wr}% WR ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"
