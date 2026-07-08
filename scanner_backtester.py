@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-scanner_backtester.py V1.2 — NEXUS Scanner Backtester
+scanner_backtester.py V1.3 — NEXUS Scanner Backtester
 =======================================================
 Pulls 2yr 1-min Alpaca IEX bars for Scanner's 44-symbol universe, replays
 through the EXACT Scanner V2.4 signal engine (scan_for_entry, manage_scanner_
 exits, bucket key), writes fingerprints to scanner_trade_fingerprints,
 triggers pattern analysis.
+
+V1.3 fix (Jul 8 2026, evening): adjustment=ALL on bar fetches. Raw bars
+(the alpaca-py default) turn every reverse split in this ETF-heavy
+universe into a fake 4-5x price event -- which is EXACTLY the shape of
+signal (volume spike + big price move) this backtester hunts for. Split
+days were being harvested as breakout entries and split-crash days as
+phantom stop-losses. All pre-V1.3 seeded fingerprints carry this
+contamination.
 
 V1.2 fix (Jul 8 2026): Slippage sign on exits. Both exit sites used
 `(1 - SLIP if winning else 1 + SLIP)` -- but a market sell crosses the
@@ -87,7 +95,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,6 +190,11 @@ def fetch_all_bars(days: int) -> dict:
                 start=start_dt,
                 end=end_dt,
                 feed=DataFeed.IEX,
+                adjustment=Adjustment.ALL,   # V1.3: Scanner's universe is full of
+                # split-happy leveraged/volatility ETFs (TNA/TZA/UVXY/SVXY/MSTU/
+                # MSTZ/NVDL/NVDS...) -- raw bars hand the vol-spike + price-move
+                # entry engine an endless stream of FAKE breakouts on split days,
+                # and fake -75%+ crashes that trip phantom stop-losses.
             ))
             df = bars.df
             if hasattr(df.index, "levels"):
