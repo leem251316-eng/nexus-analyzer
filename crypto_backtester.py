@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """
-crypto_backtester.py V3.0 -- NEXUS Crypto Pattern Memory Seeder
+crypto_backtester.py V3.1 -- NEXUS Crypto Pattern Memory Seeder
 ================================================================
 V3.0 (Jun 2026): Switched from broken Coinbase historical API to Alpaca
 crypto bars. Coinbase's candle API returns 0 candles on Railway IPs
 intermittently. Alpaca CryptoHistoricalDataClient is stable, proven, and
 already used by other NEXUS services.
+
+V3.1 (Jul 8 2026) -- FEE TRUTH:
+  - Round-trip taker fees modeled (CB_TAKER_FEE_PCT env, same var crypto.py
+    keys off; default 1.2%/side = 2.4% RT). All pnl_pct and won labels are
+    now NET of fees + slippage -- matching live's V5.10 definition of a win.
+  - TP trigger is GROSS (recipe tp_pct + round trip), matching live V5.11 --
+    the backtest was exiting at the raw net target, far earlier than live.
+  - Partial exit level fee-floored (max(gross_tp*0.5, RT + margin)) and
+    partials are BLENDED into ONE final trade record, matching live's
+    single blended fingerprint. Previously each partial was written as its
+    own won=True trade at the full unhalved pnl -- inflating both WR and
+    trade count.
+  - BTC context aligned by TIMESTAMP (reindex + ffill to the pair's index),
+    not by integer position -- gaps in either series silently misaligned
+    the vol-regime gate before.
 
 V3.0 additions vs V2.0:
   ✅ Data source: Alpaca crypto bars (BTC/USD format) instead of Coinbase API
@@ -137,6 +152,14 @@ FNG_BASE        = "https://api.alternative.me"
 
 # Backtesting params
 SLIPPAGE_PCT      = 0.0005   # 0.05% half-spread
+# V3.1: FEE MODEL. The live system's DEFINING constraint (Coinbase Intro 1
+# = 1.2%/side taker, 2.4% round trip) was completely absent -- every prior
+# result, WR figure, and strategy conclusion from this tool was fee-blind.
+# A +1% gross trade the backtest called a WIN is a -1.4% NET loss live.
+# Keys off the same env var as crypto.py so both always agree.
+TAKER_FEE_PCT      = float(os.environ.get("CB_TAKER_FEE_PCT", "0.012"))
+ROUND_TRIP_FEE_PCT = 2 * TAKER_FEE_PCT
+PARTIAL_FEE_MARGIN = 0.002   # matches crypto.py V5.11
 WARMUP_BARS       = 60
 PARTIAL_TP_MULT   = 0.50     # V5.0: partial exit at 50% of TP target
 BTC_VOL_THRESHOLD = 5.0      # V5.0: restrict alts when BTC 7d vol > 5%
@@ -640,6 +663,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
     entry_price = 0.0
     peak_price  = 0.0
     partial_done = False
+    partial_net  = 0.0   # V3.1: net pnl (fraction of orig cost) banked by the partial leg
     mfe = mae = 0.0
     entry_bar = 0
     entry_ts  = None
@@ -659,6 +683,17 @@ def simulate_pair(pair: str, df: pd.DataFrame,
 
     is_btc_eth = pair in BTC_IS_ETH
 
+    # V3.1: align BTC closes to this pair's index by TIMESTAMP, once.
+    btc_closes_aligned = None
+    if btc_df is not None and not btc_df.empty:
+        try:
+            btc_closes_aligned = (
+                btc_df["close"].reindex(df.index, method="ffill").tolist()
+            )
+        except Exception as _ae:
+            log.warning(f"{pair}: BTC reindex failed ({_ae}) -- vol gate off for this pair")
+            btc_closes_aligned = None
+
     for i in range(WARMUP_BARS, total_bars):
         closes_window  = closes[max(0, i-120):i+1]
         volumes_window = volumes[max(0, i-120):i+1]
@@ -667,8 +702,13 @@ def simulate_pair(pair: str, df: pd.DataFrame,
         # window everything else uses. Separate, larger slice, regime-only.
         regime_window  = closes[max(0, i-1050):i+1]
         btc_window     = []
-        if btc_df is not None and not btc_df.empty and i < len(btc_df):
-            btc_window = btc_df["close"].tolist()[max(0, i-120):i+1]
+        # V3.1: btc_closes_aligned is reindexed to THIS pair's timestamps
+        # (ffill) before the loop -- integer slicing is now safe because
+        # position i is the same bar time in both series. The old code
+        # sliced the raw BTC frame by position; any gap in either series
+        # silently misaligned the vol-regime gate.
+        if btc_closes_aligned is not None:
+            btc_window = btc_closes_aligned[max(0, i-120):i+1]
 
         price = closes[i]
         hour  = get_utc_hour(times[i])
@@ -708,39 +748,32 @@ def simulate_pair(pair: str, df: pd.DataFrame,
 
             exit_reason = None
 
-            # Stop loss
+            # V3.1: GROSS trigger levels, matching live V5.11 -- the recipe
+            # tp_pct is the desired NET result; the price must clear the
+            # round trip on top of it before live would ever exit. The old
+            # code triggered at the raw tp_pct, exiting far earlier than
+            # live and on moves live books as losses.
+            gross_tp    = active_tp_pct + ROUND_TRIP_FEE_PCT
+            partial_lvl = max(gross_tp * PARTIAL_TP_MULT,
+                              ROUND_TRIP_FEE_PCT + PARTIAL_FEE_MARGIN)
+
+            # Stop loss (gross, matching live)
             if profit_pct <= -active_stop_pct:
                 exit_reason = "STOP_LOSS"
 
-            # V5.0: Partial exit at 50% of TP
-            elif not partial_done and profit_pct >= active_tp_pct * PARTIAL_TP_MULT:
+            # V5.0/V3.1: Partial exit -- BLENDED into the final record,
+            # matching live's single blended fingerprint. Bank the net pnl
+            # of the sold half (half the position, gross move minus exit
+            # slippage minus the round-trip fee on that half's cost).
+            elif not partial_done and profit_pct >= partial_lvl:
                 partial_done = True
-                # Record partial exit as its own trade
-                trades.append({
-                    "pair":        pair,
-                    "entry_price": round(entry_price, 6),
-                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
-                    "pnl_pct":     round(profit_pct * 100, 3),
-                    "exit_reason": "PARTIAL_TP",
-                    "hold_bars":   i - entry_bar,
-                    "mfe":         round(mfe * 100, 3),
-                    "mae":         round(mae * 100, 3),
-                    "won":         True,
-                    "confidence":  conf_at_entry,
-                    "mode":        mode_at_entry,
-                    "strategy":    strategy_at_entry,
-                    "hour_utc":    hour,
-                    "validate":    entry_bar >= start_idx,
-                    "trade_id":    secrets.token_hex(8),
-                })
-                # Continue holding remaining half (entry_price unchanged, position half size)
-                # For simplicity, treat remaining half as continuing from current price
-                # (partial exit doesn't change entry_price in our simplified model)
-                # NOTE: bucket outcome NOT recorded here -- final exit below is
-                # the trade's true result; a partial doesn't represent it yet.
+                _gross_half  = (price * (1 - SLIPPAGE_PCT) - entry_price) / entry_price
+                partial_net  = 0.5 * (_gross_half - ROUND_TRIP_FEE_PCT)
+                # NOTE: no trade row here -- the final exit below records the
+                # whole trade's blended result, exactly like live V5.10.
 
-            # Full TP
-            elif profit_pct >= active_tp_pct:
+            # Full TP (gross trigger)
+            elif profit_pct >= gross_tp:
                 exit_reason = "TAKE_PROFIT"
 
             # Trend break / time failsafe (simplified)
@@ -749,13 +782,22 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                     exit_reason = "TIME_FAILSAFE"
 
             if exit_reason:
-                won = profit_pct > 0
+                # V3.1: NET, BLENDED PnL -- matching live's V5.10 definition:
+                #   leg  = remaining fraction * (gross move - RT fee)
+                #   pnl  = leg + previously banked partial leg
+                #   won  = NET pnl > 0
+                exit_px     = price * (1 - SLIPPAGE_PCT)
+                gross_final = (exit_px - entry_price) / entry_price
+                remain_frac = 0.5 if partial_done else 1.0
+                leg_net     = remain_frac * (gross_final - ROUND_TRIP_FEE_PCT)
+                net_pnl     = leg_net + partial_net
+                won         = net_pnl > 0
                 trades.append({
                     "pair":        pair,
                     "entry_price": round(entry_price, 6),
-                    "exit_price":  round(price * (1 - SLIPPAGE_PCT), 6),
-                    "pnl_pct":     round(profit_pct * 100, 3),
-                    "exit_reason": exit_reason,
+                    "exit_price":  round(exit_px, 6),
+                    "pnl_pct":     round(net_pnl * 100, 3),
+                    "exit_reason": exit_reason + ("+PARTIAL" if partial_done else ""),
                     "hold_bars":   i - entry_bar,
                     "mfe":         round(mfe * 100, 3),
                     "mae":         round(mae * 100, 3),
@@ -770,10 +812,13 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 # V5.1.4: this is the walk-forward learning step -- record
                 # this trade's real outcome into the bucket it was entered
                 # under, so any LATER bar matching the same bucket benefits.
+                # V3.1: 'won' is now NET-of-fees, so the learned buckets
+                # finally agree with live's definition of a win.
                 if bucket_key_at_entry:
                     bucket_stats.setdefault(bucket_key_at_entry, []).append(won)
                 in_pos       = False
                 partial_done = False
+                partial_net  = 0.0
                 mfe = mae    = 0.0
 
         else:
@@ -798,6 +843,7 @@ def simulate_pair(pair: str, df: pd.DataFrame,
                 entry_price     = price * (1 + SLIPPAGE_PCT)
                 peak_price      = entry_price
                 partial_done    = False
+                partial_net     = 0.0   # V3.1
                 mfe = mae       = 0.0
                 entry_bar       = i
                 entry_ts        = times[i]
@@ -815,18 +861,22 @@ def simulate_pair(pair: str, df: pd.DataFrame,
 
     # Close any open at end
     if in_pos and closes:
-        price      = closes[-1]
-        profit_pct = (price - entry_price) / entry_price
+        price       = closes[-1]
+        # V3.1: net + blended, same math as the in-loop exit
+        exit_px     = price * (1 - SLIPPAGE_PCT)
+        gross_final = (exit_px - entry_price) / entry_price
+        remain_frac = 0.5 if partial_done else 1.0
+        net_pnl     = remain_frac * (gross_final - ROUND_TRIP_FEE_PCT) + partial_net
         trades.append({
             "pair":        pair,
             "entry_price": round(entry_price, 6),
-            "exit_price":  round(price, 6),
-            "pnl_pct":     round(profit_pct * 100, 3),
-            "exit_reason": "TIMEOUT",
+            "exit_price":  round(exit_px, 6),
+            "pnl_pct":     round(net_pnl * 100, 3),
+            "exit_reason": "TIMEOUT" + ("+PARTIAL" if partial_done else ""),
             "hold_bars":   total_bars - entry_bar,
             "mfe":         round(mfe * 100, 3),
             "mae":         round(mae * 100, 3),
-            "won":         profit_pct > 0,
+            "won":         net_pnl > 0,
             "confidence":  conf_at_entry,
             "mode":        mode_at_entry,
             "strategy":    strategy_at_entry,
@@ -1025,12 +1075,13 @@ def main():
         # for why this replaced the old two-call train/validate structure.
         all_t = simulate_pair(pair, df, btc_df, fg_by_date)
 
+        # V3.1: partials are blended into their final trade record now --
+        # every row IS a complete round trip, so no PARTIAL_TP filtering.
         wins      = sum(1 for t in all_t if t["won"])
-        non_partial = [t for t in all_t if t["exit_reason"] != "PARTIAL_TP"]
         wr        = round(wins / max(len(all_t), 1) * 100, 1)
-        avg_pnl   = sum(t["pnl_pct"] for t in non_partial) / max(len(non_partial), 1)
+        avg_pnl   = sum(t["pnl_pct"] for t in all_t) / max(len(all_t), 1)
 
-        for t in non_partial:
+        for t in all_t:
             strategy_trades.setdefault(t.get("strategy", "MEAN_REVERSION"), []).append(t)
 
         log.info(f"  {pair}: {len(all_t)} trades | {wr}% WR | avg P&L: {avg_pnl:+.3f}%")
