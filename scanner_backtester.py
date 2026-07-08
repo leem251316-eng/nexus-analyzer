@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-scanner_backtester.py V1.1 — NEXUS Scanner Backtester
+scanner_backtester.py V1.2 — NEXUS Scanner Backtester
 =======================================================
 Pulls 2yr 1-min Alpaca IEX bars for Scanner's 44-symbol universe, replays
 through the EXACT Scanner V2.4 signal engine (scan_for_entry, manage_scanner_
 exits, bucket key), writes fingerprints to scanner_trade_fingerprints,
 triggers pattern analysis.
+
+V1.2 fix (Jul 8 2026): Slippage sign on exits. Both exit sites used
+`(1 - SLIP if winning else 1 + SLIP)` -- but a market sell crosses the
+spread against you whether the trade won or lost. Adding slippage to the
+exit price on losers made every losing trade look ~0.05% better than
+reality, biasing WR/EV stats and the seeded fingerprints optimistic on
+exactly the trades that hurt.
 
 V1.1 fix (Jun 30 2026): First real run (15,362 trades, full 2yr) failed the
 DB write almost entirely -- only 5/15,362 rows landed. Root cause: vol_ratio
@@ -276,7 +283,11 @@ def replay_scanner(all_bars: dict, validate_mode: bool = False,
                         exit_reason = "max-hold"
 
                 if exit_reason:
-                    exit_price = price * (1 - SLIPPAGE_PCT if profit_pct > 0 else 1 + SLIPPAGE_PCT)
+                    # V1.2: slippage sign fix -- a market SELL crosses the
+                    # spread AGAINST you regardless of PnL sign. The old
+                    # conditional ADDED slippage to the exit price on losers,
+                    # flattering every losing trade in the results.
+                    exit_price = price * (1 - SLIPPAGE_PCT)
                     final_pnl  = (exit_price - entry_price) / entry_price
                     mfe = (peak_price - entry_price) / entry_price
                     mae = (trough_price - entry_price) / entry_price
@@ -346,7 +357,7 @@ def replay_scanner(all_bars: dict, validate_mode: bool = False,
         # silently vanishing.
         if in_position:
             last_price = float(df["close"].iloc[-1])
-            exit_price = last_price * (1 - SLIPPAGE_PCT if last_price > entry_price else 1 + SLIPPAGE_PCT)
+            exit_price = last_price * (1 - SLIPPAGE_PCT)   # V1.2: sells always cross the spread against you
             final_pnl  = (exit_price - entry_price) / entry_price
             mfe = (peak_price - entry_price) / entry_price
             mae = (trough_price - entry_price) / entry_price
