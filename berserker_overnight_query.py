@@ -69,13 +69,15 @@ def line(label, s):
     if s is None:
         return f"  {label:10s} n=0"
     return (f"  {label:10s} n={s['n']:4d}  WR={s['wr']:3.0f}%  "
-            f"mean={s['mean'] * 100:+.2f}%  median={s['median'] * 100:+.2f}%  "
-            f"p10={s['p10'] * 100:+.2f}%  worst={s['worst'] * 100:+.2f}%")
+            f"mean={s['mean']:+.2f}%  median={s['median']:+.2f}%  "
+            f"p10={s['p10']:+.2f}%  worst={s['worst']:+.2f}%")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=None)
+    ap.add_argument("--live-since", default="2026-07-06 00:00",
+                    help="live-era cutoff, CDT — rows before this are backtest replay")
     args = ap.parse_args()
 
     db_url = os.environ.get("DATABASE_URL", "")
@@ -83,10 +85,19 @@ def main():
         print("DATABASE_URL not set. Run from a NEXUS service console.")
         sys.exit(1)
 
+    # V2 CONTAMINATION FIX: the backtester writes is_paper=FALSE rows with
+    # UNPREFIXED trade_ids — bt_ filtering alone admitted ~16.6k replay rows
+    # (first run, Jul 18). Two independent guards: (a) entry_ts must be in
+    # the live era; (b) exit_reason must use live vocabulary — 'trail' and
+    # 'timeout' are backtester-only strings (live writes 'trailing-stop').
+    live_cut = int(datetime.strptime(args.live_since, "%Y-%m-%d %H:%M")
+                   .replace(tzinfo=CENTRAL).timestamp())
     where = ["is_paper = FALSE", "trade_id NOT LIKE 'bt_%%'",
              "exit_ts IS NOT NULL", "entry_ts IS NOT NULL",
-             "pnl_pct IS NOT NULL"]
-    params = []
+             "pnl_pct IS NOT NULL",
+             "entry_ts >= %s",
+             "exit_reason NOT IN ('trail', 'timeout')"]
+    params = [live_cut]
     if args.days:
         import time as _t
         where.append("entry_ts >= %s")
@@ -101,6 +112,12 @@ def main():
             ORDER BY entry_ts
         """, params)
         rows = cur.fetchall()
+        cur.execute("""
+            SELECT COUNT(*) FROM berserker_trade_fingerprints
+            WHERE is_paper = FALSE AND exit_ts IS NOT NULL
+              AND (entry_ts < %s OR exit_reason IN ('trail', 'timeout'))
+        """, [live_cut])
+        excluded = cur.fetchone()[0]
     conn.close()
 
     intraday, overnight = [], []
@@ -114,6 +131,8 @@ def main():
     print("BERSERKER OVERNIGHT-HOLD QUERY")
     print(f"live fingerprints: {len(rows)}  |  intraday: {len(intraday)}  |  "
           f"overnight: {len(overnight)}")
+    print(f"excluded as backtest replay (pre-{args.live_since} or "
+          f"'trail'/'timeout' vocab): {excluded}")
     print("=" * 74)
 
     si = stats([r[3] for r in intraday])
@@ -131,7 +150,7 @@ def main():
             e = datetime.fromtimestamp(ent, tz=CENTRAL).strftime("%m-%d %H:%M")
             x = datetime.fromtimestamp(ext, tz=CENTRAL).strftime("%m-%d %H:%M")
             flag = "+" if pnl > 0 else "-"
-            print(f"  {flag} {sym:6s} {e} -> {x}  {pnl * 100:+.2f}%  [{reason}]")
+            print(f"  {flag} {sym:6s} {e} -> {x}  {pnl:+.2f}%  [{reason}]")
 
     print("\nVERDICT:")
     if so is None or so["n"] < 5:
