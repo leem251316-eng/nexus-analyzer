@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.4 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.5 -- NEXUS Phase4 Backtester
 =====================================================
+V1.5 fix (Jul 29 2026): ENTRY-SAMPLED FINGERPRINT FIELDS.
+  Six defects voided the B1-B3 temporal theses (all "INSUFFICIENT" on
+  empty cells). All were write-path bugs, not market answers:
+  - entry_ts/exit_ts written as int(time.time()) -- the Sunday cron's
+    wall-clock, not the trade's bar times. B1 (overnight vs intraday)
+    could never see an overnight hold. Now real epoch seconds from dt_utc.
+  - hour_entry at the signal-exit site was the EXIT bar's hour --
+    B2's hour buckets were contaminated, not just sparse. Now sampled
+    at entry (bot.entry_hour).
+  - spy_bullish, qqq_ob, vix sampled at exit; now at entry.
+  - spy_momentum hardcoded 0.0 in write_fingerprints -- B2's momentum
+    "flat"/"strong" split had nothing to read. Now real entry value.
+  - above_ma20 was never in the INSERT column list (only live phase4.py
+    wrote it -- hence n=22). Added, sampled from the ACTIVE symbol's
+    signal suite at entry (sym_ctx for bull, bear_ctx for bear).
+  - get_spy_context computed momentum but didn't return it; key added.
+  B1-B3 re-run for free after the first post-V1.5 Sunday suite.
 V1.4 fix (Jul 8 2026, evening): DATA TRUTH.
   - adjustment=ALL on all bar fetches. The entire Phase4 universe is
     leveraged ETFs that reverse-split constantly -- raw bars (alpaca-py's
@@ -487,6 +504,7 @@ def get_spy_context(spy_prices: list) -> dict:
         "overbought": rsi > 72,
         "rsi":        rsi,
         "above_ma20": spy_prices[-1] > ma20,
+        "momentum":   momentum,   # V1.5
     }
 
 def get_qqq_context(qqq_prices: list) -> dict:
@@ -620,6 +638,14 @@ class BotState:
         self.bear_ext_peak     = 0.0
         self.reversal_state    = {"state": "IDLE"}
         self.trades            = []   # completed trade dicts
+        # V1.5: entry-sampled fingerprint fields
+        self.entry_ts_ep       = 0
+        self.entry_hour        = 12
+        self.entry_spy_bull    = False
+        self.entry_spy_mom     = 0.0
+        self.entry_above_ma20  = False
+        self.entry_qqq_ob      = False
+        self.entry_vix         = 15.0
         # Diagnostic counters
         self.skip_bounce       = 0
         self.skip_tide         = 0
@@ -655,6 +681,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
     bots = {sym: BotState(sym, cfg) for sym, cfg in BOT_CONFIGS.items()}
 
     all_trades = []
+    last_dt_utc = None  # V1.5
     bar_num    = 0
     _diag_logged = False
 
@@ -671,6 +698,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
         dt_utc = ts if hasattr(ts, "tzinfo") and ts.tzinfo else ts.to_pydatetime().replace(tzinfo=timezone.utc)
         if not is_market_hours(dt_utc):
             continue
+        last_dt_utc = dt_utc  # V1.5: for end-of-data force-close exit_ts
 
         hour = get_hour_cdt(dt_utc)
 
@@ -823,10 +851,14 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                         "mfe":          round(bot.mfe * 100, 3),
                         "mae":          round(bot.mae * 100, 3),
                         "won":          final_pnl > 0,
-                        "hour_entry":   hour,
-                        "spy_bullish":  spy_ctx.get("bullish", False),
-                        "qqq_ob":       qqq_ctx.get("overbought", False),
-                        "vix":          round(vix_level, 1),
+                        "hour_entry":   bot.entry_hour,                    # V1.5: was exit hour
+                        "spy_bullish":  bot.entry_spy_bull,                # V1.5: was exit-sampled
+                        "spy_momentum": bot.entry_spy_mom,                 # V1.5
+                        "above_ma20":   bot.entry_above_ma20,              # V1.5
+                        "qqq_ob":       bot.entry_qqq_ob,                  # V1.5: was exit-sampled
+                        "vix":          round(bot.entry_vix, 1),           # V1.5: was exit-sampled
+                        "entry_ts_ep":  bot.entry_ts_ep,                   # V1.5
+                        "exit_ts_ep":   int(dt_utc.timestamp()),           # V1.5
                         "validate":     validate_mode,
                         "ts":           str(ts),
                         "trade_id":     secrets.token_hex(8),
@@ -877,6 +909,14 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                         bot.mae           = 0.0
                         bot.late_ratchet  = False
                         bot.bear_ext_trailing = False
+                        # V1.5: entry-sampled fingerprint fields
+                        bot.entry_ts_ep      = int(dt_utc.timestamp())
+                        bot.entry_hour       = hour
+                        bot.entry_spy_bull   = spy_ctx.get("bullish", False)
+                        bot.entry_spy_mom    = spy_ctx.get("momentum", 0.0)
+                        bot.entry_above_ma20 = sym_ctx.get("above_ma20", False)
+                        bot.entry_qqq_ob     = qqq_ctx.get("overbought", False)
+                        bot.entry_vix        = vix_level
                         continue
 
                 # Check bear reversal
@@ -932,6 +972,14 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                                         bot.bear_ext_peak     = entry_px
                                         bot.reversal_state    = {"state": "IDLE"}
                                         bot.mode = "SCALP"
+                                        # V1.5: entry-sampled fingerprint fields
+                                        bot.entry_ts_ep      = int(dt_utc.timestamp())
+                                        bot.entry_hour       = hour
+                                        bot.entry_spy_bull   = spy_ctx.get("bullish", False)
+                                        bot.entry_spy_mom    = spy_ctx.get("momentum", 0.0)
+                                        bot.entry_above_ma20 = bear_ctx.get("above_ma20", False)
+                                        bot.entry_qqq_ob     = qqq_ctx.get("overbought", False)
+                                        bot.entry_vix        = vix_level
 
         if not _diag_logged and bar_idx == 50000:
             _diag_logged = True
@@ -965,10 +1013,14 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                     "mfe":         round(bot.mfe * 100, 3),
                     "mae":         round(bot.mae * 100, 3),
                     "won":         profit_pct > 0,
-                    "hour_entry":  0,
-                    "spy_bullish": False,
-                    "qqq_ob":      False,
-                    "vix":         15.0,
+                    "hour_entry":  bot.entry_hour,                                              # V1.5
+                    "spy_bullish": bot.entry_spy_bull,                                          # V1.5
+                    "spy_momentum": bot.entry_spy_mom,                                          # V1.5
+                    "above_ma20":  bot.entry_above_ma20,                                        # V1.5
+                    "qqq_ob":      bot.entry_qqq_ob,                                            # V1.5
+                    "vix":         round(bot.entry_vix, 1),                                     # V1.5
+                    "entry_ts_ep": bot.entry_ts_ep,                                             # V1.5
+                    "exit_ts_ep":  int(last_dt_utc.timestamp()) if last_dt_utc else int(time.time()),  # V1.5
                     "validate":    validate_mode,
                     "ts":          "",
                     "trade_id":    secrets.token_hex(8),
@@ -1003,10 +1055,11 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
                         (trade_id, symbol, bear_pair, is_bear_trade, mode,
                          entry_ts, exit_ts, entry_price,
                          spy_bullish, spy_momentum, qqq_overbought,
+                         above_ma20,
                          hour_cdt, vix_at_entry,
                          entry_score, won, pnl_pct, exit_reason, hold_time_min,
                          mfe, mae)
-                        VALUES (%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s, %s,
+                        VALUES (%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s, %s,%s, %s,
                                 %s,%s,%s,%s, %s,%s)
                         ON CONFLICT (trade_id) DO UPDATE
                         SET won=EXCLUDED.won, pnl_pct=EXCLUDED.pnl_pct,
@@ -1017,10 +1070,13 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
                         BOT_CONFIGS.get(t["symbol"], {}).get("bear_pair", ""),
                         bool(t["is_bear"]),
                         t["mode"],
-                        int(time.time()), int(time.time()),
+                        t.get("entry_ts_ep") or int(time.time()),   # V1.5: real bar time
+                        t.get("exit_ts_ep")  or int(time.time()),   # V1.5: real bar time
                         t["entry_price"],
-                        bool(t["spy_bullish"]), 0.0,
+                        bool(t["spy_bullish"]),
+                        round(float(t.get("spy_momentum", 0.0)), 5),  # V1.5: was hardcoded 0.0
                         bool(t["qqq_ob"]),
+                        bool(t.get("above_ma20", False)),             # V1.5: was never written
                         t.get("hour_entry", 12),
                         t.get("vix", 15.0),
                         0,

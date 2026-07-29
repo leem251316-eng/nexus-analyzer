@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-nexus_analyzer_1min_railway.py V3.2 — NEXUS Berserker Backtester
+nexus_analyzer_1min_railway.py V3.3 — NEXUS Berserker Backtester
 =================================================================
+V3.3 fix (Jul 29 2026): REAL TRADE TIMESTAMPS.
+  - entry_ts / exit_ts were written as int(time.time()) — the wall-clock
+    moment the BACKTEST RAN, not the trade's bar times. Every bt_ row
+    carried the Sunday-cron runtime, so any thesis bucketing by entry_ts
+    (opening-window C1, weekday-carry C3, resolution-timing C5) saw n=0
+    across all 17K rows. Now: entry_ts_ep captured from the bar's dt_utc
+    at entry, exit_ts_ep at exit (incl. end-of-data force-close), both
+    written as epoch seconds. hour_cdt/day_of_week were already correct.
+
 Runs every Sunday 11pm UTC as Railway cron worker (genuine-reverence).
 Pulls 2yr 1-min Alpaca IEX bars, replays through the EXACT Berserker
 V10.19 signal engine, writes fingerprints to berserker_trade_fingerprints.
@@ -380,10 +389,12 @@ def replay_berserker(all_bars: dict,
     mae_track:    Dict[str, float] = {s: 0.0   for s in SYMBOLS}
     entry_hour:   Dict[str, int]   = {s: 12     for s in SYMBOLS}
     entry_day:    Dict[str, int]   = {s: 0      for s in SYMBOLS}
+    entry_ts_ep:  Dict[str, int]   = {s: 0      for s in SYMBOLS}  # V3.3
 
     trades:   List[Dict] = []
     bar_num   = 0
     vix_smooth = 15.0
+    last_dt_utc = None  # V3.3: for end-of-data force-close exit_ts
 
     for bar_idx, ts in enumerate(all_ts):
         bar_num += 1
@@ -393,6 +404,7 @@ def replay_berserker(all_bars: dict,
         in_train_window    = not validate_mode
 
         dt_utc = ts if (hasattr(ts, "tzinfo") and ts.tzinfo) else ts.to_pydatetime().replace(tzinfo=timezone.utc)
+        last_dt_utc = dt_utc  # V3.3
         # Market hours pre-filtered above -- no need to check again
         hour = get_hour_cdt(dt_utc)
         dow  = get_day_of_week(dt_utc)
@@ -507,6 +519,8 @@ def replay_berserker(all_bars: dict,
                         "validate":     validate_mode,
                         "tp_used":      sym_tp,
                         "sl_used":      sym_sl,
+                        "entry_ts_ep":  entry_ts_ep[sym],           # V3.3
+                        "exit_ts_ep":   int(dt_utc.timestamp()),    # V3.3
                     })
                     in_position[sym]  = False
                     entry_price[sym]  = 0.0
@@ -543,6 +557,7 @@ def replay_berserker(all_bars: dict,
                     mae_track[sym]    = 0.0
                     entry_hour[sym]   = hour
                     entry_day[sym]    = dow
+                    entry_ts_ep[sym]  = int(dt_utc.timestamp())  # V3.3
 
         if bar_num % 100000 == 0:
             total_so_far = len(trades)
@@ -576,6 +591,8 @@ def replay_berserker(all_bars: dict,
                 "validate":    validate_mode,
                 "tp_used":     BERSERKER_RECIPES.get(sym, {}).get("tp", TAKE_PROFIT_PCT),
                 "sl_used":     BERSERKER_RECIPES.get(sym, {}).get("sl", STOP_LOSS_PCT),
+                "entry_ts_ep": entry_ts_ep[sym],                                     # V3.3
+                "exit_ts_ep":  int(last_dt_utc.timestamp()) if last_dt_utc else int(time.time()),  # V3.3
             })
 
     return trades
@@ -615,7 +632,8 @@ def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
                         t["trade_id"],
                         t["symbol"],
                         t.get("sector", "TECH"),
-                        int(time.time()), int(time.time()),
+                        t.get("entry_ts_ep") or int(time.time()),   # V3.3: real bar time
+                        t.get("exit_ts_ep")  or int(time.time()),   # V3.3: real bar time
                         round(t.get("entry_price", 0.0), 4),
                         round(t.get("rsi_at_entry", 50.0), 2),
                         bool(t.get("spy_bullish", False)),

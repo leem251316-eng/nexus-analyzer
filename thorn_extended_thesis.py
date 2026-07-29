@@ -193,11 +193,15 @@ def main():
 
     # ---------- A6 ----------
     print("=" * 74); print("A6. BTC LEAD/LAG on alts (btc_ret_5m conditioning)")
+    # UNITS FIX (Jul 29): crypto.py stores btc_ret_5m as a FRACTION
+    # ((p[-1]-p[-2])/p[-2]), not percent. The ±0.15 thresholds below are
+    # in percent, so compare against btc5*100. Prior run: 42K rows, zero
+    # in either tail — verdict was INVALID, not a market answer.
     alts = [r for r in R if r["pair"] != "BTC-USDC" and r["btc5"] is not None and r["f4h"] is not None]
     if len(alts) >= 200:
-        up  = stats([r["f4h"] for r in alts if r["btc5"] > 0.15])
-        dn  = stats([r["f4h"] for r in alts if r["btc5"] < -0.15])
-        fl  = stats([r["f4h"] for r in alts if -0.15 <= r["btc5"] <= 0.15])
+        up  = stats([r["f4h"] for r in alts if r["btc5"] * 100 > 0.15])
+        dn  = stats([r["f4h"] for r in alts if r["btc5"] * 100 < -0.15])
+        fl  = stats([r["f4h"] for r in alts if -0.15 <= r["btc5"] * 100 <= 0.15])
         print(line("BTC +0.15%+ prior 5m", up)); print(line("BTC flat", fl)); print(line("BTC -0.15%- prior 5m", dn))
         ok = up and dn and (up["mean"] - dn["mean"]) >= 0.15
         print(f"  VERDICT A6: {'KEEP — BTC move conditions alt forwards (spread >= 0.15%)' if ok else 'KILL — no usable lead/lag at 4h'}")
