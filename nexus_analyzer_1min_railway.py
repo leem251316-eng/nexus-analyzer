@@ -789,13 +789,13 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS BERSERKER BACKTESTER V3.2")
+    log.info(f"NEXUS BERSERKER BACKTESTER V3.3")
     log.info(f"Symbols: {len(SYMBOLS)} | Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}%")
     log.info(f"V3.0: VIX gate | Earnings blackout | Regime | Walk-forward | Slippage")
     log.info("=" * 60)
 
     send_alert(
-        f"🔥 NEXUS BERSERKER BACKTESTER V3.2 STARTING\n"
+        f"🔥 NEXUS BERSERKER BACKTESTER V3.3 STARTING\n"
         f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
         f"V3.0: VIX gate | Earnings | Regime | Walk-forward | Slippage\n"
         f"Signal engine: V10.19 exact replica\n"
@@ -859,7 +859,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(val_trades)} trades)"
 
     send_alert(
-        f"✅ NEXUS BERSERKER BACKTESTER V3.2 COMPLETE\n"
+        f"✅ NEXUS BERSERKER BACKTESTER V3.3 COMPLETE\n"
         f"──────────────────\n"
         f"Training: {train_wr}% WR ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"

@@ -615,6 +615,10 @@ class BotState:
         # Diagnostic counters
         "skip_bounce", "skip_tide", "skip_vol",
         "skip_vix", "skip_avoid_hour", "score_checks",
+        # V1.5: entry-sampled fingerprint fields
+        "entry_ts_ep", "entry_hour", "entry_spy_bull",
+        "entry_spy_mom", "entry_above_ma20", "entry_qqq_ob",
+        "entry_vix",
     ]
     def __init__(self, symbol: str, cfg: dict):
         self.symbol        = symbol
@@ -1256,13 +1260,13 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"NEXUS PHASE4 BACKTESTER V1.4")
+    log.info(f"NEXUS PHASE4 BACKTESTER V1.5")
     log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
 
     send_alert(
-        f"⚡ PHASE4 BACKTESTER V1.2 STARTING\n"
+        f"⚡ PHASE4 BACKTESTER V1.5 STARTING\n"
         f"Bots: NUGT | SOXL | LABU | TQQQ\n"
         f"Bear pairs: DUST | SOXS | LABD | SQQQ\n"
         f"Period: {args.days} days | Slippage: {SLIPPAGE_PCT*100:.2f}%\n"
@@ -1323,7 +1327,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(validate_trades)} trades)"
 
     send_alert(
-        f"✅ PHASE4 BACKTESTER V1.2 COMPLETE\n"
+        f"✅ PHASE4 BACKTESTER V1.5 COMPLETE\n"
         f"──────────────────\n"
         f"Training WR: {train_wr}% ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"
