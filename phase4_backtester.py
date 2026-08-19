@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
 """
-phase4_backtester.py V1.5 -- NEXUS Phase4 Backtester
+phase4_backtester.py V1.6 -- NEXUS Phase4 Backtester
 =====================================================
+V1.6 (Aug 19 2026): SEVENTH WRITE-PATH DEFECT + MIN-SCORE SWEEP MODE.
+  - entry_score was a hardcoded literal 0 in write_fingerprints -- every
+    bt_ row ever written carried score 0 (confirmed live: MAX(entry_score)
+    over 1,699 BT rows = 0). The score computed at the entry site was
+    never carried onto the trade dict. Now: BotState.entry_score_val is
+    set at both bull and bear entry sites, flows through both trade-dict
+    sites (signal exit + end-of-data force close), and lands in the DB.
+  - NEW: --sweep SYMBOL [--scores 2,3,4,5] runs the full replay once per
+    bull min_score threshold for one bot only (bars fetched once, replayed
+    N times). Sweep mode NEVER writes fingerprints and NEVER runs pattern
+    analysis (forced dry-run) -- it exists to derive evidence for live
+    gate changes, not to seed PatternMemory. Report per threshold: bull
+    trades, WR, avg/median PnL, avg win/loss, train vs walk-forward OOS.
+    Context: live Phase4 fired ZERO algorithmic entries Jun 23 -> Aug 19;
+    NUGT/SOXL bull gates are mathematically unreachable, LABU needs a
+    perfect score, TQQQ idles at score 2-3 vs min 4. Sweep output feeds
+    the pre-registered V2.19 TQQQ-only re-arm decision.
+
 V1.5 fix (Jul 29 2026): ENTRY-SAMPLED FINGERPRINT FIELDS.
   Six defects voided the B1-B3 temporal theses (all "INSUFFICIENT" on
   empty cells). All were write-path bugs, not market answers:
@@ -619,6 +637,8 @@ class BotState:
         "entry_ts_ep", "entry_hour", "entry_spy_bull",
         "entry_spy_mom", "entry_above_ma20", "entry_qqq_ob",
         "entry_vix",
+        # V1.6: entry score carried to fingerprints (was hardcoded 0)
+        "entry_score_val",
     ]
     def __init__(self, symbol: str, cfg: dict):
         self.symbol        = symbol
@@ -650,6 +670,7 @@ class BotState:
         self.entry_above_ma20  = False
         self.entry_qqq_ob      = False
         self.entry_vix         = 15.0
+        self.entry_score_val   = 0     # V1.6
         # Diagnostic counters
         self.skip_bounce       = 0
         self.skip_tide         = 0
@@ -863,6 +884,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                         "vix":          round(bot.entry_vix, 1),           # V1.5: was exit-sampled
                         "entry_ts_ep":  bot.entry_ts_ep,                   # V1.5
                         "exit_ts_ep":   int(dt_utc.timestamp()),           # V1.5
+                        "entry_score":  bot.entry_score_val,               # V1.6
                         "validate":     validate_mode,
                         "ts":           str(ts),
                         "trade_id":     secrets.token_hex(8),
@@ -921,6 +943,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                         bot.entry_above_ma20 = sym_ctx.get("above_ma20", False)
                         bot.entry_qqq_ob     = qqq_ctx.get("overbought", False)
                         bot.entry_vix        = vix_level
+                        bot.entry_score_val  = score          # V1.6
                         continue
 
                 # Check bear reversal
@@ -984,6 +1007,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                                         bot.entry_above_ma20 = bear_ctx.get("above_ma20", False)
                                         bot.entry_qqq_ob     = qqq_ctx.get("overbought", False)
                                         bot.entry_vix        = vix_level
+                                        bot.entry_score_val  = bear_score  # V1.6
 
         if not _diag_logged and bar_idx == 50000:
             _diag_logged = True
@@ -1025,6 +1049,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
                     "vix":         round(bot.entry_vix, 1),                                     # V1.5
                     "entry_ts_ep": bot.entry_ts_ep,                                             # V1.5
                     "exit_ts_ep":  int(last_dt_utc.timestamp()) if last_dt_utc else int(time.time()),  # V1.5
+                    "entry_score": bot.entry_score_val,                                         # V1.6
                     "validate":    validate_mode,
                     "ts":          "",
                     "trade_id":    secrets.token_hex(8),
@@ -1083,7 +1108,7 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
                         bool(t.get("above_ma20", False)),             # V1.5: was never written
                         t.get("hour_entry", 12),
                         t.get("vix", 15.0),
-                        0,
+                        int(t.get("entry_score", 0)),   # V1.6: was hardcoded 0
                         bool(t["won"]),
                         round(t["pnl_pct"], 3),
                         t["exit_reason"],
@@ -1248,25 +1273,133 @@ def print_report(trades: list, days: int, validate_mode: bool = False):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def run_min_score_sweep(sweep_sym: str, scores: list, days: int):
+    """V1.6: replay one bot at multiple bull min_score thresholds.
+
+    Bars fetched ONCE, replayed once per threshold (train + walk-forward
+    OOS). NEVER writes fingerprints, NEVER runs pattern analysis -- this
+    mode produces evidence for a pre-registered live gate change, and
+    polluting PatternMemory with sweep rows would poison the very gates
+    under study. Bear-side trades are reported separately as a sanity
+    constant (bull min_score does not touch the bear path).
+    """
+    global ALL_SYMBOLS
+    if sweep_sym not in BOT_CONFIGS:
+        log.error(f"--sweep {sweep_sym}: not in BOT_CONFIGS {list(BOT_CONFIGS)}")
+        sys.exit(1)
+
+    # Restrict universe to the swept bot + its bear pair + underlying + context
+    cfg_keep    = BOT_CONFIGS[sweep_sym]
+    needed      = [sweep_sym, cfg_keep["bear_pair"], cfg_keep["underlying"], "QQQ", "SPY"]
+    ALL_SYMBOLS = list(dict.fromkeys(needed))          # dedupe, keep order
+    for k in [k for k in BOT_CONFIGS if k != sweep_sym]:
+        del BOT_CONFIGS[k]
+
+    log.info("=" * 60)
+    log.info(f"PHASE4 V1.6 MIN-SCORE SWEEP | {sweep_sym} | thresholds={scores} | {days}d")
+    log.info(f"Symbols fetched: {ALL_SYMBOLS} | fingerprint writes: DISABLED")
+    log.info("=" * 60)
+    send_alert(
+        f"🧪 PHASE4 SWEEP V1.6 STARTING\n"
+        f"Bot: {sweep_sym} | bull min_score ∈ {scores}\n"
+        f"Period: {days}d | DB writes: OFF\n"
+        f"Purpose: evidence for V2.19 re-arm gate"
+    )
+
+    t0       = time.time()
+    all_bars = fetch_all_bars(days)
+    if not all_bars:
+        log.error("No bar data fetched — check API keys")
+        sys.exit(1)
+
+    def _stats(trades):
+        bulls = [t for t in trades if not t["is_bear"]]
+        bears = [t for t in trades if t["is_bear"]]
+        if not bulls:
+            return {"n": 0, "wr": 0.0, "avg": 0.0, "med": 0.0,
+                    "avg_w": 0.0, "avg_l": 0.0, "bears": len(bears)}
+        pnls   = sorted(t["pnl_pct"] for t in bulls)
+        wins   = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        return {
+            "n":     len(bulls),
+            "wr":    round(100.0 * len(wins) / len(bulls), 1),
+            "avg":   round(sum(pnls) / len(pnls), 3),
+            "med":   round(pnls[len(pnls) // 2], 3),
+            "avg_w": round(sum(wins) / len(wins), 3) if wins else 0.0,
+            "avg_l": round(sum(losses) / len(losses), 3) if losses else 0.0,
+            "bears": len(bears),
+        }
+
+    results = []
+    for ms in scores:
+        BOT_CONFIGS[sweep_sym]["min_score"] = ms
+        log.info(f"--- min_score={ms}: training replay ---")
+        tr = replay_phase4(all_bars, validate_mode=False)
+        log.info(f"--- min_score={ms}: walk-forward replay ---")
+        va = replay_phase4(all_bars, validate_mode=True)
+        results.append((ms, _stats(tr), _stats(va)))
+        s_tr, s_va = results[-1][1], results[-1][2]
+        log.info(f"  min_score={ms} | TRAIN bull n={s_tr['n']} wr={s_tr['wr']}% "
+                 f"avg={s_tr['avg']}% med={s_tr['med']}% W/L={s_tr['avg_w']}/{s_tr['avg_l']} "
+                 f"| OOS n={s_va['n']} wr={s_va['wr']}% avg={s_va['avg']}% "
+                 f"| bears(train)={s_tr['bears']}")
+
+    # Compact table + T-Bone summary
+    log.info("=" * 60)
+    log.info(f"SWEEP RESULT | {sweep_sym} bull-only (bear path constant)")
+    log.info(f"{'ms':>3} | {'n':>5} {'WR%':>5} {'avg%':>7} {'med%':>7} | "
+             f"{'OOSn':>5} {'OOSwr':>5} {'OOSavg':>7}")
+    lines = []
+    for ms, s_tr, s_va in results:
+        log.info(f"{ms:>3} | {s_tr['n']:>5} {s_tr['wr']:>5} {s_tr['avg']:>7} {s_tr['med']:>7} | "
+                 f"{s_va['n']:>5} {s_va['wr']:>5} {s_va['avg']:>7}")
+        lines.append(f"ms={ms}: n={s_tr['n']} {s_tr['wr']}% avg={s_tr['avg']}% | "
+                     f"OOS n={s_va['n']} {s_va['wr']}% avg={s_va['avg']}%")
+    elapsed = round(time.time() - t0)
+    send_alert(
+        f"🧪 PHASE4 SWEEP V1.6 COMPLETE — {sweep_sym}\n"
+        f"──────────────────\n" + "\n".join(lines) + "\n"
+        f"──────────────────\n"
+        f"Bear trades constant: {results[0][1]['bears']} (train)\n"
+        f"No fingerprints written. Elapsed: {elapsed}s"
+    )
+    log.info(f"SWEEP DONE. {elapsed}s | no DB writes")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="NEXUS Phase4 Backtester V1.0")
+    parser = argparse.ArgumentParser(description="NEXUS Phase4 Backtester V1.6")
     parser.add_argument("--days",      type=int,  default=730, help="History days (default: 730 = 2yr)")
     parser.add_argument("--dry-run",   action="store_true")
     parser.add_argument("--no-validate", action="store_true", help="Skip walk-forward validation")
+    parser.add_argument("--sweep",     type=str,  default="",
+                        help="V1.6: bull min_score sweep for ONE bot (e.g. --sweep TQQQ). "
+                             "Forces dry-run; no fingerprints, no pattern analysis.")
+    parser.add_argument("--scores",    type=str,  default="2,3,4,5",
+                        help="V1.6: comma-separated min_score thresholds for --sweep")
     args = parser.parse_args()
 
     if not ALPACA_API_KEY or not ALPACA_SECRET:
         log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY")
         sys.exit(1)
 
+    if args.sweep:
+        try:
+            scores = sorted({int(x) for x in args.scores.split(",") if x.strip()})
+        except ValueError:
+            log.error(f"--scores must be comma-separated ints, got: {args.scores}")
+            sys.exit(1)
+        run_min_score_sweep(args.sweep.upper().strip(), scores, args.days)
+        return
+
     log.info("=" * 60)
-    log.info(f"NEXUS PHASE4 BACKTESTER V1.5")
+    log.info(f"NEXUS PHASE4 BACKTESTER V1.6")
     log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
 
     send_alert(
-        f"⚡ PHASE4 BACKTESTER V1.5 STARTING\n"
+        f"⚡ PHASE4 BACKTESTER V1.6 STARTING\n"
         f"Bots: NUGT | SOXL | LABU | TQQQ\n"
         f"Bear pairs: DUST | SOXS | LABD | SQQQ\n"
         f"Period: {args.days} days | Slippage: {SLIPPAGE_PCT*100:.2f}%\n"
@@ -1327,7 +1460,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(validate_trades)} trades)"
 
     send_alert(
-        f"✅ PHASE4 BACKTESTER V1.5 COMPLETE\n"
+        f"✅ PHASE4 BACKTESTER V1.6 COMPLETE\n"
         f"──────────────────\n"
         f"Training WR: {train_wr}% ({len(train_trades)} trades)\n"
         + "\n".join(sym_lines) + "\n"
