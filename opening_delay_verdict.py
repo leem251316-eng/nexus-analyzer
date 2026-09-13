@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-opening_delay_verdict.py V1.0 -- V10.61 OPENING-DELAY EXPERIMENT VERDICT
+opening_delay_verdict.py V1.1 -- V10.61 OPENING-DELAY EXPERIMENT VERDICT
 =========================================================================
 Pre-registered Jul 29 2026 (main.py V10.61 header). The 15-session gate
 window has elapsed. This script computes the two registered gates and
@@ -32,13 +32,30 @@ OPERATIONALIZATION (declared here, BEFORE running -- binds):
   Sample floors: >= 15 distinct sessions with shadow rows AND >= 30
   live post-9:00 trades; below either floor -> EXTEND (no verdict).
 
+V1.1 (Sep 13 2026, declared BEFORE any Gate B outcome is read):
+  * Dedup rule restated: key = (session, symbol); the FIRST tick's price is
+    the would-be entry; raw tick count is reported as liveness only, never
+    as n. Per-session distinct-symbol counts are printed so the ~7/session
+    liveness baseline is visible.
+  * EXCLUDED_SESSIONS = {Aug 28 2026}: V10.67 deployed inside the window
+    that day (2 symbols / 3 ticks). Session 1 = Aug 31. Labor Day Sep 7
+    contributes no session, so the 15th session is Mon Sep 21 -- run after
+    that close.
+  * SPCX sensitivity line (REPORT-ONLY, not part of the verdict): the
+    declared uniform 1.0% SL is the validation-FAVORING choice for SPCX
+    (live recipe SL 1.5%; a wider SL raises sim WR, which makes
+    "sim WR < 40.2%" HARDER to pass). The V1.0 rationale had the sign
+    backwards. The declared rule still binds; the sensitivity line shows
+    whether the verdict is fragile to it.
+  No gate logic changed.
+
 Run (nexus-analyst console): python3 opening_delay_verdict.py
 """
 
 import os
 import sys
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 import requests
@@ -68,6 +85,9 @@ SL_PCT           = 0.010     # live default sl (SPCX 1.5% -- declared: use 1.0%
                              # SPCX-specific handling would be post-hoc)
 MIN_SESSIONS     = 15
 MIN_LIVE_TRADES  = 30
+# V1.1: sessions excluded by declaration (deploy landed inside the window).
+EXCLUDED_SESSIONS = {date(2026, 8, 28)}
+SPCX_RECIPE_SL    = 0.015    # sensitivity only (see header)
 
 
 def send_alert(msg):
@@ -117,12 +137,14 @@ def fetch_minute_bars(symbol, start_ep, end_ep):
     return out
 
 
-def simulate_bracket(sig_ep, sig_px, bars):
+def simulate_bracket(sig_ep, sig_px, bars, sl_pct=None):
     """Walk forward from the signal through the live bracket.
     Returns (won, pnl_pct) or None if no usable bars.
-    Ambiguous bar (touches both) counts WIN -- declared anti-validation."""
+    Ambiguous bar (touches both) counts WIN -- declared anti-validation.
+    sl_pct: None = declared uniform SL_PCT (binding); a value = sensitivity."""
+    sl_pct = SL_PCT if sl_pct is None else sl_pct
     tp = sig_px * (1 + TP_PCT)
-    sl = sig_px * (1 - SL_PCT)
+    sl = sig_px * (1 - sl_pct)
     sig_day = datetime.fromtimestamp(sig_ep, CT).date()
     last_close = None
     for ep, o, h, l, c in bars:
@@ -140,7 +162,7 @@ def simulate_bracket(sig_ep, sig_px, bars):
         if hit_tp:
             return True, TP_PCT * 100
         if hit_sl:
-            return False, -SL_PCT * 100
+            return False, -sl_pct * 100
         last_close = c
     if last_close is None:
         return None
@@ -179,17 +201,24 @@ def main():
         WHERE reason = 'opening-delay' AND ts >= %s
         ORDER BY ts
     """, (EXPERIMENT_START,))
-    firsts, seen = [], set()
+    firsts, seen, excluded_rows, per_session = [], set(), 0, {}
     for ts, sym, px in sig_rows:
         day = datetime.fromtimestamp(int(ts), CT).date()
+        if day in EXCLUDED_SESSIONS:
+            excluded_rows += 1
+            continue
         key = (sym, day)
         if key in seen or not px or px <= 0:
             continue
         seen.add(key)
         firsts.append((int(ts), sym, float(px)))
+        per_session[day] = per_session.get(day, 0) + 1
     sessions = len({d for _, d in seen})
-    log.info(f"Shadow rows: {len(sig_rows)} raw -> {len(firsts)} first-per-symbol-"
-             f"per-session across {sessions} sessions")
+    log.info(f"Shadow rows: {len(sig_rows)} raw ticks (liveness only; "
+             f"{excluded_rows} on excluded sessions {sorted(EXCLUDED_SESSIONS)})")
+    log.info(f"n = {len(firsts)} distinct (session, symbol) across {sessions} sessions")
+    for d in sorted(per_session):
+        log.info(f"  {d}  distinct symbols: {per_session[d]}")
 
     if sessions < MIN_SESSIONS or n_live < MIN_LIVE_TRADES:
         log.info("=" * 60)
@@ -230,6 +259,23 @@ def main():
              f"avg={sim_avg}%/trade (registered deficit was 12.2% / -0.77%)")
     gate_b = sims >= 10 and sim_wr < GATE_A_FLOOR
 
+    # V1.1 sensitivity (REPORT-ONLY): SPCX at its live recipe SL 1.5%.
+    s_sims, s_wins, n_spcx = 0, 0, 0
+    for ts, sym, px in firsts:
+        res = simulate_bracket(ts, px, bars_cache.get(sym, []),
+                               SPCX_RECIPE_SL if sym == "SPCX" else None)
+        if res is None:
+            continue
+        s_sims += 1
+        s_wins += 1 if res[0] else 0
+        n_spcx += 1 if sym == "SPCX" else 0
+    s_wr = round(100.0 * s_wins / s_sims, 1) if s_sims else 0.0
+    log.info(f"SENSITIVITY (not binding): SPCX at 1.5% SL -> sim WR={s_wr}% "
+             f"(n={s_sims}, SPCX signals={n_spcx}); binding rule uses 1.0% uniform")
+    sens_flip = (s_wr < GATE_A_FLOOR) != (sim_wr < GATE_A_FLOOR)
+    if sens_flip:
+        log.info("  !! Gate B outcome FLIPS under the sensitivity -- verdict is fragile; say so")
+
     verdict = "KEEP" if (gate_a and gate_b) else "REVERT"
     log.info("=" * 60)
     log.info(f"GATE A (live post-9 WR >= {GATE_A_FLOOR}%): {'PASS' if gate_a else 'FAIL'} ({live_wr}%)")
@@ -243,7 +289,8 @@ def main():
         f"{'✅' if gate_a else '❌'}\n"
         f"Gate B: blocked-signal sim WR {sim_wr}% avg {sim_avg}% (n={sims}) "
         f"{'✅' if gate_b else '❌'}\n"
-        f"Sessions: {sessions}\n"
+        f"Sessions: {sessions} (Aug 28 excluded)\n"
+        f"Sensitivity SPCX@1.5%SL: sim WR {s_wr}%{' -- FLIPS GATE B' if sens_flip else ''}\n"
         f"──────────────────\n"
         f"VERDICT: {verdict}"
         + ("" if verdict == "KEEP" else "\nAction: revert V10.61 wall in next main.py version")
