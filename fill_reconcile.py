@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-fill_reconcile.py  V1.1  -- read-only, Gate-0 style  (Sep 13 2026)
+fill_reconcile.py  V1.2  -- read-only, Gate-0 style  (Sep 13 2026)
 =====================================================================
 Reconciles every LIVE Berserker trade closed in a date window against
 Alpaca IEX minute bars.  Writes NOTHING.  Runs in the nexus-analyst
 Railway console (has DATABASE_URL + Alpaca keys).
+
+V1.2: MFE cross-check flags only when the BOT's MFE exceeds IEX's (a
+peak IEX never printed = the NUE ghost-mark class). Bot MFE below IEX MFE
+is expected: 30s sampling, and the exit bar's high is included in the IEX
+window (SMCI Sep 11: TP filled +1.65, the same minute then printed +2.72).
 
 V1.1: TRADES now come from berserker_trade_fingerprints (is_paper=FALSE,
 no bt_, won IS NOT NULL, exit_ts in window) -- no more hand-typing the
@@ -50,7 +55,7 @@ TRADES_OVERRIDE = []
 
 REASON_MAP = {"take-profit": "tp", "stop-loss": "stop", "trailing-stop": "trail",
               "eod-autoclose": "eod", "manual-close": "manual"}
-MFE_TOL   = 0.30   # pct-points: bot MFE vs IEX MFE disagreement flag
+MFE_TOL   = 0.30   # pct-points: flag if bot MFE > IEX MFE by more (ghost peak)
 BAR_TOL   = 0.002  # 0.2% slack on bar containment (IEX lone prints)
 
 
@@ -174,7 +179,7 @@ def main():
         d_from, d_to = default_window()
 
     trades, still_open = load_trades(d_from, d_to)
-    print(f"FILL RECONCILE V1.1  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
+    print(f"FILL RECONCILE V1.2  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
           f"from berserker_trade_fingerprints  |  IEX minute bars, +-2 min")
     if not trades:
         print("No closed live trades in window. Check the window, or the fingerprint writer.")
@@ -231,8 +236,8 @@ def main():
             flags.append((sym, e_s, f"bot entry {entry:.2f} outside entry bar {eb[3]:.2f}-{eb[2]:.2f}"))
         if not in_xbar:
             flags.append((sym, e_s, f"implied exit {impl:.2f} outside exit bar {xb[3]:.2f}-{xb[2]:.2f}"))
-        if t["bot_mfe"] is not None and abs(d_mfe) > MFE_TOL:
-            flags.append((sym, e_s, f"bot MFE {t['bot_mfe']:+.2f} vs IEX MFE {mfe:+.2f} (diff {d_mfe:+.2f})"))
+        if t["bot_mfe"] is not None and d_mfe > MFE_TOL:
+            flags.append((sym, e_s, f"bot MFE {t['bot_mfe']:+.2f} ABOVE IEX MFE {mfe:+.2f} (ghost peak? diff {d_mfe:+.2f})"))
         if t["type"] == "trail" and mfe >= 1.0:
             flags.append((sym, e_s, f"trail exit {t['pnl']:+.2f} after MFE {mfe:+.2f} -- {giveback:.2f}% given back"))
         if t["type"] in ("stop", "trail") and mfe >= 1.5:
@@ -266,6 +271,8 @@ def main():
     for f in flags or [("-", "-", "none")]:
         print("  ", *f)
     print("\nCheck: trade count above vs T-Bone daily reports for the same days.")
+    print("Note: /buy manual positions are NOT in this table (manual_buy_equity never calls "
+          "record_entry, main.py V10.67) -- their P&L only appears in T-Bone and the equity delta.")
 
 
 if __name__ == "__main__":

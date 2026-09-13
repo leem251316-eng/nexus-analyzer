@@ -71,9 +71,12 @@ exit_reason. Bars: Alpaca IEX 1-min, adjustment=all, from entry_ts to the
 realized exit or EOD 14:58 CT, whichever the candidate reaches first.
 
   TRAIN   = live trades entered Aug 17–28 (unseen at minute level)
-  EXCLUDED= Aug 31–Sep 4 (inspected post-hoc in fill_reconcile V1.0) —
+  EXCLUDED= Aug 31–Sep 4 (inspected post-hoc in fill_reconcile V1.0) and
+            Sep 8–11 (inspected at the trail-exit level in fill_reconcile
+            V1.1 on Sep 13, before this registration bound) — both
             reported for completeness, never in the verdict
-  OOS     = live trades entered Sep 8–18
+  OOS     = live trades entered Sep 14–25 (two weeks, to reach the armed
+            floor; nothing from it has been seen at minute level)
 
 Floors: n >= 30 armed trades pooled (peak >= A at some point), OOS >= 12
 armed. Below either -> EXTEND, no verdict.
@@ -117,16 +120,27 @@ KEEP.
 
 ## 7. Path to dollars
 
-KEEP -> SHADOW logger (V10.68 batch): for every live trade, log what the
+SHADOW logger may deploy in the V10.68 batch (Sep 21) IN PARALLEL with the
+sim, because it is a pure observer: for every live trade it logs what the
 primary config WOULD have done (armed? exit reason, exit price, pnl) into
 berserker_trail_shadow with verified writes + heartbeat + one alert/day on
-failure. n = distinct trades. 15 sessions. Shadow verdict: shadow delta
-sign agrees with sim delta sign, else REVERT to research.
+failure. It touches no entry, exit, or sizing path, so it does not count
+as a WR-touching experiment. n = distinct trades. 15 sessions.
+Gate to dollars: sim verdict KEEP (§6) AND shadow delta sign agrees with
+sim delta sign. Either fails -> stays research.
 Only then a live constant+semantics change, with a 15-trade kill switch
 (rolling expectancy of armed trades <= control's -> revert).
 
+Sep 8–11 trails, for the record (PARK-grade, consistent-with, not
+evidence): 4 trails, 3 peaked +1.35..+1.47 then gave back 1.35–1.96.
+Under the primary config those three would have armed; the fourth (MSTR,
+peak +0.88) would not. The cost side (TPs that would have trailed out
+early) is unobservable from that output — which is why the sim exists.
+
 ## 8. What this touches
 
-Nothing until Sep 21. Then: one research script (trail_prereg_sim.py,
-nexus-analyzer), then a shadow observer in main.py. The live exit path
-changes only after the shadow verdict.
+Nothing until Sep 21. Then: trail_prereg_sim.py (nexus-analyzer, read-
+only) and the shadow observer in main.py V10.68 (with: holiday calendar,
+/cancel, /buy duplicate guard, manual buys calling record_entry, and
+persisting dynamic_tp on the fingerprint row). The live exit path changes
+only after both verdicts agree.
