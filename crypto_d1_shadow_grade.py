@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-crypto_d1_shadow_grade.py V1.0 — READ-ONLY Phase 2 D1 shadow grader.
+crypto_d1_shadow_grade.py V1.1 — READ-ONLY Phase 2 D1 shadow grader.
+
+V1.1 (Sep 24 2026): the live writer stores the shadow limit in
+limit_price. CRYPTO_P2_SHADOW_PREREG.md names that field `limit`
+(`limit` is reserved SQL). The required-column check and the SELECT
+read limit_price. The prereg name `limit` is accepted only when
+limit_price is absent. No other column is renamed, and the limit is
+still not recomputed from spread_bps.
 
 Implements CRYPTO_P2_SHADOW_PREREG.md (Aug 13 2026) as closely as the
 schema allows. Verdicts bind when the clock says they bind. This script
@@ -8,16 +15,22 @@ does not start Phase 3, does not write shadow rows, and does not change
 the lock.
 
 WHAT IT READS
-  crypto_shadow_signals — columns named in the prereg:
-      ts, pair, price, limit, spread_bps, funding, t48, rel_strength
+  crypto_shadow_signals — live writer columns (Matthew, Sep 24 2026):
+      id, ts, pair, price, limit_price, spread_bps, funding, t48, rel_strength
+  Required for a grade: ts, pair, price, limit_price, spread_bps, funding,
+  t48, rel_strength. `id` may be present and is not selected.
+  The prereg's parenthetical list says `limit`. That is the same field.
+  Production named it limit_price. If limit_price is absent and a column
+  named limit exists, that prereg alias is read instead. Nothing else
+  is aliased.
   crypto_thorn_observations — the Thorn tape used by crypto_p1_thesis.py
       and thorn_extended_thesis.py. Required columns: ts, pair, price.
   If either table or any required column is missing, the script exits
   with a SCHEMA FAIL naming the table, the missing names, and the
-  columns that are actually present. It does not guess alternate names
-  and it does not recompute a limit to fill a hole.
-  NULL ts, pair, price, or limit on any row is a DATA FAIL (exit 2).
-  A stored limit is never rebuilt from spread_bps.
+  columns that are actually present. It does not invent a third name
+  for the limit and it does not recompute a limit to fill a hole.
+  NULL ts, pair, price, or limit_price on any row is a DATA FAIL (exit 2).
+  A stored limit_price is never rebuilt from spread_bps.
 
 FILL AND 48h (prereg maker-fill simulation)
   FILLED if some Thorn print for that pair has price <= stored limit
@@ -98,7 +111,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0"
+VERSION = "1.1"
 CENTRAL = ZoneInfo("America/Chicago")
 # Prereg written Aug 13 2026, before any live shadow rows existed.
 ANCHOR = datetime(2026, 8, 13, 0, 0, tzinfo=CENTRAL)
@@ -117,10 +130,38 @@ CLUSTER_DAYS = 3
 
 SHADOW_TABLE = "crypto_shadow_signals"
 THORN_TABLE = "crypto_thorn_observations"
-SHADOW_COLS = (
-    "ts", "pair", "price", "limit", "spread_bps", "funding", "t48", "rel_strength",
+# Everything except the limit. The limit column is resolved separately.
+SHADOW_REQUIRED = (
+    "ts", "pair", "price", "spread_bps", "funding", "t48", "rel_strength",
 )
+# Live writer column first. The prereg names this field `limit`; accept
+# that spelling only when limit_price is not on the table.
+LIMIT_PRICE_COLUMNS = ("limit_price", "limit")
 THORN_COLS = ("ts", "pair", "price")
+
+
+def shadow_select_columns(present):
+    """Map live crypto_shadow_signals columns to the SELECT list.
+
+    `present` is the column names on the table (extras such as id are
+    ignored). Returns (columns, missing). `columns` is None when the
+    table cannot be graded. The limit slot is limit_price when that
+    column exists, otherwise the prereg name `limit`.
+    """
+    have = {}
+    for name in present:
+        have[str(name).lower()] = str(name)
+    missing = [c for c in SHADOW_REQUIRED if c not in have]
+    limit_key = next((c for c in LIMIT_PRICE_COLUMNS if c in have), None)
+    if limit_key is None:
+        missing.append("limit_price")
+    if missing:
+        return None, missing
+    columns = [
+        have["ts"], have["pair"], have["price"], have[limit_key],
+        have["spread_bps"], have["funding"], have["t48"], have["rel_strength"],
+    ]
+    return columns, []
 
 
 def weeks_since(now, anchor=ANCHOR):
@@ -531,8 +572,8 @@ def _connect():
     return conn
 
 
-def _locate(conn, table, required):
-    """Return (schema, {column: data_type}) or exit 2 with a clear schema fail."""
+def _table_columns(conn, table):
+    """Return (schema, {column: data_type}) or exit 2 if the table is missing."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -546,13 +587,12 @@ def _locate(conn, table, required):
         rows = cur.fetchall()
     if not rows:
         print(f"SCHEMA FAIL: table {table} not found in any schema.")
-        print(f"Required columns: {', '.join(required)}")
         if table == SHADOW_TABLE:
             print(
-                "Check CRYPTO_P2_SHADOW_PREREG.md instrumentation: crypto.py V5.24 "
-                "is supposed to write crypto_shadow_signals "
-                "(ts, pair, price, limit, spread_bps, funding, t48, rel_strength). "
-                "This grader does not create the table and does not invent columns."
+                "Check the V5.24 shadow writer. Live crypto_shadow_signals "
+                "columns are ts, pair, price, limit_price, spread_bps, funding, "
+                "t48, rel_strength (id optional). The prereg calls limit_price "
+                "`limit`. This grader does not create the table."
             )
         else:
             print(
@@ -576,15 +616,17 @@ def _locate(conn, table, required):
         )
         print("Refusing to guess which one the writer uses.")
         sys.exit(2)
-    cols = by_schema[schema]
+    return schema, by_schema[schema]
+
+
+def _require_columns(schema, table, cols, required):
     missing = [c for c in required if c not in cols]
     if missing:
         print(f"SCHEMA FAIL: {schema}.{table} is missing columns: {', '.join(missing)}")
         print("Present columns: " + ", ".join(cols))
         print(f"Required: {', '.join(required)}")
-        print("Refusing to invent stand-ins or rename columns. Check the writer.")
+        print("Refusing to invent stand-ins. Check the writer.")
         sys.exit(2)
-    return schema, cols
 
 
 def _fail_bad_ts(which, value):
@@ -596,11 +638,30 @@ def _fail_bad_ts(which, value):
 def load_and_grade(conn, now):
     from psycopg2 import sql
 
-    shadow_schema, _shadow_types = _locate(conn, SHADOW_TABLE, SHADOW_COLS)
-    thorn_schema, _thorn_types = _locate(conn, THORN_TABLE, THORN_COLS)
+    shadow_schema, shadow_cols = _table_columns(conn, SHADOW_TABLE)
+    thorn_schema, thorn_cols = _table_columns(conn, THORN_TABLE)
+    _require_columns(thorn_schema, THORN_TABLE, thorn_cols, THORN_COLS)
+    select_cols, missing = shadow_select_columns(shadow_cols)
+    if select_cols is None:
+        print(
+            f"SCHEMA FAIL: {shadow_schema}.{SHADOW_TABLE} is missing columns: "
+            + ", ".join(missing)
+        )
+        print("Present columns: " + ", ".join(shadow_cols))
+        print(
+            "Required: " + ", ".join(SHADOW_REQUIRED)
+            + ", limit_price (prereg name `limit` is accepted only if "
+            "limit_price is absent)"
+        )
+        print(
+            "The live writer column is limit_price. This grader does not "
+            "rename the table and does not invent any other alias."
+        )
+        sys.exit(2)
+    limit_col = select_cols[3]
 
     shadow_sql = sql.SQL("SELECT {cols} FROM {tbl} ORDER BY {ts}").format(
-        cols=sql.SQL(", ").join(sql.Identifier(c) for c in SHADOW_COLS),
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in select_cols),
         tbl=sql.Identifier(shadow_schema, SHADOW_TABLE),
         ts=sql.Identifier("ts"),
     )
@@ -661,13 +722,13 @@ def load_and_grade(conn, now):
     if null_price:
         bad.append(f"price NULL on {null_price} rows")
     if null_limit:
-        bad.append(f"limit NULL on {null_limit} rows")
+        bad.append(f"{limit_col} NULL on {null_limit} rows")
     if bad:
         print("DATA FAIL: crypto_shadow_signals has rows that cannot be graded:")
         for b in bad:
             print(f"  - {b}")
         print(
-            "Fill uses the stored limit (prereg). Limits are not recomputed from "
+            f"Fill uses stored {limit_col}. It is not recomputed from "
             "spread_bps. Check the V5.24 shadow writer."
         )
         sys.exit(2)
@@ -676,14 +737,14 @@ def load_and_grade(conn, now):
         formula_deltas.sort()
         med = formula_deltas[len(formula_deltas) // 2]
         limit_note = (
-            f"Stored limit vs prereg formula price*(1-spread_bps/2/10000): "
+            f"Stored {limit_col} vs prereg formula price*(1-spread_bps/2/10000): "
             f"median abs diff {med:.6g} on n={len(formula_deltas)} "
-            "(rows with both price and spread_bps). Grading uses the stored limit."
+            f"(rows with both price and spread_bps). Grading uses stored {limit_col}."
         )
     else:
         limit_note = (
-            "Stored-limit vs formula check skipped: no row has both price and spread_bps. "
-            "Grading uses the stored limit."
+            f"Stored-{limit_col} vs formula check skipped: no row has both price and spread_bps. "
+            f"Grading uses stored {limit_col}."
         )
 
     rels = [s["rel_strength"] for s in signals if s["rel_strength"] is not None]
@@ -775,6 +836,34 @@ def _d3_note(signals, tape, base_note):
 
 
 def _self_test():
+    # Live columns Matthew printed from public.crypto_shadow_signals.
+    # The prereg says `limit`; the writer stored limit_price. id is extra.
+    live = [
+        "id", "ts", "pair", "price", "limit_price", "spread_bps",
+        "funding", "t48", "rel_strength",
+    ]
+    cols, missing = shadow_select_columns(live)
+    assert cols == [
+        "ts", "pair", "price", "limit_price", "spread_bps",
+        "funding", "t48", "rel_strength",
+    ], cols
+    assert missing == []
+    # Prereg spelling still readable when that is the only limit column.
+    cols_alias, missing_alias = shadow_select_columns([
+        "ts", "pair", "price", "limit", "spread_bps", "funding", "t48", "rel_strength",
+    ])
+    assert cols_alias[3] == "limit" and missing_alias == []
+    # Writer name wins when both are present.
+    cols_both, _ = shadow_select_columns(live + ["limit"])
+    assert cols_both[3] == "limit_price"
+    # The V1.0 required list (column named limit, no limit_price) is not
+    # what production has. Production's list must pass; a table with
+    # neither spelling must fail asking for limit_price.
+    cols_neither, missing_neither = shadow_select_columns([
+        "id", "ts", "pair", "price", "spread_bps", "funding", "t48", "rel_strength",
+    ])
+    assert cols_neither is None and missing_neither == ["limit_price"]
+
     # Fee-free verdict matrix. now is injected; anchor is Aug 13 2026.
     early = datetime(2026, 8, 20, tzinfo=CENTRAL)          # ~1 week
     mid = datetime(2026, 9, 10, tzinfo=CENTRAL)            # ~4 weeks
