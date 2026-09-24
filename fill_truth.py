@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-fill_truth.py  V1.0  -- read-only  (Sep 24 2026)
+fill_truth.py  V1.1  -- read-only  (Sep 24 2026)
 =====================================================================
 Rebuilds every live Berserker round trip from Alpaca's own FILL activity
 feed and diffs it against berserker_trade_fingerprints. Writes NOTHING.
 Runs in the nexus-analyst console (Alpaca keys + DATABASE_URL).
+
+V1.1: a SELL with no BUY inside the window (position carried in from
+before --since) is skipped instead of closing a trip with no entry.
 
 Why: the sell-fill poll had a 3s ceiling until V10.68; on timeout the
 QUOTE estimate was recorded as fill_pnl. PLTR Sep 15: recorded +0.16,
@@ -113,12 +116,16 @@ def round_trips(fills):
             st["qty"]  += f["qty"]
             st["cost"] += f["qty"] * f["px"]
         else:
+            if st["qty"] < 1e-6 or st["t0"] is None:
+                # sell against a position bought before the window: not a trip
+                state[f["sym"]] = {"qty": 0.0, "cost": 0.0, "proceeds": 0.0,
+                                   "sold": 0.0, "t0": None, "t1": None}
+                continue
             st["qty"]      -= f["qty"]
             st["sold"]     += f["qty"]
             st["proceeds"] += f["qty"] * f["px"]
             st["t1"] = f["ts"]
-            if st["qty"] < 1e-4 and st["sold"] > 0:
-                bought = st["cost"] / max(st["sold"] + st["qty"], 1e-9)
+            if st["qty"] < 1e-4 and st["sold"] > 0 and st["cost"] > 0:
                 entry  = st["cost"] / (st["sold"] + max(st["qty"], 0.0))
                 exit_  = st["proceeds"] / st["sold"]
                 trips.append({"sym": f["sym"], "t0": st["t0"], "t1": st["t1"],
@@ -155,7 +162,7 @@ def main():
     fills, which = fetch_fills(since)
     trips, open_syms = round_trips(fills)
     fps = load_fps(since)
-    print(f"FILL TRUTH V1.0 | since {since} | key {which} | fills {len(fills)} | "
+    print(f"FILL TRUTH V1.1 | since {since} | key {which} | fills {len(fills)} | "
           f"broker round trips {len(trips)} | fingerprints {len(fps)} | still open at broker: {open_syms or '-'}")
     if not fills:
         print("No fills returned. Either no activity or this key is not the Berserker account.")
@@ -166,7 +173,7 @@ def main():
     for fp in fps:
         best, bd = None, None
         for i, tr in enumerate(trips):
-            if i in used or tr["sym"] != fp["sym"]:
+            if i in used or tr["sym"] != fp["sym"] or tr["t0"] is None:
                 continue
             d = abs((tr["t0"] - fp["t0"]).total_seconds())
             if d <= MATCH_S and (bd is None or d < bd):
