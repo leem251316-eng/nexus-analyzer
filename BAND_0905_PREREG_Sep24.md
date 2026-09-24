@@ -1,7 +1,8 @@
 # PRE-REGISTRATION — Second opening wall, 09:05–09:30 CT (Sep 24 2026)
 
-Status: DRAFT until committed to nexus-analyzer. Deploys as the ONE
-WR-touching experiment in V10.68 (Gate B closed Sep 24, slot open).
+Status: LIVE / COMMITTED in nexus-analyzer. Deployed Thu Sep 24 evening
+2026 as V10.68, the ONE WR-touching experiment (Gate B closed Sep 24,
+slot open).
 Template: the V10.61 opening-delay wall — shadow-logged blocked signals,
 Gate A / Gate B, verdict script. That template just produced a clean KEEP;
 this reuses it with expectancy gates instead of WR gates.
@@ -39,8 +40,9 @@ exits untouched, sizing untouched.
 
 ## Verdict (band_verdict.py — a parameterized copy of opening_delay_verdict.py)
 n = distinct (session, symbol), FIRST tick's price per key; raw ticks are
-liveness only. Sessions = distinct dates with >= 1 blocked signal; the
-deploy day is excluded by declaration if the deploy lands inside RTH.
+liveness only. Sessions = distinct dates with >= 1 blocked signal. The
+deploy day Thu Sep 24 is excluded by declaration (V10.68 landed near the
+close). Session 1 = Fri Sep 25.
 Floors: 15 sessions AND >= 30 distinct blocked signals.
   Gate A (the block did not hurt what still trades):
     live expectancy of entries outside 09:05–09:30 since deploy
@@ -60,8 +62,9 @@ live fills run worse. That flatters the blocked band, which makes Gate B
 HARDER to pass — anti-validation, as intended.
 
 ## Verdict date
-15 sessions after deploy. If V10.68 deploys Mon Sep 28: session 1 = Sep 29,
-verdict after the close of Mon Oct 19 (no holidays in the window).
+15 sessions after deploy. V10.68 went live Thu Sep 24 evening 2026.
+Session 1 = Fri Sep 25. Verdict after the close of Thu Oct 15 (the 15th
+session). No NYSE holidays fall in that window.
 
 ## What is NOT claimed
 - Nothing about 14:30–14:58. The census killed the late-entry-cutoff hunch:
