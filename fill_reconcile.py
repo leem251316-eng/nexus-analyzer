@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-fill_reconcile.py  V1.2  -- read-only, Gate-0 style  (Sep 13 2026)
+fill_reconcile.py  V1.3  -- read-only, Gate-0 style  (Sep 20 2026)
 =====================================================================
 Reconciles every LIVE Berserker trade closed in a date window against
 Alpaca IEX minute bars.  Writes NOTHING.  Runs in the nexus-analyst
 Railway console (has DATABASE_URL + Alpaca keys).
+
+V1.3: SLIP line in the WEEK summary = the exit-slip registration's metric
+(EXIT_SLIP_PREREG_Sep20.md). Per exit: modeled level pnl minus realized pnl.
+  stop  -> level = -sl (recipe)            trail -> level = (1+botMFE)(1-0.015)-1
+  tp    -> level = +tp (1.5 unless DynTP: realized>=1.85 -> skipped)
+  eod/manual -> no level, contributes 0.  Positive SLIP = money left at the level.
+Reported as sum and per-trade over ALL trades in the window.
 
 V1.2: MFE cross-check flags only when the BOT's MFE exceeds IEX's (a
 peak IEX never printed = the NUE ghost-mark class). Bot MFE below IEX MFE
@@ -179,7 +186,7 @@ def main():
         d_from, d_to = default_window()
 
     trades, still_open = load_trades(d_from, d_to)
-    print(f"FILL RECONCILE V1.2  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
+    print(f"FILL RECONCILE V1.3  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
           f"from berserker_trade_fingerprints  |  IEX minute bars, +-2 min")
     if not trades:
         print("No closed live trades in window. Check the window, or the fingerprint writer.")
@@ -254,6 +261,20 @@ def main():
     print(f"\nWEEK: n={n}  {len(wins)}W/{len(loss)}L  WR={100*len(wins)/n:.1f}%  "
           f"avgW={avg_w:+.2f}  avgL={avg_l:+.2f}  expectancy={expct:+.3f}%/trade  "
           f"breakeven WR={be_wr:.1f}%")
+    slip_by, SL_MAP = {}, {"SPCX": 1.5}
+    for t in trades:
+        lvl = None
+        if t["type"] == "stop":
+            lvl = -SL_MAP.get(t["sym"], 1.0)
+        elif t["type"] == "trail" and t["bot_mfe"] is not None:
+            lvl = ((1 + t["bot_mfe"] / 100) * (1 - 0.015) - 1) * 100
+        elif t["type"] == "tp" and t["pnl"] < 1.85:
+            lvl = 1.5
+        if lvl is not None:
+            slip_by.setdefault(t["type"], []).append(lvl - t["pnl"])
+    slip_total = sum(sum(v) for v in slip_by.values())
+    print(f"SLIP: {slip_total:+.2f}% sum = {slip_total / n:+.3f}%/trade over n={n}  "
+          + "  ".join(f"{k}:{sum(v):+.2f}/{len(v)}" for k, v in sorted(slip_by.items())))
     print("by exit type:")
     for typ in ("tp", "stop", "trail", "eod", "manual"):
         grp = [t for t in trades if t["type"] == typ]
