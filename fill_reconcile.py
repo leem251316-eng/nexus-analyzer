@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-fill_reconcile.py  V1.3  -- read-only, Gate-0 style  (Sep 20 2026)
+fill_reconcile.py  V1.4  -- read-only, Gate-0 style  (Sep 24 2026)
 =====================================================================
 Reconciles every LIVE Berserker trade closed in a date window against
 Alpaca IEX minute bars.  Writes NOTHING.  Runs in the nexus-analyst
 Railway console (has DATABASE_URL + Alpaca keys).
+
+V1.4: reads COALESCE(pnl_pct_broker, pnl_pct) when the broker column exists
+(written by fill_truth_write.py) -- broker fills are the P&L record now;
+falls back to pnl_pct on a DB without the column. Also prints which it used.
 
 V1.3: SLIP line in the WEEK summary = the exit-slip registration's metric
 (EXIT_SLIP_PREREG_Sep20.md). Per exit: modeled level pnl minus realized pnl.
@@ -134,11 +138,19 @@ def nearest(bars, dt, tol_min=2):
     return best
 
 
+def pnl_expr():
+    """V1.4: broker truth when present."""
+    cols = q("SELECT column_name FROM information_schema.columns "
+             "WHERE table_name='berserker_trade_fingerprints' AND column_name='pnl_pct_broker'")
+    return ("COALESCE(pnl_pct_broker, pnl_pct)", "broker") if cols else ("pnl_pct", "recorded")
+
+
 def load_trades(d_from, d_to):
     start = int(datetime.combine(d_from, datetime.min.time(), CT).timestamp())
     end   = int(datetime.combine(d_to + timedelta(days=1), datetime.min.time(), CT).timestamp())
-    rows = q("""
-        SELECT trade_id, symbol, entry_ts, exit_ts, entry_price, pnl_pct,
+    _pe, _src = pnl_expr()
+    rows = q(f"""
+        SELECT trade_id, symbol, entry_ts, exit_ts, entry_price, {_pe},
                exit_reason, mfe, mae
         FROM berserker_trade_fingerprints
         WHERE is_paper = FALSE AND trade_id NOT LIKE 'bt_%%'
@@ -170,7 +182,7 @@ def load_trades(d_from, d_to):
           AND won IS NULL AND entry_ts >= %s AND entry_ts < %s
         ORDER BY entry_ts
     """, (start, end))
-    return trades, still_open
+    return trades, still_open, _src
 
 
 def main():
@@ -185,9 +197,9 @@ def main():
     else:
         d_from, d_to = default_window()
 
-    trades, still_open = load_trades(d_from, d_to)
-    print(f"FILL RECONCILE V1.3  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
-          f"from berserker_trade_fingerprints  |  IEX minute bars, +-2 min")
+    trades, still_open, pnl_src = load_trades(d_from, d_to)
+    print(f"FILL RECONCILE V1.4  window {d_from}..{d_to} CT  |  {len(trades)} closed live trades "
+          f"from berserker_trade_fingerprints  |  P&L: {pnl_src}  |  IEX minute bars, +-2 min")
     if not trades:
         print("No closed live trades in window. Check the window, or the fingerprint writer.")
         return
