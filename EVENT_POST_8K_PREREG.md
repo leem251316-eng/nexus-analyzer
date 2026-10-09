@@ -1,10 +1,10 @@
 # PRE-REGISTRATION — Post-8-K entry window (Berserker)
 
 Status: **DRAFT — pending Matthew's review, dated Sep 27 2026.**
-Not binding until Matthew accepts it. Column names below are from his
-Oct 9 2026 read-only schema check. Stored `kind` strings remain
-**TO CONFIRM: kind values.** No `event_tape` row has been read. This file
-deploys nothing and writes nothing.
+Not binding until Matthew accepts it. Column names are from his Oct 9
+2026 schema check. `kind` strings are from the kind/source census he ran
+the same day. No trade has been joined and no pnl has been computed.
+This file deploys nothing and writes nothing.
 Sibling, filed the same day: `EVENT_FOMC_CPI_PREREG.md`. The two are one family.
 
 ## Hypothesis
@@ -87,7 +87,7 @@ Columns, in ordinal order:
 | `id` | bigint | Row identity. Not a gate. |
 | `ts` | bigint | Insert time, epoch seconds. Not the event clock. |
 | `event_ts` | bigint | Event time, epoch seconds. Same unit as `berserker_trade_fingerprints.entry_ts` and `exit_ts`. The acceptance/dissemination clock, not a period-of-report date. The only clock. |
-| `kind` | character varying | Discriminator. There is no form column. An 8-K is its own `kind`. **TO CONFIRM: kind values** for the string that means 8-K. |
+| `kind` | character varying | Discriminator. There is no form column. Treatment is `kind = 'SEC_8K'` only. `SEC_OTHER` is not an 8-K in this test. |
 | `symbol` | character varying | Issuer ticker, exact match to the trade `symbol`. 8-K rows are per-symbol. |
 | `source` | character varying | Not a gate. Printed beside `kind` in the census below. |
 | `ref` | text | Not a gate. Not an item code. |
@@ -104,15 +104,37 @@ Sentry V1.1 booted Sep 6 2026. Its 21-day observation gate opened Sep 27
 2026. Filings accepted before boot are not in this tape and are not
 backfilled.
 
-Before review, Matthew runs this one read-only check and writes the
-8-K string back into this draft:
+Matthew ran this read-only check:
 
 ```
 SELECT kind, source, count(*) FROM event_tape GROUP BY 1,2
 ```
 
-That statement returns counts by `kind` and `source`. It does not join
-trades and it does not compute pnl.
+| kind | source | count |
+| --- | --- | --- |
+| NEWS | ALPACA | 1751 |
+| SEC_8K | EDGAR | 109 |
+| SEC_OTHER | EDGAR | 31 |
+| EARNINGS | YFINANCE | 18 |
+| NFP | RULE | 15 |
+| FOMC | SEED | 3 |
+| CPI | RULE | 2 |
+| CPI | SEED | 2 |
+
+It does not join trades and it does not compute pnl.
+
+Treatment filings are `kind = 'SEC_8K'` only (`SEC_8K` / `EDGAR`, 109
+rows). `SEC_OTHER` does not open a window.
+
+`NFP`, `EARNINGS`, `NEWS`, and `SEC_OTHER` are out of scope. They are not
+treatment. They are not removed from control, except where an exclusion
+below already removes the trade.
+
+FOMC/CPI session tags used for those exclusions follow the sibling: one
+event session per CT calendar date of `event_ts` per `kind`, for
+`kind IN ('FOMC','CPI')`, any source, applied before a trade is tagged.
+`SEC_8K` filings are not collapsed by calendar date. Each filing keeps
+its own `event_ts` and the same 48-hour window.
 
 There is no form column and no item-code column. `ts` is insert time.
 The window uses `event_ts` only. `source`, `ref`, and `uniq_key` are not
@@ -152,8 +174,9 @@ First window (frozen now), same trade dates as the sibling:
   2026 inclusive. Mon Sep 7 2026 is Labor Day and contributes no session
   (`opening_delay_verdict.py`).
 
-Treatment: in the post-8-K window for that symbol, and the entry session
-is not an FOMC-decision or CPI-release session under the sibling's rules.
+Treatment: `kind = 'SEC_8K'` on that symbol, in the post-8-K window, and
+the entry session is not an FOMC-decision or CPI-release session under
+the sibling's rules, including that dedupe. `SEC_OTHER` does not qualify.
 
 Control: not in any same-symbol post window, not in any same-symbol
 anticipation window, and not on an FOMC-decision or CPI-release session.
@@ -277,6 +300,6 @@ Family `EVENT_FAMILY_2026-09-27` has two members: this file and
 - Nothing by 8-K item. The pool is the claim.
 - Nothing that promotes the existing earnings-date blackout, or that
   retires it. That rule is already live and is not under test here.
-- No verdict script, and no `event_tape` read other than the kind/source
-  census in the data section, is authorized while this status line still
-  says DRAFT.
+- The kind/source census in the data section has been run. No further
+  `event_tape` read, and no verdict script, is authorized while this
+  status line still says DRAFT.

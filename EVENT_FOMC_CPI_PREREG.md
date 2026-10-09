@@ -1,10 +1,10 @@
 # PRE-REGISTRATION — FOMC-decision and CPI-release day filter (Berserker)
 
 Status: **DRAFT — pending Matthew's review, dated Sep 27 2026.**
-Not binding until Matthew accepts it. Column names below are from his
-Oct 9 2026 read-only schema check. Stored `kind` strings remain
-**TO CONFIRM: kind values.** No `event_tape` row has been read. This file
-deploys nothing and writes nothing.
+Not binding until Matthew accepts it. Column names are from his Oct 9
+2026 schema check. `kind` strings are from the kind/source census he ran
+the same day. No trade has been joined and no pnl has been computed.
+This file deploys nothing and writes nothing.
 Sibling, filed the same day: `EVENT_POST_8K_PREREG.md`. The two are one family.
 
 ## Hypothesis
@@ -73,7 +73,7 @@ Columns, in ordinal order:
 | `id` | bigint | Row identity. Not a gate. |
 | `ts` | bigint | Insert time, epoch seconds. Not the event clock. |
 | `event_ts` | bigint | Event time, epoch seconds. Same unit as `berserker_trade_fingerprints.entry_ts` and `exit_ts`. The only clock. |
-| `kind` | character varying | Discriminator. **TO CONFIRM: kind values** for an FOMC decision and a CPI release. |
+| `kind` | character varying | Discriminator. Treatment is `kind IN ('FOMC','CPI')`, any `source`. |
 | `symbol` | character varying | Issuer ticker. Macro rows (FOMC/CPI) presumably have `symbol` NULL and are told apart by `kind`. A non-NULL macro `symbol` must not be joined onto a Berserker name. |
 | `source` | character varying | Not a gate. Printed beside `kind` in the census below. |
 | `ref` | text | Not a gate. |
@@ -89,19 +89,32 @@ unlabeled. It is not filled in from the website.
 Sentry V1.1 booted Sep 6 2026. Its 21-day observation gate opened Sep 27
 2026. That is why the window starts at boot and stops before today.
 
-This document uses the FOMC-decision `kind` and the CPI-release `kind`
-only, once those strings are filled in. The 8-K value is the sibling's.
-No other `kind` is a gate.
-
-Before review, Matthew runs this one read-only check and writes the
-strings back into this draft:
+Matthew ran this read-only check:
 
 ```
 SELECT kind, source, count(*) FROM event_tape GROUP BY 1,2
 ```
 
-That statement returns counts by `kind` and `source`. It does not join
-trades and it does not compute pnl.
+| kind | source | count |
+| --- | --- | --- |
+| NEWS | ALPACA | 1751 |
+| SEC_8K | EDGAR | 109 |
+| SEC_OTHER | EDGAR | 31 |
+| EARNINGS | YFINANCE | 18 |
+| NFP | RULE | 15 |
+| FOMC | SEED | 3 |
+| CPI | RULE | 2 |
+| CPI | SEED | 2 |
+
+It does not join trades and it does not compute pnl.
+
+Treatment rows are `kind IN ('FOMC','CPI')`, any `source`. `CPI` is stored
+under both `RULE` and `SEED`. `FOMC` is stored under `SEED`. Source is not
+a filter. `SEC_8K` is the sibling's treatment, not a third cell here.
+
+`NFP`, `EARNINGS`, `NEWS`, and `SEC_OTHER` are out of scope. They are not
+treatment. They are not removed from control, except where an exclusion
+below already removes the trade.
 
 There is no form column and no item-code column. `ts` is insert time.
 Session assignment uses `event_ts` only. `id`, `source`, `ref`, and
@@ -118,6 +131,15 @@ assignment, in `America/Chicago`:
   so a date-typed column has a rule before anyone sees a row. It is not
   a choice made after the read. Confirmed type is bigint epoch seconds,
   so this branch does not apply.
+
+Dedupe, before floors are counted and before any trade is tagged: one
+event session per CT calendar date of `event_ts` per `kind`. Two `CPI`
+rows on the same CT date, one `RULE` and one `SEED`, are one CPI session.
+The same collapse applies to `FOMC`. The distinct-session floor and the
+trade tags use that collapsed set. A trade on a date that carries both
+kinds is still one trade in the pooled cell. The 15:00 CT
+session-assignment rule is unchanged. It is applied to the earliest
+`event_ts` in the collapsed (date, kind) group.
 
 FOMC and CPI are one pooled cell. Splitting them is report-only.
 
@@ -144,7 +166,8 @@ First window (frozen now):
   (`opening_delay_verdict.py`). Weekends contribute none.
 
 Treatment: entry session is an FOMC-decision session or a CPI-release
-session under the rules above.
+session under the rules above (`kind IN ('FOMC','CPI')`, any source,
+after the one-session-per-CT-date-per-kind dedupe).
 
 Control: every other in-window session.
 
@@ -262,6 +285,6 @@ Family `EVENT_FAMILY_2026-09-27` has two members: this file and
   the employment situation.
 - Nothing per symbol as a shippable exception. The breadth test exists so
   a thin name cannot pass as a day effect.
-- No verdict script, and no `event_tape` read other than the kind/source
-  census in the data section, is authorized while this status line still
-  says DRAFT.
+- The kind/source census in the data section has been run. No further
+  `event_tape` read, and no verdict script, is authorized while this
+  status line still says DRAFT.
