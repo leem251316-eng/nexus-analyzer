@@ -1,8 +1,10 @@
 # PRE-REGISTRATION — Post-8-K entry window (Berserker)
 
 Status: **DRAFT — pending Matthew's review, dated Sep 27 2026.**
-Not binding until Matthew accepts it and fills every TO CONFIRM name below.
-No `event_tape` row has been read. This file deploys nothing and writes nothing.
+Not binding until Matthew accepts it. Column names below are from his
+Oct 9 2026 read-only schema check. Stored `kind` strings remain
+**TO CONFIRM: kind values.** No `event_tape` row has been read. This file
+deploys nothing and writes nothing.
 Sibling, filed the same day: `EVENT_FOMC_CPI_PREREG.md`. The two are one family.
 
 ## Hypothesis
@@ -49,7 +51,7 @@ No post-8-K expectancy has been computed. There is no discovery cell. The
 ## Claim
 
 On the frozen window, mean fee-cleared per-trade pnl on entries inside
-`(event_time, event_time + 48h]` after a same-symbol 8-K is at least 0.20
+`(event_ts, event_ts + 48h]` after a same-symbol 8-K is at least 0.20
 percentage points worse than on entries outside both that window and the
 48 hours before the filing, the post-8-K mean is negative, and the other
 mean is not.
@@ -74,48 +76,62 @@ Live rows only: `is_paper = FALSE`, `trade_id NOT LIKE 'bt_%'`,
 TSLA, AAPL, SMCI, SPCX. The join is exact ticker equality. No subsidiary
 mapping, no fuzzy match. A tape symbol outside those 12 does not join.
 
-### `event_tape` (schema not in this repo)
+### `event_tape` (columns confirmed Oct 9 2026)
 
-Searched every tracked file on `main` at `74f8cbf` for `event_tape`,
-`Sentry`, `FOMC`, and `8-K`. No `CREATE TABLE`, column list, or event-type
-enum exists here. Sentry lives in Trading-bot, which this registration
-does not open and does not modify. No database query was run. EDGAR is not
-a second label inside the verdict. A filing enters the treatment set only
-when the confirmed `event_tape` row says it is an 8-K for that symbol. A
-filing the tape missed is a coverage hole. It is reported and left
-unlabeled.
+The repo still has no `CREATE TABLE` for `event_tape` (searched at
+`74f8cbf`). Matthew ran a read-only schema check on the live database.
+Columns, in ordinal order:
+
+| column | type | role in this registration |
+| --- | --- | --- |
+| `id` | bigint | Row identity. Not a gate. |
+| `ts` | bigint | Insert time, epoch seconds. Not the event clock. |
+| `event_ts` | bigint | Event time, epoch seconds. Same unit as `berserker_trade_fingerprints.entry_ts` and `exit_ts`. The acceptance/dissemination clock, not a period-of-report date. The only clock. |
+| `kind` | character varying | Discriminator. There is no form column. An 8-K is its own `kind`. **TO CONFIRM: kind values** for the string that means 8-K. |
+| `symbol` | character varying | Issuer ticker, exact match to the trade `symbol`. 8-K rows are per-symbol. |
+| `source` | character varying | Not a gate. Printed beside `kind` in the census below. |
+| `ref` | text | Not a gate. Not an item code. |
+| `uniq_key` | text | Not a gate. Not used to merge or split filings. |
+
+Sentry lives in Trading-bot, which this registration does not open and
+does not modify. The schema check returned names and types only. EDGAR is
+not a second label inside the verdict. A filing enters the treatment set
+only when an `event_tape` row's `kind` says it is an 8-K for that
+`symbol`. A filing the tape missed is a coverage hole. It is reported
+and left unlabeled.
 
 Sentry V1.1 booted Sep 6 2026. Its 21-day observation gate opened Sep 27
 2026. Filings accepted before boot are not in this tape and are not
 backfilled.
 
-Columns this verdict is allowed to depend on. Each name is **TO CONFIRM**
-by Matthew from the Sentry writer before any `SELECT`. The verdict must
-not guess.
+Before review, Matthew runs this one read-only check and writes the
+8-K string back into this draft:
 
-| role the grader will require | TO CONFIRM |
-| --- | --- |
-| Event time. One clock: the acceptance or dissemination time, not a period-of-report date. Type and timezone are part of the confirmation. | **TO CONFIRM** |
-| Event kind. One discriminator. The stored value that means "8-K" is part of the confirmation. | **TO CONFIRM** |
-| Symbol. Issuer ticker, exact match to the trade symbol. | **TO CONFIRM** |
-| Filing form. Required only if an 8-K is not already its own event-kind value. If the kind value isolates 8-K, this column is unused and must not be used to slice. Whether the column exists is **TO CONFIRM**. | **TO CONFIRM** |
+```
+SELECT kind, source, count(*) FROM event_tape GROUP BY 1,2
+```
 
-Forbidden as gates even if the table has them: 8-K item codes, accession
-numbers, headline text, raw payload, and any second timestamp. One clock,
-the confirmed one.
+That statement returns counts by `kind` and `source`. It does not join
+trades and it does not compute pnl.
 
-Window clock, chosen by the confirmed column's type, not by the outcome:
+There is no form column and no item-code column. `ts` is insert time.
+The window uses `event_ts` only. `source`, `ref`, and `uniq_key` are not
+gates.
 
-- Timestamp with a time of day. Treatment is `entry_ts` in
-  `(event_time, event_time + 48 hours]`. Anticipation, excluded from both
-  cells, is `[event_time - 48 hours, event_time]`.
-- Date only, no time of day. `event_time` is set to 09:00 CT on the first
+`event_ts` is bigint epoch seconds, so it has a time of day. Window
+clock:
+
+- Treatment is `entry_ts` in `(event_ts, event_ts + 48 hours]`.
+  Anticipation, excluded from both cells, is
+  `[event_ts - 48 hours, event_ts]`.
+- Date only, no time of day. `event_ts` is set to 09:00 CT on the first
   NYSE session that starts strictly after that date. The same 48-hour
   treatment and anticipation intervals then apply. A date-only stamp
   cannot show that the filing-date session was after the filing; starting
   at the next open keeps pre-filing entries out of the treatment set.
   That makes a KEEP harder if the damage was on the filing date itself.
   The branch is pre-declared so it is not picked after the read.
+  Confirmed type is bigint epoch seconds, so this branch does not apply.
 
 Overlapping 8-Ks on one symbol: the entry is in treatment if it falls in
 any post window. It counts once. The filing id for the breadth and
@@ -128,7 +144,7 @@ n = closed live trades, equal-weighted.
 
 First window (frozen now), same trade dates as the sibling:
 
-- Filings: event time from 2026-09-06 00:00 CT inclusive through
+- Filings: `event_ts` from 2026-09-06 00:00 CT inclusive through
   2026-09-27 00:00 CT exclusive. A filing inside that span can cover a
   trade after Fri Sep 25. Those later trades wait for the extension.
   The first trade window does not stretch to follow them.
@@ -261,5 +277,6 @@ Family `EVENT_FAMILY_2026-09-27` has two members: this file and
 - Nothing by 8-K item. The pool is the claim.
 - Nothing that promotes the existing earnings-date blackout, or that
   retires it. That rule is already live and is not under test here.
-- No query, no verdict script, and no row of `event_tape` is authorized
-  while this status line still says DRAFT.
+- No verdict script, and no `event_tape` read other than the kind/source
+  census in the data section, is authorized while this status line still
+  says DRAFT.

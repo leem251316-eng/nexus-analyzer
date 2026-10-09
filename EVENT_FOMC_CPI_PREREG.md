@@ -1,8 +1,10 @@
 # PRE-REGISTRATION — FOMC-decision and CPI-release day filter (Berserker)
 
 Status: **DRAFT — pending Matthew's review, dated Sep 27 2026.**
-Not binding until Matthew accepts it and fills every TO CONFIRM name below.
-No `event_tape` row has been read. This file deploys nothing and writes nothing.
+Not binding until Matthew accepts it. Column names below are from his
+Oct 9 2026 read-only schema check. Stored `kind` strings remain
+**TO CONFIRM: kind values.** No `event_tape` row has been read. This file
+deploys nothing and writes nothing.
 Sibling, filed the same day: `EVENT_POST_8K_PREREG.md`. The two are one family.
 
 ## Hypothesis
@@ -60,47 +62,62 @@ Live rows only: `is_paper = FALSE`, `trade_id NOT LIKE 'bt_%'`,
 `won IS NOT NULL`. Symbols: CLSK, MARA, PLTR, GEO, CXW, NUE, MSTR, NVDA,
 TSLA, AAPL, SMCI, SPCX. Paper-trial names stay out.
 
-### `event_tape` (schema not in this repo)
+### `event_tape` (columns confirmed Oct 9 2026)
 
-Searched every tracked file on `main` at `74f8cbf` for `event_tape`,
-`Sentry`, `FOMC`, and `8-K`. No `CREATE TABLE`, column list, or event-type
-enum exists here. Sentry lives in Trading-bot, which this registration
-does not open and does not modify. No database query was run. The public
-Fed and BLS calendars are not a substitute label: a session enters the
-treatment set only when the confirmed `event_tape` row says so. A release
-the tape missed is a coverage hole. It is reported and left unlabeled.
-It is not filled in from the website.
+The repo still has no `CREATE TABLE` for `event_tape` (searched at
+`74f8cbf`). Matthew ran a read-only schema check on the live database.
+Columns, in ordinal order:
+
+| column | type | role in this registration |
+| --- | --- | --- |
+| `id` | bigint | Row identity. Not a gate. |
+| `ts` | bigint | Insert time, epoch seconds. Not the event clock. |
+| `event_ts` | bigint | Event time, epoch seconds. Same unit as `berserker_trade_fingerprints.entry_ts` and `exit_ts`. The only clock. |
+| `kind` | character varying | Discriminator. **TO CONFIRM: kind values** for an FOMC decision and a CPI release. |
+| `symbol` | character varying | Issuer ticker. Macro rows (FOMC/CPI) presumably have `symbol` NULL and are told apart by `kind`. A non-NULL macro `symbol` must not be joined onto a Berserker name. |
+| `source` | character varying | Not a gate. Printed beside `kind` in the census below. |
+| `ref` | text | Not a gate. |
+| `uniq_key` | text | Not a gate. |
+
+Sentry lives in Trading-bot, which this registration does not open and
+does not modify. The schema check returned names and types only. The
+public Fed and BLS calendars are not a substitute label: a session enters
+the treatment set only when an `event_tape` row's `kind` says so. A
+release the tape missed is a coverage hole. It is reported and left
+unlabeled. It is not filled in from the website.
 
 Sentry V1.1 booted Sep 6 2026. Its 21-day observation gate opened Sep 27
 2026. That is why the window starts at boot and stops before today.
 
-Columns this verdict is allowed to depend on. Each name is **TO CONFIRM**
-by Matthew from the Sentry writer before any `SELECT`. The verdict must
-not guess.
+This document uses the FOMC-decision `kind` and the CPI-release `kind`
+only, once those strings are filled in. The 8-K value is the sibling's.
+No other `kind` is a gate.
 
-| role the grader will require | TO CONFIRM |
-| --- | --- |
-| Event time. One clock used to assign the CT session. Type (timestamptz, epoch seconds, or date) and timezone are part of the confirmation. | **TO CONFIRM** |
-| Event kind. One discriminator whose stored values isolate (i) an FOMC decision and (ii) a CPI release. Exact strings are part of the confirmation. | **TO CONFIRM** |
-| Symbol. Issuer ticker on symbol-scoped rows. Macro rows must not join onto a Berserker symbol (NULL, empty, or a sentinel — which of those is **TO CONFIRM**). | **TO CONFIRM** |
+Before review, Matthew runs this one read-only check and writes the
+strings back into this draft:
 
-This document uses the FOMC-decision value and the CPI-release value only.
-The 8-K value is the sibling's. No other kind is a gate.
+```
+SELECT kind, source, count(*) FROM event_tape GROUP BY 1,2
+```
 
-Forbidden as gates even if the table has them: item codes, accession
-numbers, headline text, raw payload, and any second timestamp. One clock,
-the confirmed one.
+That statement returns counts by `kind` and `source`. It does not join
+trades and it does not compute pnl.
 
-Session assignment, once that clock is confirmed:
+There is no form column and no item-code column. `ts` is insert time.
+Session assignment uses `event_ts` only. `id`, `source`, `ref`, and
+`uniq_key` are not gates.
 
-- Timestamp with a time of day, and the CT time is before 15:00 CT: the
-  session is that CT calendar date.
-- Timestamp at or after 15:00 CT: the session is the next NYSE session.
+`event_ts` is bigint epoch seconds, so it has a time of day. Session
+assignment, in `America/Chicago`:
+
+- CT time before 15:00 CT: the session is that CT calendar date.
+- CT time at or after 15:00 CT: the session is the next NYSE session.
   The print landed after the cash close.
 - Date only, no time of day: the session is that calendar date if it is
   an NYSE session; otherwise the next NYSE session. This branch exists
   so a date-typed column has a rule before anyone sees a row. It is not
-  a choice made after the read.
+  a choice made after the read. Confirmed type is bigint epoch seconds,
+  so this branch does not apply.
 
 FOMC and CPI are one pooled cell. Splitting them is report-only.
 
@@ -118,7 +135,7 @@ and not dollars.
 
 First window (frozen now):
 
-- Events: tape rows with event time from 2026-09-06 00:00 CT inclusive
+- Events: tape rows with `event_ts` from 2026-09-06 00:00 CT inclusive
   through 2026-09-27 00:00 CT exclusive. Boot day through the day before
   the gate opened. Sep 6 is a Sunday, so the equity sample still starts
   Tue Sep 8.
@@ -134,10 +151,10 @@ Control: every other in-window session.
 Excluded from both cells (counted in an appendix, not in n, not in either
 mean):
 
-- The trade also falls in the sibling's post-8-K window, `(event_time,
-  event_time + 48h]` on that symbol.
-- The trade falls in the sibling's anticipation window, `[event_time - 48h,
-  event_time]` on that symbol. That window is not a registered thesis.
+- The trade also falls in the sibling's post-8-K window, `(event_ts,
+  event_ts + 48h]` on that symbol.
+- The trade falls in the sibling's anticipation window, `[event_ts - 48h,
+  event_ts]` on that symbol. That window is not a registered thesis.
 
 An exclusion that drops a cell under its floor is EXTEND. The excluded
 trades are not put back.
@@ -245,5 +262,6 @@ Family `EVENT_FAMILY_2026-09-27` has two members: this file and
   the employment situation.
 - Nothing per symbol as a shippable exception. The breadth test exists so
   a thin name cannot pass as a day effect.
-- No query, no verdict script, and no row of `event_tape` is authorized
-  while this status line still says DRAFT.
+- No verdict script, and no `event_tape` read other than the kind/source
+  census in the data section, is authorized while this status line still
+  says DRAFT.
