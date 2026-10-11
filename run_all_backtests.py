@@ -8,7 +8,7 @@ Runs all four backtests in sequence every Sunday 11pm UTC.
 Railway cron: 0 23 * * 0
 
 Order:
-  1. Berserker (nexus_analyzer_1min_railway.py V3.0) — ~35-45 min
+  1. Berserker (nexus_analyzer_1min_railway.py V4.0) — ~35-45 min
   2. Phase4 (phase4_backtester.py V1.2)             — ~45-60 min
   3. Crypto (crypto_backtester.py V3.0)             — ~15-25 min
   4. Scanner (scanner_backtester.py V1.0)           — ~15-25 min
@@ -98,7 +98,7 @@ def main():
     results    = {}
 
     # 1. Berserker
-    ok, elapsed = run_script("nexus_analyzer_1min_railway.py", "BERSERKER V3.0")
+    ok, elapsed = run_script("nexus_analyzer_1min_railway.py", "BERSERKER V4.0")
     results["Berserker"] = {"ok": ok, "elapsed": elapsed}
 
     # 2. Phase4
