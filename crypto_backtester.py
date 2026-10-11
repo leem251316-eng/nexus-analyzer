@@ -67,6 +67,8 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
+import backtest_safety
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [CRYPTO-BT] %(message)s",
@@ -890,9 +892,12 @@ def simulate_pair(pair: str, df: pd.DataFrame,
 
 # ── DB write ──────────────────────────────────────────────────────────────────
 def write_fingerprints(all_records: List[Dict], dry_run: bool = False) -> int:
-    if dry_run or not DATABASE_URL:
-        log.info(f"  DRY RUN: would write {len(all_records)} fingerprints")
-        return len(all_records)
+    if dry_run or not backtest_safety.writes_enabled() or not DATABASE_URL:
+        log.info(
+            f"  DRY RUN: not deleting or inserting. "
+            f"Crypto rows left untouched: {len(all_records)}"
+        )
+        return 0
     try:
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
@@ -947,6 +952,9 @@ def write_fingerprints(all_records: List[Dict], dry_run: bool = False) -> int:
 
 def run_pattern_analysis() -> Tuple[int, float]:
     """Same as crypto.py PatternMemory.run_analysis()."""
+    if not backtest_safety.writes_enabled():
+        log.info("  DRY RUN: skipping pattern analysis")
+        return 0, 0.0
     if not DATABASE_URL:
         return 0, 0.0
     try:
@@ -1024,7 +1032,7 @@ def main():
 
     pairs   = args.pairs or ALL_PAIRS
     days    = args.days
-    dry_run = args.dry_run
+    dry_run = backtest_safety.dry_run(args.dry_run)
 
     if not ALPACA_API_KEY:
         log.error("Missing ALPACA_API_KEY")
@@ -1037,6 +1045,7 @@ def main():
     log.info("=" * 60)
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"🌙 NEXUS CRYPTO BACKTESTER V3.0 STARTING\n"
         f"Data source: Alpaca (replaces broken Coinbase API)\n"
         f"Pairs: {len(pairs)} | Days: {days}\n"
@@ -1173,6 +1182,7 @@ def main():
         dist_lines.append(f"  {strat_name}: avg={avg:.0f} max={max(scores)} near55={near_miss}")
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"✅ NEXUS CRYPTO BACKTESTER V3.0 COMPLETE\n"
         f"──────────────────\n"
         f"Overall WR: {bt_wr}% ({total_t} trades)\n"

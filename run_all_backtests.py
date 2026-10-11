@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-run_all_backtests.py — NEXUS Backtester Orchestrator V1.1
-==========================================================
-Entry point for nexus-analyzer Railway worker (genuine-reverence).
-Runs all four backtests in sequence every Sunday 11pm UTC.
+run_all_backtests.py — NEXUS Backtester Orchestrator
+=====================================================
+Entry point for the nexus-backtester Railway worker (Procfile).
+A deploy starts this process once. The Sunday cron is no longer attached,
+so this file is what a merge to main will run.
 
-Railway cron: 0 23 * * 0
+Database writes are off unless BACKTEST_WRITE_DB is 1, true, yes, or on.
+When it is off, every stage is launched with --dry-run. Each stage also
+refuses DELETE/INSERT on its own if the variable is off, including a
+direct `python phase4_backtester.py`. Telegram summaries are marked
+DRY RUN. The suite still runs and still reports.
 
 Order:
   1. Berserker (nexus_analyzer_1min_railway.py V4.0) — ~35-45 min
@@ -33,6 +38,8 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import backtest_safety
+
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CENTRAL          = ZoneInfo("America/Chicago")
@@ -52,15 +59,16 @@ def send_alert(msg: str):
         pass
 
 
-def run_script(script: str, label: str) -> tuple:
+def run_script(script: str, label: str, extra_args: list) -> tuple:
     """Run a backtester script as a subprocess. Returns (success, elapsed_sec)."""
+    cmd = [sys.executable, script, *extra_args]
     print(f"\n{'='*60}", flush=True)
-    print(f"[ORCHESTRATOR] Starting {label}", flush=True)
+    print(f"[ORCHESTRATOR] Starting {label}: {' '.join(cmd)}", flush=True)
     print(f"{'='*60}", flush=True)
     t0 = time.time()
     try:
         result = subprocess.run(
-            [sys.executable, script],
+            cmd,
             check=True,
             timeout=7200,   # 2hr hard limit per script
         )
@@ -84,12 +92,20 @@ def run_script(script: str, label: str) -> tuple:
 
 def main():
     now = datetime.now(tz=CENTRAL)
-    print(f"[ORCHESTRATOR] NEXUS Backtester Orchestrator V1.1", flush=True)
+    writing = backtest_safety.writes_enabled()
+    extra = [] if writing else ["--dry-run"]
+    print(f"[ORCHESTRATOR] NEXUS Backtester Orchestrator", flush=True)
     print(f"[ORCHESTRATOR] Start: {now.strftime('%Y-%m-%d %H:%M:%S CDT')}", flush=True)
+    print(
+        f"[ORCHESTRATOR] BACKTEST_WRITE_DB={'ON' if writing else 'OFF (DRY RUN)'}",
+        flush=True,
+    )
 
     send_alert(
+        f"{backtest_safety.banner(writing)}"
         f"🚀 NEXUS BACKTESTER SUITE STARTING\n"
         f"4 systems: Berserker → Phase4 → Crypto → Scanner\n"
+        f"Database writes: {'ON' if writing else 'OFF'}\n"
         f"ETA: ~2.5-3 hours total\n"
         f"{now.strftime('%H:%M CDT')}"
     )
@@ -98,30 +114,38 @@ def main():
     results    = {}
 
     # 1. Berserker
-    ok, elapsed = run_script("nexus_analyzer_1min_railway.py", "BERSERKER V4.0")
+    ok, elapsed = run_script("nexus_analyzer_1min_railway.py", "BERSERKER V4.0", extra)
     results["Berserker"] = {"ok": ok, "elapsed": elapsed}
 
     # 2. Phase4
-    ok, elapsed = run_script("phase4_backtester.py", "PHASE4 V1.2")
+    ok, elapsed = run_script("phase4_backtester.py", "PHASE4 V1.2", extra)
     results["Phase4"] = {"ok": ok, "elapsed": elapsed}
 
     # 3. Crypto
-    ok, elapsed = run_script("crypto_backtester.py", "CRYPTO V3.0")
+    ok, elapsed = run_script("crypto_backtester.py", "CRYPTO V3.0", extra)
     results["Crypto"] = {"ok": ok, "elapsed": elapsed}
 
     # 4. Scanner
-    ok, elapsed = run_script("scanner_backtester.py", "SCANNER V1.0")
+    ok, elapsed = run_script("scanner_backtester.py", "SCANNER V1.0", extra)
     results["Scanner"] = {"ok": ok, "elapsed": elapsed}
 
     # Final summary
     wall_elapsed = round(time.time() - wall_start)
-    lines = ["📊 NEXUS BACKTEST SUITE COMPLETE", "──────────────────"]
+    lines = [
+        backtest_safety.banner(writing).rstrip(),
+        "📊 NEXUS BACKTEST SUITE COMPLETE",
+        "──────────────────",
+    ]
+    lines = [ln for ln in lines if ln]
     for name, r in results.items():
         status = "✅" if r["ok"] else "❌"
         lines.append(f"{status} {name}: {r['elapsed']}s")
-    lines.append(f"──────────────────")
+    lines.append("──────────────────")
     lines.append(f"Total: {wall_elapsed}s ({round(wall_elapsed/60)}min)")
-    lines.append(f"Next run: Sunday 11pm UTC")
+    if writing:
+        lines.append("Writes: ON (BACKTEST_WRITE_DB). Closed bt_% rows were replaced.")
+    else:
+        lines.append("Writes: OFF. No fingerprint rows were deleted or inserted.")
 
     send_alert("\n".join(lines))
     print(f"\n[ORCHESTRATOR] All backtests complete. Total: {wall_elapsed}s", flush=True)

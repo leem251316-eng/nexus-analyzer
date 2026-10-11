@@ -137,6 +137,38 @@ class ExitEngineTests(unittest.TestCase):
         event = sim.step_position(red, at(14, 58), 100.0, 100.0, 100.0, 100.0)
         self.assertEqual(event["reason"], "eod-autoclose")
 
+        # Fewer than 6 closes on the tape does not carry, even if green
+        # and rising. Live returns False when price_history is shorter
+        # than 6 prints.
+        young = sim.new_position(at(14, 55), 100.0, 0.0, tp=0.015, sl=0.010)
+        event = None
+        for i, px in enumerate([100.2, 100.4, 100.6]):
+            event = sim.step_position(
+                young, at(14, 56) + timedelta(minutes=i), px, px, px, px
+            )
+        self.assertEqual(event["reason"], "eod-autoclose")
+        self.assertFalse(young["carried"])
+
+        # The live test uses the symbol tape, not "closes since entry".
+        # A one-bar position still carries when that tape is long and rising.
+        taped = sim.new_position(at(14, 57), 100.0, 0.0, tp=0.015, sl=0.010)
+        tape = [100.0, 100.1, 100.2, 100.3, 100.4, 100.6]
+        event = sim.step_position(
+            taped, at(14, 58), 100.6, 100.6, 100.6, 100.6, tape=tape
+        )
+        self.assertIsNone(event)
+        self.assertTrue(taped["carried"])
+
+        # Earnings blackout flattens a winner the carry test would keep.
+        blocked = sim.new_position(at(14, 50), 100.0, 0.0, tp=0.015, sl=0.010)
+        event = None
+        for i, px in enumerate([100.2, 100.3, 100.4, 100.5, 100.6, 100.7, 100.8, 100.9]):
+            event = sim.step_position(
+                blocked, at(14, 51) + timedelta(minutes=i), px, px, px, px,
+                earnings_blocked=(i == 7),
+            )
+        self.assertEqual(event["reason"], "eod-earnings-close")
+
     def test_overnight_gap_fills_at_the_open(self):
         # Friday 14:58 carry, Monday 08:30 opens through the stop.
         state = sim.new_position(at(14, 50), 100.0, 0.0, tp=0.015, sl=0.010)
@@ -194,22 +226,29 @@ class ClockAndGateTests(unittest.TestCase):
         self.assertEqual(sim.required_rsi(False, "WEAK"), 62.0)
         self.assertEqual(sim.required_rsi(True, "STRONG"), 62.0)
         self.assertEqual(sim.required_rsi(True, "WEAK"), 72.0)
-        healthy = sim.regime_score(
-            vix=18, spy_above_short_ma=True, spy_momentum=0.001,
-            sector_health="STRONG", qqq_above_short_ma=True, spy_rsi=55,
-        )
+        healthy = sim.regime_score(vix=18, spy_above_short_ma=True)
+        self.assertEqual(healthy, 0)
         self.assertLess(healthy, sim.REGIME_BLOCK_SCORE)
-        blocked = sim.regime_score(
-            vix=20, spy_above_short_ma=False, spy_momentum=-0.001,
-            sector_health="WEAK", qqq_above_short_ma=True, spy_rsi=55,
+        # Bar-only inputs top out at 2 (SPY bear + VIX > 25). That is
+        # under the shutdown threshold of 4, so the score does not block.
+        bars_only = sim.regime_score(vix=26, spy_above_short_ma=False)
+        self.assertEqual(bars_only, 2)
+        self.assertLess(bars_only, sim.REGIME_BLOCK_SCORE)
+        # Score 3 is defensive size, not a Berserker entry block.
+        defensive = sim.regime_score(
+            vix=18, spy_above_short_ma=False, berserker_cb=True, fear_greed=10,
         )
-        self.assertGreaterEqual(blocked, sim.REGIME_BLOCK_SCORE)
-        # VIX alone is +2, under the score block. The hard VIX gate is separate.
-        vix_only = sim.regime_score(
-            vix=30, spy_above_short_ma=True, spy_momentum=0.01,
-            sector_health="STRONG", qqq_above_short_ma=True, spy_rsi=55,
+        self.assertEqual(defensive, 3)
+        self.assertLess(defensive, sim.REGIME_BLOCK_SCORE)
+        shutdown = sim.regime_score(
+            vix=26, spy_above_short_ma=False, berserker_cb=True, scanner_cb=True,
         )
-        self.assertEqual(vix_only, 2)
+        self.assertEqual(shutdown, 4)
+        self.assertGreaterEqual(shutdown, sim.REGIME_BLOCK_SCORE)
+        # VIX == 25 blocks entries in get_vix_status, but the regime point
+        # is strict greater-than.
+        self.assertEqual(sim.regime_score(vix=25, spy_above_short_ma=True), 0)
+        self.assertEqual(sim.regime_score(vix=25.01, spy_above_short_ma=True), 1)
 
     def test_earnings_blackout_uses_each_historical_print(self):
         old = datetime(2024, 11, 1, 21, 0, tzinfo=ZoneInfo("UTC"))
@@ -376,21 +415,24 @@ class ReplayBookTests(unittest.TestCase):
         )
         ordered = sorted(trades, key=lambda t: t["entry_ts_ep"])
         self.assertEqual([t["symbol"] for t in ordered], ["CLSK", "MARA", "NVDA"])
-        # 09:30, 09:31, 09:32 — one fill per minute, PLTR skipped (avoid hour 9).
+        # Signal gate is 35 one-minute samples: 08:30 + 34 min = 09:04,
+        # which is after the opening wall and before band_0905. PLTR is
+        # skipped for avoid-hour 9, so the next fills are 09:30 and 09:31
+        # once the band ends. One fill per minute.
         minutes = []
         for t in ordered:
             ct = datetime.fromtimestamp(t["entry_ts_ep"], CT)
             minutes.append(ct.hour * 60 + ct.minute)
-        self.assertEqual(minutes, [9 * 60 + 30, 9 * 60 + 31, 9 * 60 + 32])
+        self.assertEqual(minutes, [9 * 60 + 4, 9 * 60 + 30, 9 * 60 + 31])
         epochs = [t["entry_ts_ep"] for t in ordered]
         self.assertEqual(len(epochs), len(set(epochs)))
         for t in ordered:
             self.assertEqual(t["exit_reason"], "eod-autoclose")
             self.assertFalse(t["overnight"])
             self.assertTrue(t["trade_id"].startswith("bt_v4_"))
-            # 09:30 → 14:58 is 328 clock minutes, not a cross-symbol bar index.
+            # 09:04 → 14:58 is 354 clock minutes, not a cross-symbol bar index.
             if t["symbol"] == "CLSK":
-                self.assertEqual(t["hold_min"], 328)
+                self.assertEqual(t["hold_min"], 354)
 
     def test_cooldown_and_holdout_tag_from_one_book(self):
         # 40 minutes from 10:00. Warmup is patched down so the short book
@@ -543,44 +585,118 @@ class ReplayBookTests(unittest.TestCase):
 
 class ConfluenceTests(unittest.TestCase):
     def test_each_leg_can_be_the_one_that_qualifies(self):
-        # Momentum: last 5-bar change positive and larger than the prior one.
+        # Momentum: last 5-sample change positive and larger than the prior one.
         up = list(range(100, 112))
         quiet_hist = _hist(0.0, 0.0)
-        self.assertGreaterEqual(sim.confluence_count(up, quiet_hist, session_vwap=10_000), 1)
+        self.assertGreaterEqual(sim.confluence_count(up, quiet_hist, analyst_score=0), 1)
 
-        # Bouncing: close above the close three bars ago, momentum suppressed
-        # by a flat recent change that is not larger than the prior swing.
+        # Bouncing: close above the close three samples ago.
         bounce = [10, 10, 10, 9, 9, 9, 9, 10]
         self.assertGreaterEqual(
-            sim.confluence_count(bounce, quiet_hist, session_vwap=10_000), 1
+            sim.confluence_count(bounce, quiet_hist, analyst_score=0), 1
         )
 
-        # Session VWAP leg alone: price above vwap, other legs quiet.
+        # Fifth leg is the analyst score, not session VWAP. A flat tape
+        # has zero price legs. Score 0 (service absent) adds nothing.
+        # Score >= 1 adds the leg and does not require the other four.
         flat = [5.0] * 30
-        self.assertGreaterEqual(sim.confluence_count(flat, quiet_hist, session_vwap=4.0), 1)
-        self.assertEqual(sim.confluence_count(flat, quiet_hist, session_vwap=6.0), 0)
+        self.assertEqual(sim.confluence_count(flat, quiet_hist, analyst_score=0), 0)
+        self.assertEqual(sim.confluence_count(flat, quiet_hist, analyst_score=1), 1)
 
     def test_strong_uptrend_passes_the_base_gates(self):
-        # Monotonic rise → RSI high, MACD bullish, price above the short MA,
-        # and several confluence legs.
         # Chop, then a push. A perfectly smooth rise leaves Wilder RSI
-        # undefined (zero average loss) in the V3.3 copy of the indicator.
+        # undefined (zero average loss), matching live get_signals.
         prices = [100 + (i % 5) * 0.05 for i in range(40)]
         px = prices[-1]
         for _ in range(40):
             px += 0.8
             prices.append(px)
-        sig = sim.get_signals_bt(prices, "STRONG", is_trump=False, session_vwap=None)
+        sig = sim.get_signals_bt(prices, "STRONG", is_trump=False, analyst_score=0)
         self.assertTrue(sig["buy"], sig)
         self.assertGreater(sig["rsi"], 62)
         self.assertGreaterEqual(sig["confluence"], 1)
-        weak = sim.get_signals_bt(prices, "WEAK", is_trump=True, session_vwap=None)
+        self.assertEqual(sig["analyst_score"], 0)
+        weak = sim.get_signals_bt(prices, "WEAK", is_trump=True, analyst_score=0)
         self.assertTrue(weak["buy"])
+
+
+class LiveGateTests(unittest.TestCase):
+    def test_sector_health_is_fifteen_samples_not_the_short_ma(self):
+        # Older drop still inside a 20-sample average, but the last print
+        # is not below the print 15 samples ago. That name is not "down".
+        stale = [200.0] * 5 + [10.0] * 15
+        fresh = [10.0] * 14 + [9.0]
+        flat = [10.0] * 20
+        theme = ["STALE", "FRESH", "FLAT", "ALSO"]
+        prices = {"STALE": stale, "FRESH": fresh, "FLAT": flat, "ALSO": flat}
+        self.assertEqual(sim.compute_sector_health(prices, theme), "STRONG")
+        prices["B"] = fresh
+        theme3 = ["FRESH", "B", "C"]
+        prices["C"] = fresh
+        self.assertEqual(sim.compute_sector_health(prices, theme3), "WEAK")
+
+    def test_spy_momentum_gate_allows_a_small_dip(self):
+        soft = [100.0] * 50
+        soft[-1] = 99.8  # -0.2% over the deque lookback, inside -0.3
+        self.assertTrue(sim.spy_context(soft)["momentum_ok"])
+        hard = [100.0] * 50
+        hard[-1] = 99.5
+        self.assertFalse(sim.spy_context(hard)["momentum_ok"])
+        # Under 20 samples live assumes BULL and does not block.
+        early = sim.spy_context([100.0] * 10)
+        self.assertTrue(early["momentum_ok"])
+        self.assertEqual(early["regime"], "BULL")
+
+    def test_dynamic_tp_thresholds_and_the_recipe_floor(self):
+        self.assertAlmostEqual(sim.dynamic_tp(0.015, [3.2] * 30), 0.025)
+        self.assertAlmostEqual(sim.dynamic_tp(0.015, [2.2] * 30), 0.020)
+        self.assertAlmostEqual(sim.dynamic_tp(0.015, [3.2] * 29), 0.015)
+        self.assertAlmostEqual(sim.dynamic_tp(0.030, [4.0] * 40), 0.030)
+        key = sim.bucket_key("NVDA", 73, True, "STRONG", False, 9)
+        self.assertEqual(key, "NVDA|rsi_hi|spy_bull|STRONG|TECH|hr_open")
+
+    def test_scan_order_is_the_no_focus_rotation(self):
+        # Never-traded names keep SYMBOLS order and scan before a name
+        # that just exited. Cooling names are left out of the list.
+        symbols = ["CLSK", "MARA", "NVDA"]
+        self.assertEqual(
+            sim.scan_order(symbols, ["NVDA"], held=[], cooling=[]),
+            ["CLSK", "MARA", "NVDA"],
+        )
+        self.assertEqual(
+            sim.scan_order(symbols, ["NVDA", "CLSK"], held=[], cooling=["MARA"]),
+            ["NVDA", "CLSK"],
+        )
 
 
 def _hist(prev, last):
     import pandas as pd
     return pd.Series([prev, last])
+
+
+class WriteSwitchTests(unittest.TestCase):
+    def test_database_writes_default_off(self):
+        import backtest_safety as gate
+        old = os.environ.pop("BACKTEST_WRITE_DB", None)
+        try:
+            self.assertFalse(gate.writes_enabled())
+            self.assertTrue(gate.dry_run(False))
+            self.assertIn("DRY RUN", gate.banner(False))
+            self.assertEqual(gate.banner(True), "")
+            for raw in ("", "0", "false", "no", "off"):
+                os.environ["BACKTEST_WRITE_DB"] = raw
+                self.assertFalse(gate.writes_enabled(), raw)
+            for raw in ("1", "true", "YES", "on"):
+                os.environ["BACKTEST_WRITE_DB"] = raw
+                self.assertTrue(gate.writes_enabled(), raw)
+                self.assertFalse(gate.dry_run(False))
+            # An explicit --dry-run still wins when the variable is on.
+            self.assertTrue(gate.dry_run(True))
+        finally:
+            if old is None:
+                os.environ.pop("BACKTEST_WRITE_DB", None)
+            else:
+                os.environ["BACKTEST_WRITE_DB"] = old
 
 
 if __name__ == "__main__":

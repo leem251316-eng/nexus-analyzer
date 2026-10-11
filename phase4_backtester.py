@@ -135,6 +135,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, Adjustment
 
+import backtest_safety
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [P4-BT] %(message)s",
@@ -1061,9 +1063,12 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
 
 # ── DB write ──────────────────────────────────────────────────────────────────
 def write_fingerprints(trades: list, dry_run: bool = False) -> int:
-    if dry_run or not DATABASE_URL:
-        log.info(f"  DRY RUN: would write {len(trades)} fingerprints")
-        return len(trades)
+    if dry_run or not backtest_safety.writes_enabled() or not DATABASE_URL:
+        log.info(
+            f"  DRY RUN: not deleting or inserting. "
+            f"Phase4 rows left untouched: {len(trades)}"
+        )
+        return 0
     try:
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
@@ -1131,6 +1136,9 @@ def write_fingerprints(trades: list, dry_run: bool = False) -> int:
 
 def run_pattern_analysis() -> Tuple[int, float]:
     """Trigger Phase4Memory.run_analysis() equivalent inline."""
+    if not backtest_safety.writes_enabled():
+        log.info("  DRY RUN: skipping pattern analysis")
+        return 0, 0.0
     if not DATABASE_URL:
         return 0, 0.0
     try:
@@ -1392,13 +1400,16 @@ def main():
         run_min_score_sweep(args.sweep.upper().strip(), scores, args.days)
         return
 
+    dry_run = backtest_safety.dry_run(args.dry_run)
+
     log.info("=" * 60)
     log.info(f"NEXUS PHASE4 BACKTESTER V1.6")
-    log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {args.dry_run}")
+    log.info(f"Days: {args.days} | Slippage: {SLIPPAGE_PCT*100:.2f}% | DryRun: {dry_run}")
     log.info(f"V2.0 features: ADX regime filter | Vol confirmation | Underlying exit")
     log.info("=" * 60)
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"⚡ PHASE4 BACKTESTER V1.6 STARTING\n"
         f"Bots: NUGT | SOXL | LABU | TQQQ\n"
         f"Bear pairs: DUST | SOXS | LABD | SQQQ\n"
@@ -1434,11 +1445,11 @@ def main():
     written = 0
     if train_trades:
         log.info(f"Writing {len(train_trades)} training fingerprints to DB...")
-        written = write_fingerprints(train_trades, args.dry_run)
+        written = write_fingerprints(train_trades, dry_run)
 
     # Run pattern analysis
     buckets, overall_wr = 0, 0.0
-    if not args.dry_run and DATABASE_URL and written > 0:
+    if not dry_run and DATABASE_URL and written > 0:
         log.info("Running pattern analysis...")
         buckets, overall_wr = run_pattern_analysis()
 
@@ -1460,6 +1471,7 @@ def main():
         val_line = f"\nValidation (last 25%): {vwr}% WR ({len(validate_trades)} trades)"
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"✅ PHASE4 BACKTESTER V1.6 COMPLETE\n"
         f"──────────────────\n"
         f"Training WR: {train_wr}% ({len(train_trades)} trades)\n"

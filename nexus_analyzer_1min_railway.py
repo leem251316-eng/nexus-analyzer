@@ -12,15 +12,14 @@ berserker_live_sim.py:
   * Hard TP (recipe, usually 1.5%) and hard SL (1.0%, SPCX 1.5%).
   * 1.5% trail off the peak, armed after 20 minutes.
   * 0.5% ratchet once current profit is +1.5% (preempted by TP).
-  * EOD at 14:58 CT. Green and still rising over ~3 minutes carries;
-    the next RTH open fills the gap.
-  * Entry gates: RSI(9) > 62 (72 for TRUMP_THEME when sector health is
-    WEAK), MACD bullish, price above the 20-bar short MA, 1-of-5
-    confluence, avoid hours, 08:30–09:00 CT wall, 09:05–09:30 CT
-    band_0905, buys only before 14:55 CT, SPY 5-bar momentum > 0,
-    VIX > 25, regime score >= 3, 48h earnings blackout, 30-min
-    per-symbol cooldown, max 3 positions, one new entry per minute
-    in SYMBOLS order.
+  * EOD at 14:58 CT. Green and last close above the close 5 samples
+    back carries; a short tape or an earnings blackout flattens.
+    The next RTH open fills the gap.
+  * Entry gates follow main.py V10.68. The fifth confluence leg is the
+    analyst-service score and is modeled as 0 (service absent, does not
+    block). Regime shutdown is score >= 4; bar-only inputs cannot reach
+    it. SPY momentum blocks only a drop faster than -0.3%. See
+    berserker_live_sim.py for the matched / approximated list.
   * Per-symbol half-spread (quote sample, else Roll on closes, else
     the documented table). Not a flat 5 bps.
   * Historical earnings dates (yfinance get_earnings_dates). The
@@ -35,9 +34,9 @@ trade_id LIKE 'bt_%' (see reclassify_bt_rows.py: PatternMemory ingests
 bt_ rows through that gate). bt_v4_ still matches, so a production write
 feeds the live win-rate gate. The v4 tag is how Trading-bot can later
 keep this engine (LIKE 'bt_v4_%') and ignore pre-v4 rows. This repo
-does not change Trading-bot. The Sunday DELETE still removes every
-closed bt_% row before inserting the new in-sample book, which is the
-existing refresh contract.
+does not change Trading-bot. When BACKTEST_WRITE_DB is on, the writer
+still deletes every closed bt_% row and inserts the in-sample book.
+The default is off, so a deploy does not do that.
 
 Gates on the holdout (net of costs):
   avg P&L/trade >= +0.15%, profit factor >= 1.15,
@@ -45,14 +44,15 @@ Gates on the holdout (net of costs):
   no symbol > 25% of total P&L.
 
 Usage:
-  python nexus_analyzer_1min_railway.py                 # 730 days, writes DB
-  python nexus_analyzer_1min_railway.py --dry-run       # no DB write
-  python nexus_analyzer_1min_railway.py --days 30 --dry-run --no-quotes
-  python nexus_analyzer_1min_railway.py --no-earnings   # skip the calendar
-  python nexus_analyzer_1min_railway.py --no-validate   # hide the holdout report
+  python nexus_analyzer_1min_railway.py                 # dry run (default)
+  python nexus_analyzer_1min_railway.py --dry-run       # same, explicit
+  BACKTEST_WRITE_DB=1 python nexus_analyzer_1min_railway.py
+                                                        # delete/insert bt_ rows
+  python nexus_analyzer_1min_railway.py --days 30 --no-quotes
 
-Do not point DATABASE_URL at production while developing. --dry-run
-never connects.
+Writes stay off unless BACKTEST_WRITE_DB is 1, true, yes, or on.
+--dry-run forces them off even then. A dry run still prints and telegrams
+and never connects to delete or insert.
 """
 
 import os
@@ -72,6 +72,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, Adjustment
 
+import backtest_safety
 import berserker_live_sim as sim
 
 logging.basicConfig(
@@ -347,16 +348,19 @@ def write_fingerprints(trades: List[dict], dry_run: bool = False) -> int:
     """Replace closed bt_% rows with the in-sample V4 book.
 
     Holdout trades are dropped here even if the caller passed the full
-    book. --dry-run and a missing DATABASE_URL never connect.
+    book. A dry run (the default) and a missing DATABASE_URL never connect.
     """
     rows = sim.rows_for_db(trades)
     skipped = len(trades) - len(rows)
     if skipped:
         log.info(f"  Holdout rows kept out of the DB: {skipped}")
-    if dry_run or not DATABASE_URL:
-        log.info(f"  DRY RUN: would write {len(rows)} bt_v4_ fingerprints")
+    if dry_run or not backtest_safety.writes_enabled() or not DATABASE_URL:
+        log.info(
+            f"  DRY RUN: not deleting or inserting. "
+            f"In-sample bt_v4_ rows left untouched: {len(rows)}"
+        )
         log.info(f"  {GATE_NOTE}")
-        return len(rows)
+        return 0
     try:
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
@@ -425,6 +429,9 @@ def run_pattern_analysis() -> Tuple[int, float]:
     plus bt_v4_ in-sample rows (pre-v4 bt_ rows were deleted). Holdout
     trades were never inserted, so they do not move the buckets.
     """
+    if not backtest_safety.writes_enabled():
+        log.info("  DRY RUN: skipping pattern analysis")
+        return 0, 0.0
     if not DATABASE_URL:
         return 0, 0.0
     try:
@@ -510,6 +517,7 @@ def main():
     parser.add_argument("--no-quotes", action="store_true",
                         help="Skip the IEX quote sample; use Roll or the table.")
     args = parser.parse_args()
+    dry_run = backtest_safety.dry_run(args.dry_run)
 
     if not ALPACA_API_KEY or not ALPACA_SECRET:
         log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY")
@@ -520,9 +528,11 @@ def main():
     log.info(f"Symbols: {len(SYMBOLS)} | Days: {args.days}")
     log.info("Exits: TP / SL / 1.5% trail after 20m / ratchet / EOD 14:58 CT")
     log.info(GATE_NOTE)
+    log.info("DB writes: %s", "ON" if not dry_run else "OFF (DRY RUN)")
     log.info("=" * 60)
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"🔥 NEXUS BERSERKER BACKTESTER V4.0 STARTING\n"
         f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
         f"Live-path exits (TP/SL/trail/EOD carry) | per-symbol costs\n"
@@ -559,7 +569,11 @@ def main():
     )
     in_sample, holdout = sim.split_holdout(trades)
     log.info(f"Replay complete: {len(in_sample)} in-sample, {len(holdout)} holdout")
-    print(sim.format_report(in_sample, label="IN-SAMPLE (first 75%, written)", verdict=False))
+    ins_label = (
+        "IN-SAMPLE (first 75%, DRY RUN — not written)" if dry_run
+        else "IN-SAMPLE (first 75%, written)"
+    )
+    print(sim.format_report(in_sample, label=ins_label, verdict=False))
     gates = None
     if not args.no_validate:
         print(sim.format_report(
@@ -571,11 +585,14 @@ def main():
 
     written = 0
     if trades:
-        log.info(f"Writing {len(in_sample)} in-sample bt_v4_ fingerprints...")
-        written = write_fingerprints(trades, args.dry_run)
+        log.info(
+            f"Fingerprint step: {len(in_sample)} in-sample rows "
+            f"({'DRY RUN' if dry_run else 'WRITE'})"
+        )
+        written = write_fingerprints(trades, dry_run)
 
     buckets, _overall_wr = 0, 0.0
-    if not args.dry_run and DATABASE_URL and written > 0:
+    if not dry_run and DATABASE_URL and written > 0:
         log.info("Running pattern analysis...")
         buckets, _overall_wr = run_pattern_analysis()
 
@@ -585,6 +602,7 @@ def main():
     verdict = "SUPPRESSED" if gates is None else ("PASS" if gates["pass"] else "FAIL")
 
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"✅ NEXUS BERSERKER BACKTESTER V4.0 COMPLETE\n"
         f"──────────────────\n"
         f"In-sample: {ins['n']} trades  avg {ins['avg_pnl']:+.3f}%  "

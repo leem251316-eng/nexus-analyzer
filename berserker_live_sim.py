@@ -1,60 +1,64 @@
 #!/usr/bin/env python3
 """
-berserker_live_sim.py — Berserker V4 replay engine (live-path replica).
+berserker_live_sim.py — Berserker V4 replay engine (Trading-bot main.py V10.68).
 
-This module is pure: no database, no Alpaca, no Telegram. The Sunday runner
-in nexus_analyzer_1min_railway.py feeds it bars and writes fingerprints.
+Pure module: no database, no Alpaca, no Telegram. nexus_analyzer_1min_railway.py
+feeds it one-minute bars. Checked against main.py V10.68 (get_signals,
+manage_exits, is_position_still_running, compute_regime_score,
+get_spy_regime_and_momentum, get_dynamic_tp, get_sorted_symbols).
 
-Live path this replicates
--------------------------
-Trading-bot (leem251316-eng/Trading-bot, main.py V10.68) is a private repo
-and was not readable from the analyzer environment. The exit state machine
-follows the control replica in trail_prereg_sim.py, which was written
-against main.py V10.67 (TP / SL / base trail / ratchet / 20-minute arm /
-EOD 14:58 CT carry) and checked against live fills. Entry clocks follow
-the V10.61 opening wall and the V10.68 band_0905 prereg. Signal math for
-RSI, MACD, the 20-bar short MA, sector health, and the first four
-confluence legs is the V3.3 copy of get_signals() from main.py V10.19.
-Where V10.68 is stricter than that copy, the constants below say so.
+What the bars can match
+-----------------------
+RSI(9) Wilder, MACD 12/26/9, price above the 20-sample average, confluence
+legs 1-4, recipe avoid-hours/days, the 08:30-09:00 and 09:05-09:30 entry
+walls (per symbol, so a later name can still fill), buys stopped at 14:55,
+SPY regime (last vs 20-sample average; BEAR caps the book at 1), the SPY
+momentum gate (not falling faster than -0.3% over the lookback), VIX
+block at >= 25 and the extreme cap at >= 30, regime shutdown only at
+score >= 4, 48h earnings blackout, 30-minute cooldown, one new entry per
+step, EOD at 14:58 (green AND last > the print 5 samples back, else flat;
+earnings names always flat), TP / SL / 20-minute trail / 0.5% ratchet.
 
-Exit (evaluated on each RTH minute bar, after the entry minute):
-  * Hard take-profit at the recipe TP (usually 1.5% above the fill).
-  * Hard stop at the recipe SL (1.0%, SPCX 1.5%). A gap through the stop
-    fills at the open, not at the stop. That is the overnight gap.
-  * Base trail: 1.5% off the prior peak, only after 20 minutes held.
-  * Ratchet: 0.5% trail when *current* profit is already >= +1.5%.
-    Take-profit is checked first and uses the same +1.5% level, so the
-    ratchet almost never fires. The width selector is still live.
-  * EOD at 14:58 CT (close-2). Flat or red, or green but not higher than
-    ~3 minutes ago, is sold. Green and still rising carries overnight.
-    The next RTH open is a real fill, so the gap is in the P&L.
+What the bars cannot match, and how this replay treats it
+---------------------------------------------------------
+Live samples last-trade prints about every 30s and keeps 50 of them.
+This replay only has 1-minute closes, kept to the same 50-sample deque.
+Indicator math matches; the clock each sample covers does not.
 
-Within a bar the order matches the V10.67 replica: open gap, then the low
-against the stop and the trail (prior peak), then the high against TP.
-A low that hits the trail before the high tags TP is a trail, not a winner.
+The fifth confluence leg is nexus_client.analyst_scores() >= 1. That HTTP
+service has no historical tape. A missing score does not block (the live
+try/except). This replay passes score 0 on every bar, so the leg never
+fires. Legs 1-4 still qualify a buy. Session VWAP is not a leg.
 
-Entry gates (all must pass; scan is SYMBOLS order, one fill per minute):
-  RSI(9) > 62, or > 72 for a TRUMP_THEME name when sector health is WEAK;
-  MACD line above signal; price above the 20-bar short MA; at least one
-  of five confluence legs; recipe avoid-hours/days; 08:30–09:00 CT opening
-  wall; 09:05–09:30 CT band_0905; no buys at or after 14:55 CT (close-5);
-  SPY 5-bar momentum > 0; VIX proxy > 25 blocks; regime score >= 3 blocks;
-  48h earnings blackout; 30-minute per-symbol cooldown; at most 3 open
-  positions.
+Regime points for the Berserker circuit breaker, the Scanner circuit
+breaker, and crypto fear-and-greed are account and service state. They
+default off, so a bar-only score is 0-2 (SPY below its average, VIX > 25)
+and never reaches the shutdown threshold of 4. Score 3 would only scale
+notional; this book is one unit per trade, so percent P&L does not change.
 
-Costs are a per-symbol half-spread on the entry and on the exit, not a
-flat 5 bps. Quote samples win, then the Roll estimator on closes, then
-FALLBACK_HALF_SPREAD (wider for SPCX, GEO, CXW, CLSK, MARA, MSTR, SMCI).
+Win Follower HOT/bench order and /focus (10-minute cooldown) need the live
+fingerprint table. With those off, live sorts by recently_traded. This
+replay does that: a name not in the last 10 exits keeps SYMBOLS order and
+scans first.
 
-Walk-forward: one continuous book. An entry before the 75% timestamp is
-in-sample. An entry at or after it is the holdout. Holdout rows are not
-written (see rows_for_db). hold_time_min is clock minutes between the
-entry and exit timestamps, including the overnight gap.
+Dynamic TP (2.0% / 2.5% when a bucket has >= 30 winner MFEs) reads the same
+fingerprint table this job would write. In-sample entries use the recipe
+TP. At the holdout boundary the replay freezes winner-MFE stats from
+in-sample trades already closed and applies get_dynamic_tp only to holdout
+entries. Live's online mix of every bt_ row is not copied.
 
-Fingerprints use trade_id prefix bt_v4_. Live BerserkerMemory.run_analysis
-includes trade_id LIKE 'bt_%', so these rows still feed that gate. The
-v4 tag is what a later Trading-bot change can require in order to ignore
-pre-v4 rows. This repo does not modify Trading-bot.
+VIX is still the SPY realized-vol proxy (live uses yfinance ^VIX). The
+NYSE holiday and early-close calendar is not in the bars (weekday
+08:30-15:00, fixed 14:55 / 14:58). strategy_recipes.json can override
+TP/SL at boot; hours and days stay the hardcoded recipes, which match.
+The win-rate skip inside execute_trade is not applied: it reads production
+buckets, and applying it here would be circular.
+
+Exit path inside a minute bar: gap at the open, then the low against the
+stop and the trail off the prior peak, then the high against TP. Live
+checks one last price at a time and updates the peak before the trail, so
+a new high cannot trail on the same print. The prior-peak-then-low order
+is the one-minute analogue.
 """
 
 from __future__ import annotations
@@ -83,9 +87,15 @@ RSI_BUY_TRUMP_WEAK = 72.0
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-SHORT_MA_BARS = 20          # "price above the short MA"
+SHORT_MA_BARS = 20          # price > sum(last 20) / 20
+SECTOR_LOOKBACK = 15        # live: last print < the print 15 samples ago
 CONFLUENCE_MIN = 1
-WARMUP_BARS = 50
+# Live price_history maxlen is 50 prints. get_signals itself fires once
+# len >= max(RSI_PERIOD+1, 26, MACD_SLOW+MACD_SIGNAL) == 35. WARMUP_BARS
+# is that gate (tests patch it). HIST_MAXLEN is the deque.
+HIST_MAXLEN = 50
+SIGNAL_MIN_BARS = max(RSI_PERIOD + 1, 26, MACD_SLOW + MACD_SIGNAL)
+WARMUP_BARS = SIGNAL_MIN_BARS
 
 TAKE_PROFIT_PCT = 0.015
 STOP_LOSS_PCT = 0.010
@@ -97,10 +107,18 @@ MIN_HOLD_MINUTES = 20.0
 COOLDOWN_MINUTES = 30.0
 MAX_POSITIONS = 3
 
-VIX_BLOCK_THRESHOLD = 25.0
+VIX_BLOCK_THRESHOLD = 25.0     # block new entries when VIX >= 25
+VIX_EXTREME_THRESHOLD = 30.0   # also cap the book at 1 (redundant with the block)
+SPY_MOMENTUM_GATE = -0.3       # percent; block only if SPY is falling faster
+SPY_BEAR_MAX_POS = 1
+SPY_MOM_LOOKBACK = 60          # live asks for 60 prints; the deque holds 50
 EARNINGS_BUFFER_H = 48.0
-REGIME_BLOCK_SCORE = 3
-HOLDOUT_FRACTION = 0.75     # first 75% in-sample, last 25% true holdout
+REGIME_BLOCK_SCORE = 4         # shutdown. Score 3 does not block Berserker.
+HOLDOUT_FRACTION = 0.75        # first 75% in-sample, last 25% true holdout
+DYN_TP_MIN_WINNERS = 30
+DYN_TP_HI = 0.025
+DYN_TP_MID = 0.020
+MAX_RECENT = 10                # recently_traded rotation depth
 
 # Clock minutes, America/Chicago. RTH is 08:30–15:00 CT (09:30–16:00 ET).
 RTH_OPEN = 8 * 60 + 30
@@ -146,7 +164,7 @@ CONFLUENCE_LEGS = (
     "ema9_above_ema21",
     "macd_hist_accel",
     "bouncing",
-    "above_session_vwap",
+    "analyst_score",
 )
 
 
@@ -226,36 +244,28 @@ def regime_score(
     *,
     vix: float,
     spy_above_short_ma: bool,
-    spy_momentum: float,
-    sector_health: str,
-    qqq_above_short_ma: bool,
-    spy_rsi: float,
+    berserker_cb: bool = False,
+    scanner_cb: bool = False,
+    fear_greed: Optional[float] = None,
 ) -> int:
-    """Bar-visible regime score. Entries block at REGIME_BLOCK_SCORE (3).
+    """V10.68 compute_regime_score. One point each, shutdown at 4.
 
-    Live also adds circuit-breaker and consecutive-stop state. Those are
-    account facts, not in the bars, so this score under-blocks versus a
-    session that has already tripped the breaker. Weights:
-      +2  VIX proxy above 25
-      +1  SPY under its short MA
-      +1  SPY 5-bar momentum <= 0
-      +1  sector health WEAK
-      +1  QQQ under its short MA
-      +1  SPY RSI(9) under 40
-    The hard VIX>25 entry block is separate and still applies at +2.
+    +1 Berserker circuit breaker, +1 Scanner circuit breaker,
+    +1 crypto fear-and-greed < 25, +1 SPY below its 20-sample average,
+    +1 VIX > 25 (strict). Score 3 scales size and still allows Berserker.
+    The three service flags default off because a bar replay does not
+    have them. SPY-bear plus VIX>25 is therefore 2, under the block.
     """
     score = 0
-    if vix > VIX_BLOCK_THRESHOLD:
-        score += 2
+    if berserker_cb:
+        score += 1
+    if scanner_cb:
+        score += 1
+    if fear_greed is not None and float(fear_greed) < 25:
+        score += 1
     if not spy_above_short_ma:
         score += 1
-    if spy_momentum <= 0:
-        score += 1
-    if sector_health == "WEAK":
-        score += 1
-    if not qqq_above_short_ma:
-        score += 1
-    if spy_rsi < 40:
+    if vix > VIX_BLOCK_THRESHOLD:
         score += 1
     return score
 
@@ -303,27 +313,34 @@ def compute_macd(prices: Sequence[float]):
 
 def compute_sector_health(trump_prices: Dict[str, Sequence[float]],
                           trump_theme: Sequence[str]) -> str:
-    """WEAK when a majority of the TRUMP basket is under its 20-bar average."""
+    """WEAK when a majority of TRUMP_THEME printed lower than 15 samples ago.
+
+    Names with a short tape do not count as down. The denominator is the
+    full theme, matching update_sector_health. On these bars, 15 samples
+    is 15 minutes; live's 15 prints are about 7.5 minutes.
+    """
+    theme = list(trump_theme)
     down = 0
-    seen = 0
-    for sym in trump_theme:
-        prices = trump_prices.get(sym)
-        if prices and len(prices) >= SHORT_MA_BARS:
-            seen += 1
-            window = list(prices)[-SHORT_MA_BARS:]
-            ma = sum(window) / SHORT_MA_BARS
-            if window[-1] < ma:
-                down += 1
-    if seen == 0:
+    for sym in theme:
+        prices = list(trump_prices.get(sym) or [])
+        if len(prices) >= SECTOR_LOOKBACK and prices[-1] < prices[-SECTOR_LOOKBACK]:
+            down += 1
+    if not theme:
         return "STRONG"
-    return "WEAK" if down > len(list(trump_theme)) / 2 else "STRONG"
+    return "WEAK" if down > len(theme) / 2 else "STRONG"
 
 
-def confluence_count(prices: Sequence[float], macd_hist, session_vwap: Optional[float]) -> int:
-    """How many of the five confluence legs are true. Entry needs >= 1."""
-    prices_l = list(prices)
+def confluence_count(prices: Sequence[float], macd_hist,
+                     analyst_score: int = 0) -> int:
+    """How many of the five V10.68 confluence legs are true. Entry needs >= 1.
+
+    Leg 5 is the analyst-service score. Pass 0 when the service has no
+    reading for this bar (the live failure path: agreement can add a leg,
+    absence never blocks).
+    """
+    prices_l = list(prices)[-HIST_MAXLEN:]
     legs = 0
-    if len(prices_l) >= 6:
+    if len(prices_l) >= 10:
         mom_recent = prices_l[-1] - prices_l[-6]
         mom_prior = prices_l[-6] - prices_l[-11] if len(prices_l) >= 11 else 0.0
         if mom_recent > 0 and mom_recent > mom_prior:
@@ -339,38 +356,49 @@ def confluence_count(prices: Sequence[float], macd_hist, session_vwap: Optional[
             legs += 1
     if len(prices_l) >= 4 and prices_l[-1] > prices_l[-4]:
         legs += 1
-    if session_vwap is not None and session_vwap > 0 and prices_l[-1] > session_vwap:
-        legs += 1
+    try:
+        if int(analyst_score) >= 1:
+            legs += 1
+    except (TypeError, ValueError):
+        pass
     return legs
 
 
 def get_signals_bt(prices: Sequence[float], sector_health: str, is_trump: bool,
-                   session_vwap: Optional[float] = None) -> dict:
-    """Base gates plus 1-of-5 confluence. buy is False until warmup is done."""
-    if len(prices) < max(RSI_PERIOD + 1, MACD_SLOW + MACD_SIGNAL):
+                   analyst_score: int = 0) -> dict:
+    """Base gates plus 1-of-5 confluence. The fifth leg is the analyst score.
+
+    The price window is the last HIST_MAXLEN samples, matching the live
+    deque. analyst_score defaults to 0 (service absent).
+    """
+    prices_l = list(prices)[-HIST_MAXLEN:]
+    if len(prices_l) < SIGNAL_MIN_BARS:
         return {"buy": False}
-    price = list(prices)[-1]
-    rsi = compute_rsi(prices)
-    macd_val, macd_sig, macd_hist = compute_macd(prices)
+    price = prices_l[-1]
+    rsi = compute_rsi(prices_l)
+    macd_val, macd_sig, macd_hist = compute_macd(prices_l)
     macd_bullish = bool(macd_val > macd_sig)
-    ma = sum(list(prices)[-SHORT_MA_BARS:]) / SHORT_MA_BARS
+    ma = sum(prices_l[-SHORT_MA_BARS:]) / SHORT_MA_BARS
     above_ma = price > ma
     rsi_need = required_rsi(is_trump, sector_health)
-    if not (rsi > rsi_need and macd_bullish and above_ma):
+    rsi_out = round(rsi, 2) if rsi == rsi else 50.0
+    if not (rsi == rsi and rsi > rsi_need and macd_bullish and above_ma):
         return {
             "buy": False,
-            "rsi": round(rsi, 2) if rsi == rsi else 50.0,
+            "rsi": rsi_out,
             "macd_bull": macd_bullish,
             "above_ma": above_ma,
             "confluence": 0,
+            "analyst_score": int(analyst_score or 0),
         }
-    legs = confluence_count(prices, macd_hist, session_vwap)
+    legs = confluence_count(prices_l, macd_hist, analyst_score)
     return {
         "buy": legs >= CONFLUENCE_MIN,
         "rsi": round(rsi, 2),
         "macd_bull": macd_bullish,
         "above_ma": above_ma,
         "confluence": legs,
+        "analyst_score": int(analyst_score or 0),
     }
 
 
@@ -389,31 +417,144 @@ def vix_from_spy(closes: Sequence[float], prev_smooth: float) -> float:
     return prev_smooth * 0.7 + raw * 0.3
 
 
+def _fingerprint_rsi(prices: Sequence[float]) -> float:
+    """Live _get_spy_context_for_fingerprint RSI: Wilder, period min(7, n), last 20."""
+    window = list(prices)[-20:]
+    if len(window) < 8:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(window)):
+        d = window[i] - window[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    period = min(7, len(gains))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+    if al == 0:
+        return 100.0
+    return round(100.0 - (100.0 / (1.0 + ag / al)), 2)
+
+
 def spy_context(closes: Sequence[float]) -> dict:
-    if len(closes) < SHORT_MA_BARS:
+    """SPY regime gate plus the separate fingerprint fields.
+
+    Regime and the momentum gate follow get_spy_regime_and_momentum.
+    With fewer than 20 samples live returns BULL and momentum_ok.
+    The lookback is min(60, n-1) on a deque of 50, so it never actually
+    sees 60 samples. These bars are 1 minute, not 30s prints.
+
+    bullish / rsi / momentum on the fingerprint are _get_spy_context_for_fingerprint:
+    last > average of up to 20, a 7-period Wilder on those 20, and the
+    5-sample percent return. They are not the entry gate.
+    """
+    prices = list(closes)[-HIST_MAXLEN:]
+    fp_rsi = _fingerprint_rsi(prices)
+    fp_mom = 0.0
+    if len(prices) >= 6 and prices[-6] > 0:
+        fp_mom = (prices[-1] - prices[-6]) / prices[-6] * 100.0
+    fp_bull = False
+    if len(prices) >= 8:
+        window = prices[-20:]
+        ma = sum(window) / len(window)
+        fp_bull = prices[-1] > ma
+    if len(prices) < SHORT_MA_BARS:
         return {
-            "above_ma": False,
-            "bullish": False,
-            "rsi": 50.0,
-            "momentum": 0.0,
+            "regime": "BULL",
+            "above_ma": True,
+            "momentum_ok": True,
+            "momentum_pct": 0.0,
+            "bullish": fp_bull,
+            "rsi": fp_rsi,
+            "momentum": float(fp_mom),
             "ready": False,
         }
-    prices = list(closes)
-    ma = sum(prices[-SHORT_MA_BARS:]) / SHORT_MA_BARS
-    above = prices[-1] > ma
-    rsi = compute_rsi(prices) if len(prices) > RSI_PERIOD else 50.0
-    if rsi != rsi:  # NaN
-        rsi = 50.0
-    mom = 0.0
-    if len(prices) >= 6 and prices[-6] > 0:
-        mom = (prices[-1] - prices[-6]) / prices[-6]
+    lookback = min(SPY_MOM_LOOKBACK, len(prices) - 1)
+    base = prices[-lookback]
+    mom_pct = (prices[-1] - base) / base * 100.0 if base > 0 else 0.0
+    ma20 = sum(prices[-SHORT_MA_BARS:]) / SHORT_MA_BARS
+    above = prices[-1] > ma20
     return {
+        "regime": "BULL" if above else "BEAR",
         "above_ma": above,
-        "bullish": above and mom > 0,
-        "rsi": float(rsi),
-        "momentum": float(mom),
+        "momentum_ok": mom_pct >= SPY_MOMENTUM_GATE,
+        "momentum_pct": float(mom_pct),
+        "bullish": fp_bull,
+        "rsi": fp_rsi,
+        "momentum": float(fp_mom),
         "ready": True,
     }
+
+
+def bucket_key(symbol: str, rsi: float, spy_bullish: bool,
+               sector_health: str, is_trump: bool, hour: int) -> str:
+    """BerserkerMemory._bucket_key. RSI splits at 72 and 62."""
+    sector = "TRUMP" if is_trump else "TECH"
+    if rsi > 72:
+        rsi_b = "rsi_hi"
+    elif rsi > 62:
+        rsi_b = "rsi_mid"
+    else:
+        rsi_b = "rsi_low"
+    spy_b = "spy_bull" if spy_bullish else "spy_bear"
+    sec_b = sector_health or "STRONG"
+    if hour < 10:
+        hr_b = "hr_open"
+    elif hour < 13:
+        hr_b = "hr_mid"
+    else:
+        hr_b = "hr_late"
+    return f"{symbol}|{rsi_b}|{spy_b}|{sec_b}|{sector}|{hr_b}"
+
+
+def dynamic_tp(recipe_tp: float, winner_mfes: Sequence[float]) -> float:
+    """get_dynamic_tp. winner_mfes are percent points (1.5 means +1.5%).
+
+    >= 30 winners, avg MFE >= 3 and at least 15% of them reached 3 → 2.5%.
+    Else avg MFE >= 2 and at least 25% reached 2 → 2.0%. Never below recipe.
+    """
+    n = len(winner_mfes)
+    if n < DYN_TP_MIN_WINNERS:
+        return float(recipe_tp)
+    avg = sum(winner_mfes) / n
+    pct_3 = sum(1 for m in winner_mfes if m >= 3.0) / n
+    pct_2 = sum(1 for m in winner_mfes if m >= 2.0) / n
+    if avg >= 3.0 and pct_3 >= 0.15:
+        dyn = DYN_TP_HI
+    elif avg >= 2.0 and pct_2 >= 0.25:
+        dyn = DYN_TP_MID
+    else:
+        return float(recipe_tp)
+    return max(dyn, float(recipe_tp))
+
+
+def rotation_priority(symbol: str, recently_traded: Sequence[str]) -> int:
+    """get_symbol_priority: index in recently_traded + 1, else 0."""
+    try:
+        return list(recently_traded).index(symbol) + 1
+    except ValueError:
+        return 0
+
+
+def scan_order(symbols: Sequence[str], recently_traded: Sequence[str],
+               held: Iterable[str], cooling: Iterable[str]) -> List[str]:
+    """get_sorted_symbols with Win Follower and /focus off.
+
+    Held, cooling, and (live-only) benched names are dropped. Everyone else
+    sorts by rotation priority. Priority 0 keeps SYMBOLS order.
+    """
+    skip = set(held) | set(cooling)
+    available = [s for s in symbols if s not in skip]
+    return sorted(available, key=lambda s: rotation_priority(s, recently_traded))
+
+
+def mark_recently_traded(recently: List[str], symbol: str) -> None:
+    if symbol in recently:
+        recently.remove(symbol)
+    recently.insert(0, symbol)
+    del recently[MAX_RECENT:]
 
 
 def roll_half_spread(closes: Sequence[float]) -> Optional[float]:
@@ -505,7 +646,9 @@ def _finish(state: dict, reason: str, exit_raw: float, ts: datetime) -> dict:
 
 
 def step_position(state: dict, ts: datetime, open_: float, high: float,
-                  low: float, close: float) -> Optional[dict]:
+                  low: float, close: float, *,
+                  earnings_blocked: bool = False,
+                  tape: Optional[Sequence[float]] = None) -> Optional[dict]:
     """Advance one open position by one RTH bar.
 
     Returns an exit dict, or None if the position stays open (including
@@ -556,12 +699,18 @@ def step_position(state: dict, ts: datetime, open_: float, high: float,
 
     state["closes"].append(float(close))
 
-    # 4. Close-2. Carry only when the position is green on the fill and
-    #    the close is higher than the close ~3 minutes ago.
+    # 4. Close-2. Live carries only when broker PnL is green AND the symbol
+    #    tape's last print is above the print 5 samples back (index -6),
+    #    which needs at least 6 prints. A short tape does not carry.
+    #    Earnings-blackout names are sold even when that test would carry.
+    #    `tape` is the symbol's running closes (live price_history). When
+    #    the caller does not pass one, the closes since entry are the tape.
     if ct.hour * 60 + ct.minute >= EOD_MINUTE:
+        if earnings_blocked:
+            return _finish(state, "eod-earnings-close", close, ts)
         profit = close / entry_fill - 1.0
-        closes = state["closes"]
-        rising = len(closes) >= 4 and close > closes[-4]
+        series = list(tape) if tape is not None else state["closes"]
+        rising = len(series) >= 6 and float(series[-1]) > float(series[-6])
         if profit > 0 and rising:
             state["skip_date"] = ct.date()
             state["carried"] = True
@@ -646,9 +795,10 @@ def replay(
     """Continuous replay. validate_mode=True returns only holdout entries.
 
     all_bars maps symbol -> DataFrame or list of (ts, o, h, l, c[, v]).
-    Include SPY and QQQ. Scan order is `symbols` (live universe order).
-    signal_fn(symbol, prices, sector_health, is_trump, session_vwap) may
-    replace get_signals_bt in tests.
+    Include SPY (QQQ is ingested when present and is not a gate).
+    signal_fn(symbol, prices, sector_health, is_trump, analyst_score) may
+    replace get_signals_bt in tests. analyst_score is 0: the analyst
+    service is not on the tape.
     """
     earnings_map = earnings_map or {}
     recipes = recipes or {}
@@ -669,31 +819,18 @@ def replay(
         costs = resolve_costs(symbols, closes, quote_half=quote_half)
 
     price_hist: Dict[str, deque] = {
-        s: deque(maxlen=120) for s in list(symbols) + ["SPY", "QQQ"]
+        s: deque(maxlen=HIST_MAXLEN) for s in list(symbols) + ["SPY", "QQQ"]
     }
-    vwap_state: Dict[str, tuple] = {s: (None, 0.0, 0.0) for s in symbols}
     in_pos = {s: False for s in symbols}
     pos: Dict[str, dict] = {}
     last_exit: Dict[str, Optional[datetime]] = {s: None for s in symbols}
     entry_meta: Dict[str, dict] = {}
+    recently: List[str] = []
     vix_smooth = 15.0
     trades: List[dict] = []
-
-    def session_vwap(sym: str, ts: datetime, high: float, low: float,
-                     close: float, volume: float) -> Optional[float]:
-        day, cum_pv, cum_v = vwap_state[sym]
-        ct_day = to_ct(ts).date()
-        if day != ct_day:
-            cum_pv, cum_v = 0.0, 0.0
-            day = ct_day
-        if volume > 0:
-            typical = (high + low + close) / 3.0
-            cum_pv += typical * volume
-            cum_v += volume
-        vwap_state[sym] = (day, cum_pv, cum_v)
-        if cum_v <= 0:
-            return None
-        return cum_pv / cum_v
+    # Frozen at the first holdout timestamp, from in-sample winners already
+    # closed. Holdout entries read it; in-sample entries stay on recipe TP.
+    frozen_mfes: Optional[Dict[str, List[float]]] = None
 
     def close_trade(sym: str, event: dict, sector_health: str):
         st = pos[sym]
@@ -730,6 +867,8 @@ def replay(
             "validate": holdout,
             "holdout": holdout,
             "tp_used": st["tp"],
+            "recipe_tp": meta.get("recipe_tp", st["tp"]),
+            "bucket_key": meta.get("bucket_key"),
             "sl_used": st["sl"],
             "entry_ts_ep": int(st["entry_ts"].timestamp()),
             "exit_ts_ep": int(event["ts"].timestamp()),
@@ -744,6 +883,7 @@ def replay(
         pos.pop(sym, None)
         entry_meta.pop(sym, None)
         last_exit[sym] = event["ts"]
+        mark_recently_traded(recently, sym)
 
     for epoch in timeline:
         # Ingest every symbol that printed, then manage exits, then one entry.
@@ -755,8 +895,6 @@ def replay(
             ts, o, h, l, c, v = bar
             price_hist[sym].append(c)
             printed[sym] = bar
-            if sym in vwap_state:
-                session_vwap(sym, ts, h, l, c, v)
 
         if not printed:
             continue
@@ -766,18 +904,19 @@ def replay(
 
         vix_smooth = vix_from_spy(price_hist["SPY"], vix_smooth)
         spy = spy_context(price_hist["SPY"])
-        qqq = spy_context(price_hist["QQQ"])
         sector = compute_sector_health(
             {s: price_hist[s] for s in trump_theme}, trump_theme
         )
         score = regime_score(
             vix=vix_smooth,
             spy_above_short_ma=spy["above_ma"],
-            spy_momentum=spy["momentum"],
-            sector_health=sector,
-            qqq_above_short_ma=qqq["above_ma"],
-            spy_rsi=spy["rsi"],
         )
+        # BEAR cuts the book to 1. VIX >= 30 does too, and VIX >= 25
+        # already refuses every new entry, so the extreme cap never
+        # admits a trade the block would have refused.
+        max_pos = SPY_BEAR_MAX_POS if spy["regime"] == "BEAR" else MAX_POSITIONS
+        if vix_smooth >= VIX_EXTREME_THRESHOLD:
+            max_pos = min(max_pos, 1)
 
         for sym in symbols:
             if not in_pos[sym]:
@@ -791,28 +930,54 @@ def replay(
             if bar is None:
                 continue
             ts, o, h, l, c, _v = bar
-            event = step_position(pos[sym], ts, o, h, l, c)
+            event = step_position(
+                pos[sym], ts, o, h, l, c,
+                earnings_blocked=is_earnings_blocked(ts, earnings_map.get(sym, [])),
+                tape=list(price_hist[sym]),
+            )
             if event:
                 close_trade(sym, event, sector)
 
-        # One new entry per minute, live scan order, after exits free a slot.
-        if sum(1 for s in symbols if in_pos[s]) >= MAX_POSITIONS:
+        if frozen_mfes is None and epoch >= cutoff:
+            frozen_mfes = {}
+            for closed in trades:
+                if closed.get("holdout") or not closed.get("won"):
+                    continue
+                key = closed.get("bucket_key")
+                if not key:
+                    continue
+                frozen_mfes.setdefault(key, []).append(float(closed["mfe"]))
+
+        # One new entry per step, after exits free a slot.
+        open_n = sum(1 for s in symbols if in_pos[s])
+        if open_n >= max_pos:
             continue
-        block = clock_entry_block(minute)
-        if block:
+        if minute < RTH_OPEN or minute >= RTH_CLOSE or minute >= ENTRY_CUTOFF:
             continue
-        if vix_smooth > VIX_BLOCK_THRESHOLD:
+        if vix_smooth >= VIX_BLOCK_THRESHOLD:
             continue
-        if not spy["ready"] or spy["momentum"] <= 0:
+        if not spy["momentum_ok"]:
             continue
         if score >= REGIME_BLOCK_SCORE:
             continue
 
+        cooling = []
         for sym in symbols:
-            if in_pos[sym]:
+            if last_exit[sym] is None:
                 continue
-            if sum(1 for s in symbols if in_pos[s]) >= MAX_POSITIONS:
+            gap_min = (ts0 - last_exit[sym]).total_seconds() / 60.0
+            if gap_min < COOLDOWN_MINUTES:
+                cooling.append(sym)
+        held = [s for s in symbols if in_pos[s]]
+        for sym in scan_order(symbols, recently, held, cooling):
+            if sum(1 for s in symbols if in_pos[s]) >= max_pos:
                 break
+            # Opening wall and band_0905 skip this name and keep scanning.
+            # Both windows are clock-wide, so in practice nobody fills.
+            if RTH_OPEN <= minute < OPENING_WALL_END:
+                continue
+            if BAND_0905_LO <= minute < BAND_0905_HI:
+                continue
             bar = printed.get(sym)
             if bar is None:
                 continue
@@ -823,35 +988,37 @@ def replay(
                 continue
             if ct.weekday() in recipe.get("avoid_days", []):
                 continue
-            if last_exit[sym] is not None:
-                gap_min = (ts0 - last_exit[sym]).total_seconds() / 60.0
-                if gap_min < COOLDOWN_MINUTES:
-                    continue
             if is_earnings_blocked(ts0, earnings_map.get(sym, [])):
                 continue
             ts, o, h, l, c, v = bar
-            _day, cum_pv, cum_v = vwap_state[sym]
-            vwap = (cum_pv / cum_v) if cum_v > 0 else None
             is_trump = sym in trump_theme
+            analyst_score = 0
             if signal_fn is not None:
-                sig = signal_fn(sym, price_hist[sym], sector, is_trump, vwap)
+                sig = signal_fn(sym, price_hist[sym], sector, is_trump, analyst_score)
             else:
-                sig = get_signals_bt(price_hist[sym], sector, is_trump, vwap)
+                sig = get_signals_bt(price_hist[sym], sector, is_trump, analyst_score)
             if not sig.get("buy"):
                 continue
             half, _source = costs.get(sym, (FALLBACK_HALF_SPREAD_DEFAULT, "table"))
-            opened = new_position(
-                ts, c, half, tp_pct_for(sym, recipes), sl_pct_for(sym, recipes)
-            )
+            recipe_tp = tp_pct_for(sym, recipes)
+            rsi_now = float(sig.get("rsi", 50.0))
+            key = bucket_key(sym, rsi_now, bool(spy["bullish"]), sector, is_trump, ct.hour)
+            if epoch >= cutoff and frozen_mfes is not None:
+                tp = dynamic_tp(recipe_tp, frozen_mfes.get(key, []))
+            else:
+                tp = recipe_tp
+            opened = new_position(ts, c, half, tp, sl_pct_for(sym, recipes))
             in_pos[sym] = True
             pos[sym] = opened
             entry_meta[sym] = {
-                "rsi": sig.get("rsi", 50.0),
+                "rsi": rsi_now,
                 "spy_bullish": spy["bullish"],
                 "spy_rsi": spy["rsi"],
                 "spy_momentum": spy["momentum"],
                 "sector_health": sector,
                 "vix": round(vix_smooth, 1),
+                "bucket_key": key,
+                "recipe_tp": recipe_tp,
             }
             break  # one new entry per scan step
 
