@@ -97,6 +97,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, Adjustment
 
+import backtest_safety
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SCANNER-BT] %(message)s",
@@ -398,9 +400,12 @@ def replay_scanner(all_bars: dict, validate_mode: bool = False,
 
 # ── DB write ───────────────────────────────────────────────────────────────────
 def write_fingerprints(trades: List[Dict], dry_run: bool = False) -> int:
-    if dry_run:
-        log.info(f"[DRY RUN] Would write {len(trades)} fingerprints")
-        return len(trades)
+    if dry_run or not backtest_safety.writes_enabled():
+        log.info(
+            f"[DRY RUN] Not deleting or inserting. "
+            f"Scanner rows left untouched: {len(trades)}"
+        )
+        return 0
     if not DATABASE_URL:
         log.warning("No DATABASE_URL -- skipping DB write")
         return 0
@@ -484,6 +489,9 @@ def run_pattern_analysis() -> Tuple[int, float]:
     """Mirrors ScannerMemory.run_analysis() in scanner.py -- reads all
     completed fingerprints (backtest + any live), rebuilds scanner_pattern_
     stats bucket-by-bucket. Returns (bucket_count, overall_win_rate)."""
+    if not backtest_safety.writes_enabled():
+        log.info("DRY RUN: skipping pattern analysis")
+        return 0, 0.0
     if not DATABASE_URL:
         return 0, 0.0
     conn = psycopg2.connect(DATABASE_URL)
@@ -590,6 +598,7 @@ def main():
     parser.add_argument("--days", type=int, default=730)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    dry_run = backtest_safety.dry_run(args.dry_run)
 
     log.info("=" * 60)
     log.info("NEXUS SCANNER BACKTESTER V1.1")
@@ -603,6 +612,7 @@ def main():
 
     t0 = time.time()
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"🔍 SCANNER BACKTESTER V1.1 STARTING\n"
         f"Symbols: {len(SCANNER_UNIVERSE)} | Days: {args.days}\n"
         f"Signal engine: scanner.py V2.4 exact replica\n"
@@ -612,7 +622,10 @@ def main():
     all_bars = fetch_all_bars(args.days)
     if "SPY" not in all_bars:
         log.error("SPY fetch failed -- cannot proceed")
-        send_alert("❌ SCANNER BACKTESTER FAILED — SPY bars unavailable")
+        send_alert(
+            f"{backtest_safety.banner(not dry_run)}"
+            "❌ SCANNER BACKTESTER FAILED — SPY bars unavailable"
+        )
         sys.exit(1)
 
     # Full training replay
@@ -633,9 +646,9 @@ def main():
     # sample for seeding pattern memory -- same convention as Berserker/
     # Phase4 backtesters, which write training trades, not validation trades)
     log.info(f"Writing {len(train_trades)} training fingerprints to DB...")
-    write_fingerprints(train_trades, dry_run=args.dry_run)
+    write_fingerprints(train_trades, dry_run=dry_run)
 
-    if not args.dry_run:
+    if not dry_run:
         log.info("Running pattern analysis...")
         buckets, wr = run_pattern_analysis()
     else:
@@ -647,6 +660,7 @@ def main():
     train_wr = (sum(1 for t in train_trades if t["won"]) / len(train_trades) * 100) if train_trades else 0
     val_wr   = (sum(1 for t in val_trades if t["won"]) / len(val_trades) * 100) if val_trades else 0
     send_alert(
+        f"{backtest_safety.banner(not dry_run)}"
         f"✅ SCANNER BACKTESTER V1.1 COMPLETE\n"
         f"──────────────────\n"
         f"Training: {len(train_trades)} trades | {train_wr:.1f}% WR\n"
