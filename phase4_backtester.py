@@ -125,7 +125,6 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 
-import pandas as pd
 import psycopg2
 import psycopg2.extras
 import requests
@@ -136,6 +135,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, Adjustment
 
 import backtest_safety
+import fast_indicators
 
 logging.basicConfig(
     level=logging.INFO,
@@ -291,42 +291,28 @@ def get_hour_cdt(dt: datetime) -> int:
 
 # ── Signal engine (exact copy from phase4.py V2.0) ───────────────────────────
 def compute_rsi(prices: list, period: int = 7) -> Optional[float]:
-    if len(prices) < period + 1:
+    val = fast_indicators.wilder_rsi(prices, period)
+    if val is None or not (val == val):
         return None
-    s        = pd.Series(prices, dtype=float)
-    delta    = s.diff()
-    gain     = delta.where(delta > 0, 0.0)
-    loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs  = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    val = float(rsi.iloc[-1])
-    return round(val, 2) if 0 < val < 100 else None
+    val = round(val, 2)
+    return val if 0 < val < 100 else None
 
 def compute_ema(prices: list, period: int) -> Optional[float]:
     if len(prices) < period:
         return None
-    s = pd.Series(prices)
-    return round(float(s.ewm(span=period, adjust=False).mean().iloc[-1]), 4)
+    return round(fast_indicators.ema_last(prices, period), 4)
 
 def compute_macd(prices: list) -> dict:
     if len(prices) < 26:
         return {"bullish": False}
-    s         = pd.Series(prices)
-    ema12     = s.ewm(span=12, adjust=False).mean()
-    ema26     = s.ewm(span=26, adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal    = macd_line.ewm(span=9, adjust=False).mean()
-    return {"bullish": float(macd_line.iloc[-1]) > float(signal.iloc[-1])}
+    macd_line, signal = fast_indicators.macd_last(prices)
+    return {"bullish": macd_line > signal}
 
 def compute_bollinger(prices: list, period: int = 20) -> dict:
     if len(prices) < period:
         return {"squeeze": False, "near_lower": False, "at_lower": False,
                 "far_below": False, "pct_b": 0.5}
-    s      = pd.Series(prices)
-    middle = float(s.rolling(period).mean().iloc[-1])
-    std    = float(s.rolling(period).std().iloc[-1])
+    middle, std = fast_indicators.bollinger_last(prices, period)
     upper  = middle + 2 * std
     lower  = middle - 2 * std
     price  = prices[-1]
@@ -343,19 +329,7 @@ def compute_bollinger(prices: list, period: int = 20) -> dict:
 def compute_stochrsi(prices: list, rsi_period: int = 14, stoch_period: int = 14) -> dict:
     if len(prices) < rsi_period + stoch_period + 5:
         return {"oversold": False, "overbought": False}
-    s        = pd.Series(prices, dtype=float)
-    delta    = s.diff()
-    gain     = delta.where(delta > 0, 0.0)
-    loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi_ser  = 100 - (100 / (1 + rs))
-    min_rsi  = rsi_ser.rolling(stoch_period).min()
-    max_rsi  = rsi_ser.rolling(stoch_period).max()
-    denom    = max_rsi - min_rsi
-    stoch_k  = ((rsi_ser - min_rsi) / denom * 100).where(denom != 0, 50)
-    k_val    = float(stoch_k.iloc[-1])
+    k_val = fast_indicators.stochrsi_last(prices, rsi_period, stoch_period)
     return {"oversold": k_val < 20, "overbought": k_val > 80}
 
 def compute_obv(prices: list, volumes: list) -> dict:
@@ -400,19 +374,10 @@ def compute_adx(prices: list, period: int = 14) -> float:
     if len(prices) < period * 2 + 5:
         return 25.0
     try:
-        s      = pd.Series(prices)
-        pos_dm = s.diff().clip(lower=0)
-        neg_dm = (-s.diff()).clip(lower=0)
-        tr     = s.diff().abs()
-        atr_s  = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-        pdm_s  = pos_dm.ewm(alpha=1.0 / period, adjust=False).mean()
-        ndm_s  = neg_dm.ewm(alpha=1.0 / period, adjust=False).mean()
-        pdi    = 100 * pdm_s / atr_s.replace(0, float("nan"))
-        ndi    = 100 * ndm_s / atr_s.replace(0, float("nan"))
-        dx     = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, float("nan"))
-        adx    = dx.ewm(alpha=1.0 / period, adjust=False).mean()
-        val    = float(adx.iloc[-1])
-        return round(val, 2) if not (pd.isna(val) or val < 0) else 25.0
+        val = fast_indicators.adx_last(prices, period)
+        if val != val or val < 0:
+            return 25.0
+        return round(val, 2)
     except Exception:
         return 25.0
 
@@ -682,6 +647,18 @@ class BotState:
         self.score_checks      = 0
 
 
+def _bar_lookup(df) -> dict:
+    """Timestamp -> (close, volume). Built once so the replay does not
+    pay DataFrame.loc on every symbol every minute."""
+    closes = df["close"].to_numpy()
+    vols = df["volume"].to_numpy() if "volume" in getattr(df, "columns", []) else None
+    out = {}
+    for i, ts in enumerate(df.index):
+        vol = float(vols[i]) if vols is not None else 0.0
+        out[ts] = (float(closes[i]), vol)
+    return out
+
+
 def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
     """
     Main replay engine. Iterates all timestamps, feeds bars to each bot,
@@ -693,6 +670,7 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
     for sym, df in all_bars.items():
         all_ts.update(df.index.tolist())
     all_ts = sorted(all_ts)
+    bars = {sym: _bar_lookup(df) for sym, df in all_bars.items()}
 
     total_bars = len(all_ts)
     validate_start_idx = int(total_bars * 0.75) if validate_mode else 0
@@ -717,9 +695,9 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
 
         # Update context (SPY, QQQ) -- V1.4: VIXY dropped
         for ctx_sym, hist in [("SPY", spy_hist), ("QQQ", qqq_hist)]:
-            if ctx_sym in all_bars and ts in all_bars[ctx_sym].index:
-                row = all_bars[ctx_sym].loc[ts]
-                hist.append(float(row["close"]))
+            hit = bars.get(ctx_sym, {}).get(ts)
+            if hit is not None:
+                hist.append(hit[0])
 
         # Skip if not market hours
         dt_utc = ts if hasattr(ts, "tzinfo") and ts.tzinfo else ts.to_pydatetime().replace(tzinfo=timezone.utc)
@@ -738,24 +716,24 @@ def replay_phase4(all_bars: dict, validate_mode: bool = False) -> list:
             cfg = bot.cfg
 
             # Update bull ETF prices
-            has_new_bar = sym in all_bars and ts in all_bars[sym].index
+            hit = bars.get(sym, {}).get(ts)
+            has_new_bar = hit is not None
             if has_new_bar:
-                row = all_bars[sym].loc[ts]
-                bot.prices.append(float(row["close"]))
-                bot.volumes.append(float(row.get("volume", 0)))
+                bot.prices.append(hit[0])
+                bot.volumes.append(hit[1])
 
             # Update bear ETF prices
             bear = bot.bear_pair
-            if bear in all_bars and ts in all_bars[bear].index:
-                row = all_bars[bear].loc[ts]
-                bot.bear_prices.append(float(row["close"]))
-                bot.bear_volumes.append(float(row.get("volume", 0)))
+            hit = bars.get(bear, {}).get(ts)
+            if hit is not None:
+                bot.bear_prices.append(hit[0])
+                bot.bear_volumes.append(hit[1])
 
             # Update underlying prices
             und = cfg["underlying"]
-            if und in all_bars and ts in all_bars[und].index:
-                row = all_bars[und].loc[ts]
-                bot.und_prices.append(float(row["close"]))
+            hit = bars.get(und, {}).get(ts)
+            if hit is not None:
+                bot.und_prices.append(hit[0])
 
             if len(bot.prices) < WARMUP_BARS:
                 continue

@@ -537,6 +537,7 @@ def main():
         f"Symbols: {len(SYMBOLS)} | Days: {args.days}\n"
         f"Live-path exits (TP/SL/trail/EOD carry) | per-symbol costs\n"
         f"Holdout is the last 25% of the book and is not written\n"
+        f"Research (not written): carry-all overnight, drop-bottom half\n"
         f"ETA: ~30-45 min"
     )
 
@@ -583,6 +584,42 @@ def main():
         ))
         gates = sim.evaluate_gates(sim.summarize(holdout))
 
+    # Research only. Same bars, costs, and earnings as the baseline.
+    # Neither book is passed to write_fingerprints.
+    log.info(
+        "Research carry-all: same entry gates; at 14:58 every non-earnings "
+        "position is carried. A carried name still occupies a slot, so "
+        "later entries can differ from the baseline. Not written."
+    )
+    carry_trades = sim.replay(
+        all_bars,
+        earnings_map,
+        symbols=list(SYMBOLS),
+        recipes=BERSERKER_RECIPES,
+        trump_theme=list(TRUMP_THEME),
+        costs=costs,
+        validate_mode=False,
+        eod_policy="carry_all",
+    )
+    carry_in, carry_out = sim.split_holdout(carry_trades)
+    print(sim.format_report(
+        carry_in,
+        label="RESEARCH CARRY-ALL IN-SAMPLE (not written)",
+        verdict=False,
+    ))
+    print(sim.format_report(
+        carry_out,
+        label="RESEARCH CARRY-ALL HOLDOUT (not written)",
+        verdict=True,
+    ))
+    log.info(
+        "Research drop-bottom: drop the worse half of symbols by in-sample "
+        "total P&L. Symbols with no in-sample trades are not kept. "
+        "Judged on holdout only. Not written."
+    )
+    print(sim.format_drop_bottom(trades))
+    _drop_rows, dropped_syms, kept_syms, _is_totals = sim.select_holdout_above_median(trades)
+
     written = 0
     if trades:
         log.info(
@@ -600,6 +637,12 @@ def main():
     ins = sim.summarize(in_sample)
     oos = sim.summarize(holdout)
     verdict = "SUPPRESSED" if gates is None else ("PASS" if gates["pass"] else "FAIL")
+    carry_oos = sim.summarize(carry_out)
+    carry_g = sim.evaluate_gates(carry_oos)
+    drop_oos = sim.summarize(_drop_rows)
+    drop_g = sim.evaluate_gates(drop_oos)
+    carry_verdict = "PASS" if carry_g["pass"] else "FAIL"
+    drop_verdict = "PASS" if drop_g["pass"] else "FAIL"
 
     send_alert(
         f"{backtest_safety.banner(not dry_run)}"
@@ -611,13 +654,21 @@ def main():
         f"PF {sim._fmt_pf(oos['profit_factor'])}  "
         f"DD {oos['max_drawdown']:.2f}pp\n"
         f"HOLDOUT VERDICT: {verdict}\n"
+        f"Carry-all holdout: {carry_oos['n']} avg {carry_oos['avg_pnl']:+.3f}%  "
+        f"{carry_verdict} (not written)\n"
+        f"Drop-bottom holdout: kept {len(kept_syms)} dropped {len(dropped_syms)}  "
+        f"{drop_oos['n']} avg {drop_oos['avg_pnl']:+.3f}%  "
+        f"{drop_verdict} (not written)\n"
         f"──────────────────\n"
-        f"Fingerprints written (bt_v4_, in-sample only): {written:,}\n"
+        f"Fingerprints written (bt_v4_, baseline in-sample only): {written:,}\n"
         f"Pattern buckets: {buckets}\n"
         f"bt_v4_ matches live LIKE 'bt_%' and feeds the win-rate gate.\n"
         f"Elapsed: {elapsed}s"
     )
-    log.info(f"DONE. wrote {written} | holdout {verdict} | {elapsed}s")
+    log.info(
+        f"DONE. wrote {written} | holdout {verdict} | "
+        f"carry-all {carry_verdict} | drop-bottom {drop_verdict} | {elapsed}s"
+    )
 
 
 if __name__ == "__main__":

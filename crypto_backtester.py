@@ -68,6 +68,8 @@ from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import backtest_safety
+import crypto_symbols
+import fast_indicators
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,9 +93,11 @@ ALL_PAIRS = [
     "POL-USDC", "SUI-USDC",
 ]
 
-ALPACA_SYM = {p: p.replace("-USDC", "/USD") for p in ALL_PAIRS}
-# Exceptions
-ALPACA_SYM["POL-USDC"] = "MATIC/USD"   # Alpaca uses MATIC for Polygon
+# Primary Alpaca symbol (first candidate). POL/USD is the post-rebrand
+# name; fetch_all_crypto_bars also tries MATIC/USD. SUI/USD is requested
+# once and skipped with a log line when Alpaca has no bars — it is not on
+# the March 2026 support list.
+ALPACA_SYM = {p: crypto_symbols.alpaca_symbol_candidates(p)[0] for p in ALL_PAIRS}
 
 # ── Recipes (matches crypto.py V5.0 exactly) ─────────────────────────────────
 RECIPES: Dict[str, Dict] = {
@@ -190,17 +194,9 @@ def get_utc_hour(ts) -> int:
 
 # ── Signal engine (matches crypto.py V5.0 tech/macro components) ─────────────
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    s        = pd.Series(closes, dtype=float)
-    delta    = s.diff()
-    gain     = delta.where(delta > 0, 0.0)
-    loss     = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs  = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    # Same Wilder seed as the old pandas ewm path, including a NaN when the
+    # window never prints a loss (callers must not use `rsi or 50`).
+    return fast_indicators.wilder_rsi(closes, period)
 
 def calc_multi_tf_rsi(closes_5m: list) -> dict:
     """Approximate multi-TF RSI from 5m bars (backtest proxy)."""
@@ -602,24 +598,33 @@ def fetch_all_crypto_bars(pairs: list, days: int) -> dict:
     log.info(f"Fetching {days}d 5-min crypto bars for {len(pairs)} pairs...")
 
     for pair in pairs:
-        alpaca_sym = ALPACA_SYM.get(pair, pair.replace("-USDC", "/USD"))
-        try:
-            bars = client.get_crypto_bars(CryptoBarsRequest(
-                symbol_or_symbols=alpaca_sym,
-                timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-                start=start_dt,
-                end=end_dt,
-            ))
-            df = bars.df
-            if hasattr(df.index, "levels"):
-                df = df.xs(alpaca_sym, level=0)
-            if not df.empty:
-                result[pair] = df
-                log.info(f"  {pair} ({alpaca_sym}): {len(df):,} bars")
-            else:
-                log.warning(f"  {pair}: EMPTY")
-        except Exception as e:
-            log.error(f"  {pair}: {e}")
+        candidates = crypto_symbols.alpaca_symbol_candidates(pair)
+        tried = []
+        found = None
+        for alpaca_sym in candidates:
+            tried.append(alpaca_sym)
+            try:
+                bars = client.get_crypto_bars(CryptoBarsRequest(
+                    symbol_or_symbols=alpaca_sym,
+                    timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+                    start=start_dt,
+                    end=end_dt,
+                ))
+                df = bars.df
+                if hasattr(df.index, "levels"):
+                    df = df.xs(alpaca_sym, level=0)
+                if not df.empty:
+                    found = (alpaca_sym, df)
+                    break
+                log.warning(f"  {pair} ({alpaca_sym}): EMPTY")
+            except Exception as e:
+                log.error(f"  {pair} ({alpaca_sym}): {e}")
+        if found is not None:
+            alpaca_sym, df = found
+            result[pair] = df
+            log.info(f"  {pair} ({alpaca_sym}): {len(df):,} bars")
+        else:
+            log.warning(crypto_symbols.empty_pair_message(pair, tried, days))
         time.sleep(0.3)
 
     log.info(f"Fetched {len(result)}/{len(pairs)} pairs")
@@ -1074,7 +1079,7 @@ def main():
 
     for pair in pairs:
         if pair not in all_bars:
-            log.warning(f"  {pair}: no data, skipping")
+            log.warning(f"  {pair}: SKIP — no bars loaded, not simulated")
             continue
 
         df = all_bars[pair]
