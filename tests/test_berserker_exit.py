@@ -699,5 +699,202 @@ class WriteSwitchTests(unittest.TestCase):
                 os.environ["BACKTEST_WRITE_DB"] = old
 
 
+class SymbolShareTests(unittest.TestCase):
+    def _trade(self, sym, pnl, exit_ts, reason="take-profit", overnight=False, thin=False):
+        return {
+            "symbol": sym,
+            "pnl_pct": pnl,
+            "exit_reason": reason,
+            "exit_ts_ep": exit_ts,
+            "overnight": overnight,
+            "thin": thin,
+            "holdout": False,
+            "trade_id": "bt_v4_abc",
+        }
+
+    def test_negative_total_reports_each_symbols_share_of_the_loss(self):
+        trades = [
+            self._trade("SMCI", -35.89, 1, reason="stop-loss", thin=True),
+            self._trade("AAPL", -1.0, 2, reason="stop-loss"),
+        ]
+        summary = sim.summarize(trades)
+        self.assertTrue(summary["symbol_share_scored"])
+        self.assertEqual(summary["max_symbol"], "SMCI")
+        self.assertAlmostEqual(summary["symbol_shares"]["SMCI"], -35.89 / -36.89)
+        self.assertAlmostEqual(summary["symbol_shares"]["AAPL"], -1.0 / -36.89)
+        self.assertGreater(summary["max_symbol_share"], 0.25)
+        gates = sim.evaluate_gates(summary)
+        self.assertFalse(gates["symbol_share"])
+        text = sim.format_report(trades, label="HOLDOUT", verdict=True)
+        self.assertIn("97.3%", text)
+        self.assertIn("VERDICT: FAIL", text)
+        self.assertNotIn("n/a", text)
+
+    def test_winner_inside_a_losing_book_prints_a_negative_share(self):
+        trades = [
+            self._trade("SMCI", -30.0, 1, reason="stop-loss", thin=True),
+            self._trade("AAPL", 5.0, 2),
+        ]
+        summary = sim.summarize(trades)
+        self.assertAlmostEqual(summary["symbol_shares"]["SMCI"], 1.2)
+        self.assertAlmostEqual(summary["symbol_shares"]["AAPL"], -0.2)
+        text = sim.format_report(trades, label="HOLDOUT", verdict=True)
+        self.assertIn("120.0%", text)
+        self.assertIn("-20.0%", text)
+        self.assertNotIn("n/a", text)
+
+    def test_near_zero_net_skips_the_share_gate(self):
+        trades = [
+            self._trade("AAPL", 1.0, 1),
+            self._trade("NVDA", -1.0, 2, reason="stop-loss"),
+        ]
+        summary = sim.summarize(trades)
+        self.assertFalse(summary["symbol_share_scored"])
+        self.assertIsNone(summary["max_symbol_share"])
+        gates = sim.evaluate_gates(summary)
+        self.assertTrue(gates["symbol_share"])
+        self.assertFalse(gates["pass"])
+        text = sim.format_report(trades, label="HOLDOUT", verdict=True)
+        self.assertIn("SKIP", text)
+        self.assertNotIn("n/a", text)
+
+    def test_empty_book_still_fails(self):
+        gates = sim.evaluate_gates(sim.summarize([]))
+        self.assertFalse(gates["symbol_share"])
+        self.assertFalse(gates["pass"])
+
+
+class CarryAllAndDropBottomTests(unittest.TestCase):
+    def test_carry_all_holds_a_red_close_and_earnings_still_flatten(self):
+        # 99.5 is red versus the 100 fill and still above the 1% stop.
+        red = sim.new_position(at(14, 57), 100.0, 0.0, tp=0.015, sl=0.010)
+        live = sim.step_position(red, at(14, 58), 99.5, 99.5, 99.5, 99.5)
+        self.assertEqual(live["reason"], "eod-autoclose")
+
+        carried = sim.new_position(at(14, 57), 100.0, 0.0, tp=0.015, sl=0.010)
+        event = sim.step_position(
+            carried, at(14, 58), 99.5, 99.5, 99.5, 99.5, eod_policy="carry_all"
+        )
+        self.assertIsNone(event)
+        self.assertTrue(carried["carried"])
+        self.assertEqual(carried["skip_date"], at(14, 58).date())
+
+        blocked = sim.new_position(at(14, 57), 100.0, 0.0, tp=0.015, sl=0.010)
+        flat = sim.step_position(
+            blocked, at(14, 58), 101.0, 101.0, 101.0, 101.0,
+            earnings_blocked=True, eod_policy="carry_all",
+        )
+        self.assertEqual(flat["reason"], "eod-earnings-close")
+
+    def test_carry_all_replay_is_overnight_and_live_is_same_day(self):
+        symbols = ["NVDA"]
+        bars = {
+            "NVDA": _day(10.0, 0.0, day=8) + _day(10.0, 0.0, day=9),
+            "SPY": _day(500.0, 0.02, day=8) + _day(500.0, 0.02, day=9),
+        }
+        costs = {"NVDA": (0.0, "table")}
+
+        def always_buy(sym, prices, sector, is_trump, analyst):
+            return {"buy": True, "rsi": 70.0}
+
+        common = dict(
+            symbols=symbols,
+            recipes={},
+            trump_theme=[],
+            costs=costs,
+            signal_fn=always_buy,
+        )
+        live = sim.replay(bars, {}, eod_policy="live", **common)
+        carry = sim.replay(bars, {}, eod_policy="carry_all", **common)
+        self.assertTrue(live)
+        self.assertTrue(any(t["exit_reason"] == "eod-autoclose" and not t["overnight"] for t in live))
+        self.assertTrue(any(t["overnight"] for t in carry))
+        self.assertTrue(all(t["exit_reason"] != "eod-autoclose" or t["overnight"] for t in carry))
+        with self.assertRaises(ValueError):
+            sim.replay(bars, {}, eod_policy="nope", **common)
+
+    def test_drop_bottom_keeps_the_upper_half_and_scores_holdout_only(self):
+        def row(sym, pnl, holdout, exit_ts):
+            return {
+                "symbol": sym,
+                "pnl_pct": pnl,
+                "exit_reason": "take-profit" if pnl > 0 else "stop-loss",
+                "exit_ts_ep": exit_ts,
+                "overnight": False,
+                "thin": False,
+                "holdout": holdout,
+                "trade_id": "bt_v4_abc",
+            }
+
+        trades = []
+        # Worst first after the sort: DDD -20, CCC -5, then BBB +1, AAA +10.
+        for i, (sym, pnl) in enumerate([("DDD", -20.0), ("CCC", -5.0), ("BBB", 1.0), ("AAA", 10.0)]):
+            trades.append(row(sym, pnl, False, i + 1))
+        for i, sym in enumerate(["AAA", "BBB", "CCC", "DDD", "SPCX"]):
+            trades.append(row(sym, 0.40, True, 100 + i))
+
+        kept_oos, dropped, kept, totals = sim.select_holdout_above_median(trades)
+        self.assertEqual([s for s, _ in dropped], ["DDD", "CCC"])
+        self.assertEqual([s for s, _ in kept], ["BBB", "AAA"])
+        self.assertEqual(sorted(t["symbol"] for t in kept_oos), ["AAA", "BBB"])
+        self.assertNotIn("SPCX", totals)
+        text = sim.format_drop_bottom(trades)
+        self.assertIn("DDD", text)
+        self.assertIn("RESEARCH DROP-BOTTOM HOLDOUT", text)
+        self.assertIn("VERDICT:", text)
+        # Holdout of the kept names is two +0.40 trades. The dropped
+        # names' holdout rows are not in the scored book.
+        summary = sim.summarize(kept_oos)
+        self.assertEqual(summary["n"], 2)
+        self.assertAlmostEqual(summary["avg_pnl"], 0.40)
+
+    def test_eleven_names_drop_five_and_keep_the_median(self):
+        trades = []
+        for i in range(11):
+            trades.append({
+                "symbol": f"S{i:02d}",
+                "pnl_pct": -float(i),
+                "exit_reason": "stop-loss",
+                "exit_ts_ep": i,
+                "overnight": False,
+                "thin": False,
+                "holdout": False,
+                "trade_id": "bt_v4_abc",
+            })
+            trades.append({
+                "symbol": f"S{i:02d}",
+                "pnl_pct": 0.2,
+                "exit_reason": "take-profit",
+                "exit_ts_ep": 100 + i,
+                "overnight": False,
+                "thin": False,
+                "holdout": True,
+                "trade_id": "bt_v4_oos",
+            })
+        kept_oos, dropped, kept, _totals = sim.select_holdout_above_median(trades)
+        self.assertEqual(len(dropped), 5)
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(len(kept_oos), 6)
+        # S00 pnl 0 is the best. S10 pnl -10 is the worst. Median S05 is kept.
+        self.assertIn("S05", [s for s, _ in kept])
+        self.assertIn("S10", [s for s, _ in dropped])
+        self.assertNotIn("S05", [s for s, _ in dropped])
+
+    def test_tied_in_sample_pnl_breaks_on_symbol_name(self):
+        trades = [
+            {"symbol": "BBB", "pnl_pct": 1.0, "exit_reason": "take-profit",
+             "exit_ts_ep": 1, "holdout": False, "overnight": False, "thin": False},
+            {"symbol": "AAA", "pnl_pct": 1.0, "exit_reason": "take-profit",
+             "exit_ts_ep": 2, "holdout": False, "overnight": False, "thin": False},
+            {"symbol": "AAA", "pnl_pct": 0.2, "exit_reason": "take-profit",
+             "exit_ts_ep": 3, "holdout": True, "overnight": False, "thin": False},
+            {"symbol": "BBB", "pnl_pct": 0.2, "exit_reason": "take-profit",
+             "exit_ts_ep": 4, "holdout": True, "overnight": False, "thin": False},
+        ]
+        _oos, dropped, kept, _totals = sim.select_holdout_above_median(trades)
+        self.assertEqual(dropped, [("AAA", 1.0)])
+        self.assertEqual(kept, [("BBB", 1.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

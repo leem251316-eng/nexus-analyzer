@@ -13,10 +13,11 @@ direct `python phase4_backtester.py`. Telegram summaries are marked
 DRY RUN. The suite still runs and still reports.
 
 Order:
-  1. Berserker (nexus_analyzer_1min_railway.py V4.0) — ~35-45 min
-  2. Phase4 (phase4_backtester.py V1.2)             — ~45-60 min
-  3. Crypto (crypto_backtester.py V3.0)             — ~15-25 min
-  4. Scanner (scanner_backtester.py V1.0)           — ~15-25 min
+  1. Berserker (nexus_analyzer_1min_railway.py V4.0) — baseline plus research replays
+  2. Phase4 (phase4_backtester.py V1.2)             — pure-Python indicators
+  3. Crypto (crypto_backtester.py V3.0)             — pure-Python RSI
+  4. Scanner (scanner_backtester.py V1.0)
+  Per-stage backstop is 3 hours (was 2). Stages return when they finish.
 
 Each sends its own T-Bone alerts on start/finish.
 This script sends a combined summary at the end.
@@ -59,6 +60,14 @@ def send_alert(msg: str):
         pass
 
 
+# Oct 11 dry run: Phase4's holdout walk and crypto's LTC pass were both
+# killed at 7200s, so those stages never finished. The indicator loops no
+# longer build a pandas object per bar, which is what filled the 2 hours.
+# 3 hours is the backstop so a slow box still reaches the holdout and the
+# last pairs. Stages return as soon as they finish.
+STAGE_TIMEOUT_SEC = 10800
+
+
 def run_script(script: str, label: str, extra_args: list) -> tuple:
     """Run a backtester script as a subprocess. Returns (success, elapsed_sec)."""
     cmd = [sys.executable, script, *extra_args]
@@ -70,7 +79,7 @@ def run_script(script: str, label: str, extra_args: list) -> tuple:
         result = subprocess.run(
             cmd,
             check=True,
-            timeout=7200,   # 2hr hard limit per script
+            timeout=STAGE_TIMEOUT_SEC,
         )
         elapsed = round(time.time() - t0)
         print(f"[ORCHESTRATOR] ✅ {label} complete in {elapsed}s", flush=True)
@@ -106,7 +115,7 @@ def main():
         f"🚀 NEXUS BACKTESTER SUITE STARTING\n"
         f"4 systems: Berserker → Phase4 → Crypto → Scanner\n"
         f"Database writes: {'ON' if writing else 'OFF'}\n"
-        f"ETA: ~2.5-3 hours total\n"
+        f"ETA: indicator path is pure Python; 3h per-stage backstop\n"
         f"{now.strftime('%H:%M CDT')}"
     )
 

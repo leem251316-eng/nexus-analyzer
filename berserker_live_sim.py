@@ -19,6 +19,11 @@ score >= 4, 48h earnings blackout, 30-minute cooldown, one new entry per
 step, EOD at 14:58 (green AND last > the print 5 samples back, else flat;
 earnings names always flat), TP / SL / 20-minute trail / 0.5% ratchet.
 
+``eod_policy="carry_all"`` is a research replay. Entries are unchanged.
+At 14:58 every non-earnings position is carried, green or red. Earnings
+still flatten. A carried name keeps its slot, so the next day's entries
+can differ from the live policy. The baseline book is still ``"live"``.
+
 What the bars cannot match, and how this replay treats it
 ---------------------------------------------------------
 Live samples last-trade prints about every 30s and keeps 50 of them.
@@ -158,6 +163,9 @@ GATE_AVG_PNL = 0.15
 GATE_PROFIT_FACTOR = 1.15
 GATE_MAX_DRAWDOWN = 8.0
 GATE_MAX_SYMBOL_SHARE = 0.25
+# |net P&L| below this fraction of gross absolute P&L is not a
+# concentration ratio. The share gate skips instead of failing.
+SHARE_MATERIAL_FRACTION = 0.01
 
 CONFLUENCE_LEGS = (
     "momentum",
@@ -648,7 +656,8 @@ def _finish(state: dict, reason: str, exit_raw: float, ts: datetime) -> dict:
 def step_position(state: dict, ts: datetime, open_: float, high: float,
                   low: float, close: float, *,
                   earnings_blocked: bool = False,
-                  tape: Optional[Sequence[float]] = None) -> Optional[dict]:
+                  tape: Optional[Sequence[float]] = None,
+                  eod_policy: str = "live") -> Optional[dict]:
     """Advance one open position by one RTH bar.
 
     Returns an exit dict, or None if the position stays open (including
@@ -708,6 +717,14 @@ def step_position(state: dict, ts: datetime, open_: float, high: float,
     if ct.hour * 60 + ct.minute >= EOD_MINUTE:
         if earnings_blocked:
             return _finish(state, "eod-earnings-close", close, ts)
+        # Research book: carry every non-earnings position through the
+        # close. The live book still requires a green tape.
+        if eod_policy == "carry_all":
+            state["skip_date"] = ct.date()
+            state["carried"] = True
+            return None
+        if eod_policy != "live":
+            raise ValueError(f"unknown eod_policy {eod_policy!r}")
         profit = close / entry_fill - 1.0
         series = list(tape) if tape is not None else state["closes"]
         rising = len(series) >= 6 and float(series[-1]) > float(series[-6])
@@ -791,6 +808,7 @@ def replay(
     quote_half: Optional[Dict[str, float]] = None,
     signal_fn: Optional[Callable] = None,
     validate_mode: bool = False,
+    eod_policy: str = "live",
 ) -> List[dict]:
     """Continuous replay. validate_mode=True returns only holdout entries.
 
@@ -800,6 +818,8 @@ def replay(
     replace get_signals_bt in tests. analyst_score is 0: the analyst
     service is not on the tape.
     """
+    if eod_policy not in ("live", "carry_all"):
+        raise ValueError(f"unknown eod_policy {eod_policy!r}")
     earnings_map = earnings_map or {}
     recipes = recipes or {}
     indexed: Dict[str, Dict[int, tuple]] = {}
@@ -934,6 +954,7 @@ def replay(
                 pos[sym], ts, o, h, l, c,
                 earnings_blocked=is_earnings_blocked(ts, earnings_map.get(sym, [])),
                 tape=list(price_hist[sym]),
+                eod_policy=eod_policy,
             )
             if event:
                 close_trade(sym, event, sector)
@@ -1068,6 +1089,45 @@ def _max_drawdown(pnls_exit_order: Sequence[float]) -> float:
     return worst
 
 
+def symbol_pnl_shares(by_symbol: Dict[str, float]) -> dict:
+    """Each symbol's share of net P&L.
+
+    share = symbol_pnl / total_pnl, including when the total is negative.
+    A large loser then has a large positive share of the net loss, and the
+    max of those shares is the dominant contributor.
+
+    When there is no book, the gross is zero, or |net| is under 1% of the
+    gross absolute P&L, the ratio is not a concentration measure. scored
+    is False and the share gate must not veto.
+    """
+    total = float(sum(by_symbol.values()))
+    gross = float(sum(abs(v) for v in by_symbol.values()))
+    material = (
+        bool(by_symbol)
+        and gross > 0.0
+        and abs(total) >= SHARE_MATERIAL_FRACTION * gross
+    )
+    if not material:
+        return {
+            "scored": False,
+            "total": total,
+            "gross": gross,
+            "max_share": None,
+            "max_symbol": None,
+            "shares": {},
+        }
+    shares = {sym: pnl / total for sym, pnl in by_symbol.items()}
+    max_symbol = max(shares, key=lambda s: shares[s])
+    return {
+        "scored": True,
+        "total": total,
+        "gross": gross,
+        "max_share": shares[max_symbol],
+        "max_symbol": max_symbol,
+        "shares": shares,
+    }
+
+
 def summarize(trades: Sequence[dict]) -> dict:
     """Metrics the Sunday report and the PASS/FAIL gates both use."""
     rows = list(trades)
@@ -1090,12 +1150,7 @@ def summarize(trades: Sequence[dict]) -> dict:
         (overnight if t.get("overnight") else same_day).append(float(t["pnl_pct"]))
     ordered = sorted(rows, key=lambda t: (t.get("exit_ts_ep") or 0, t["symbol"]))
     total = sum(pnls)
-    if total > 0 and by_symbol:
-        max_share = max(by_symbol.values()) / total
-        max_sym = max(by_symbol, key=lambda s: by_symbol[s])
-    else:
-        max_share = None
-        max_sym = None
+    share_info = symbol_pnl_shares(by_symbol)
     return {
         "n": n,
         "wins": len(wins),
@@ -1106,8 +1161,10 @@ def summarize(trades: Sequence[dict]) -> dict:
         "profit_factor": _profit_factor(pnls) if n else 0.0,
         "max_drawdown": _max_drawdown([float(t["pnl_pct"]) for t in ordered]) if n else 0.0,
         "total_pnl": total,
-        "max_symbol_share": max_share,
-        "max_symbol": max_sym,
+        "max_symbol_share": share_info["max_share"],
+        "max_symbol": share_info["max_symbol"],
+        "symbol_share_scored": share_info["scored"],
+        "symbol_shares": share_info["shares"],
         "by_exit": by_exit,
         "by_symbol": by_symbol,
         "by_symbol_n": by_symbol_n,
@@ -1130,7 +1187,16 @@ def evaluate_gates(summary: dict) -> dict:
     pf_ok = n > 0 and pf >= GATE_PROFIT_FACTOR
     dd_ok = n > 0 and summary["max_drawdown"] <= GATE_MAX_DRAWDOWN
     share = summary["max_symbol_share"]
-    share_ok = n > 0 and share is not None and share <= GATE_MAX_SYMBOL_SHARE
+    if "symbol_share_scored" in summary:
+        scored = bool(summary["symbol_share_scored"])
+    else:
+        scored = share is not None
+    if n <= 0:
+        share_ok = False
+    elif not scored:
+        share_ok = True
+    else:
+        share_ok = share is not None and share <= GATE_MAX_SYMBOL_SHARE
     return {
         "avg_pnl": avg_ok,
         "profit_factor": pf_ok,
@@ -1170,12 +1236,14 @@ def format_report(trades: Sequence[dict], *, label: str, verdict: bool) -> str:
         f"{'Symbol':<8} {'N':>5} {'TotalPnL':>10} {'Avg':>8} {'Share':>8}",
         "-" * 44,
     ]
-    total = s["total_pnl"]
+    shares = s["symbol_shares"]
     for sym in sorted(s["by_symbol"], key=lambda k: -s["by_symbol"][k]):
         n = s["by_symbol_n"][sym]
         tot = s["by_symbol"][sym]
-        share = (tot / total * 100.0) if total > 0 else float("nan")
-        share_s = f"{share:5.1f}%" if share == share else "  n/a"
+        if sym in shares:
+            share_s = f"{shares[sym] * 100:.1f}%"
+        else:
+            share_s = "skip"
         lines.append(
             f"{sym:<8} {n:5d} {tot:+10.2f}% {tot / n:+7.3f}% {share_s:>8}"
         )
@@ -1194,14 +1262,19 @@ def format_report(trades: Sequence[dict], *, label: str, verdict: bool) -> str:
     if verdict:
         def mark(ok: bool) -> str:
             return "PASS" if ok else "FAIL"
-        share = s["max_symbol_share"]
-        share_s = "n/a" if share is None else f"{share * 100:.1f}%"
+        if s["n"] == 0:
+            share_s, share_mark = "n/a", "FAIL"
+        elif not s["symbol_share_scored"]:
+            share_s, share_mark = "SKIP", "SKIP"
+        else:
+            share_s = f"{s['max_symbol_share'] * 100:.1f}%"
+            share_mark = mark(g["symbol_share"])
         lines += [
             "GATES",
             f"  avg P&L/trade    {s['avg_pnl']:+.3f}%    >= +{GATE_AVG_PNL:.2f}%    {mark(g['avg_pnl'])}",
             f"  profit factor    {_fmt_pf(s['profit_factor']):>8}    >= {GATE_PROFIT_FACTOR:.2f}      {mark(g['profit_factor'])}",
             f"  max drawdown     {s['max_drawdown']:8.2f} pp <= {GATE_MAX_DRAWDOWN:.0f}        {mark(g['max_drawdown'])}",
-            f"  max symbol share {share_s:>8}    <= {GATE_MAX_SYMBOL_SHARE * 100:.0f}%       {mark(g['symbol_share'])}",
+            f"  max symbol share {share_s:>8}    <= {GATE_MAX_SYMBOL_SHARE * 100:.0f}%       {share_mark}",
             "",
             f"VERDICT: {'PASS' if g['pass'] else 'FAIL'}",
         ]
@@ -1214,3 +1287,58 @@ def split_holdout(trades: Sequence[dict]) -> Tuple[List[dict], List[dict]]:
     for t in trades:
         (oos if t.get("holdout") else ins).append(t)
     return ins, oos
+
+
+def select_holdout_above_median(trades: Sequence[dict]):
+    """Drop the worse half of symbols by in-sample total P&L.
+
+    Rank is in-sample sum of pnl_pct, worst first. Ties break on the
+    symbol name so the cut is stable. ``len(ranked) // 2`` names are
+    dropped, so an odd count keeps the median (11 names drop 5 and keep
+    6). A symbol with no in-sample trades is not kept, including one that
+    only appears in the holdout.
+
+    Returns ``(holdout_rows, dropped, kept, is_totals)``. dropped and kept
+    are ``(symbol, in_sample_pnl)`` pairs. holdout_rows are the holdout
+    trades of the kept symbols, in their original order. Score those rows
+    with the same gates; do not score the in-sample book again.
+    """
+    ins, oos = split_holdout(trades)
+    totals: Dict[str, float] = {}
+    for t in ins:
+        sym = t["symbol"]
+        totals[sym] = totals.get(sym, 0.0) + float(t["pnl_pct"])
+    ranked = sorted(totals, key=lambda s: (totals[s], s))
+    n_drop = len(ranked) // 2
+    dropped = [(s, totals[s]) for s in ranked[:n_drop]]
+    kept = [(s, totals[s]) for s in ranked[n_drop:]]
+    kept_set = {s for s, _pnl in kept}
+    holdout_rows = [t for t in oos if t["symbol"] in kept_set]
+    return holdout_rows, dropped, kept, totals
+
+
+def format_drop_bottom(trades: Sequence[dict], *, label: Optional[str] = None) -> str:
+    """Holdout report after dropping the worse in-sample half. Not a DB write."""
+    holdout_rows, dropped, kept, _totals = select_holdout_above_median(trades)
+    lines = [
+        "",
+        "DROP-BOTTOM (research, not written)",
+        "Ranked by in-sample total P&L. The worse half is dropped.",
+        "Names with no in-sample trades are not kept. Gates score holdout only.",
+        "Dropped:",
+    ]
+    if not dropped:
+        lines.append("  (none)")
+    for sym, pnl in dropped:
+        lines.append(f"  {sym:<8} in-sample {pnl:+.2f}%")
+    lines.append("Kept:")
+    if not kept:
+        lines.append("  (none)")
+    for sym, pnl in kept:
+        lines.append(f"  {sym:<8} in-sample {pnl:+.2f}%")
+    lines.append(format_report(
+        holdout_rows,
+        label=label or "RESEARCH DROP-BOTTOM HOLDOUT (not written)",
+        verdict=True,
+    ))
+    return "\n".join(lines)

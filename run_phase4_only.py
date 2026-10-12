@@ -41,7 +41,7 @@ def main():
         result = subprocess.run(
             [sys.executable, "phase4_backtester.py"],
             check=True,
-            timeout=7200,
+            timeout=10800,  # same 3h backstop as run_all_backtests.STAGE_TIMEOUT_SEC
         )
         elapsed = round(time.time() - t0)
         print(f"[P4-TEST] ✅ Phase4 complete in {elapsed}s", flush=True)
