@@ -161,4 +161,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # TEMPORARY one-shot (Oct 19): read-only entry-feature export, then exit.
+    # Revert this commit to restore the normal suite.
+    import oneshot_entry_export
+    oneshot_entry_export.main()
+    sys.exit(0)
