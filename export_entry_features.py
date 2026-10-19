@@ -58,22 +58,42 @@ CUMPIV = {s: P[s].pivot_table(index="day", columns="slot", values="cumv").ffill(
 
 DAYLIST = {s: sorted(set(P[s].day)) for s in P}
 news_ok = "--no-news" not in sys.argv
-if news_ok:
-    try:
-        from alpaca.data.historical.news import NewsClient
-        from alpaca.data.requests import NewsRequest
-        ncl = NewsClient(nx.ALPACA_API_KEY, nx.ALPACA_SECRET)
-    except Exception as e:
-        print(f"# news disabled: {e}", file=sys.stderr); news_ok = False
 NEWS = {}
 def news_times(sym):
-    # alpaca-py treats `limit` as a TOTAL cap and paginates internally, so no limit = full history.
+    """All Alpaca News timestamps for sym in [start, end]. Plain GETs to data.alpaca.markets,
+    paced under the 200/min limit, with backoff on 429. None if the symbol could not be fetched."""
     if sym in NEWS: return NEWS[sym]
-    r = ncl.get_news(NewsRequest(symbols=sym, start=start, end=end))
-    items = getattr(r, "news", None) or r.data.get("news", [])
-    out = [pd.Timestamp(getattr(n, "created_at", None) or n["created_at"]).tz_convert(CT) for n in items]
-    print(f"# news {sym}: {len(out)} articles", file=sys.stderr, flush=True)
-    NEWS[sym] = pd.DatetimeIndex(sorted(out)); return NEWS[sym]
+    import requests, time as _t
+    url = "https://data.alpaca.markets/v1beta1/news"
+    hdr = {"APCA-API-KEY-ID": nx.ALPACA_API_KEY, "APCA-API-SECRET-KEY": nx.ALPACA_SECRET}
+    out, tok, pages = [], None, 0
+    try:
+        while True:
+            q = {"symbols": sym, "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "limit": 50, "sort": "asc", "include_content": "false"}
+            if tok: q["page_token"] = tok
+            for attempt in range(12):
+                r = requests.get(url, headers=hdr, params=q, timeout=30)
+                if r.status_code == 429:
+                    _t.sleep(min(60, 5 * (attempt + 1))); continue
+                r.raise_for_status(); break
+            else:
+                raise RuntimeError("429 after retries")
+            j = r.json(); pages += 1
+            out += [pd.Timestamp(n["created_at"]).tz_convert(CT) for n in (j.get("news") or [])]
+            tok = j.get("next_page_token")
+            _t.sleep(0.4)
+            if not tok: break
+        NEWS[sym] = pd.DatetimeIndex(sorted(out))
+        print(f"# news {sym}: {len(out)} articles, {pages} pages", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"# news {sym}: FAILED ({e}); news_n blank for this symbol", file=sys.stderr, flush=True)
+        NEWS[sym] = None
+    return NEWS[sym]
+
+print(f"# replay trades: {len(tr)}", file=sys.stderr, flush=True)
+if news_ok:
+    for _s in sorted({t["symbol"] for t in tr}): news_times(_s)
 
 def feat(t):
     s = t["symbol"]; et = pd.Timestamp(t["entry_ts_ep"], unit="s", tz="UTC").tz_convert(CT)
@@ -94,7 +114,7 @@ def feat(t):
             f["drv_r30_pos"] = int(l.r30 > 0) if pd.notna(l.r30) else ""
     if news_ok:
         nt = news_times(s); prev = [x for x in DAYLIST[s] if x < day]
-        if prev:
+        if prev and nt is not None:
             lo = pd.Timestamp(datetime.combine(prev[-1], datetime.min.time())).tz_localize(CT) + pd.Timedelta(hours=15)
             f["news_n"] = int(((nt > lo) & (nt <= et)).sum())
     return f
