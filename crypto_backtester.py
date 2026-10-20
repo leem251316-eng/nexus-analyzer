@@ -48,6 +48,7 @@ Usage:
 """
 
 import os
+import suite_digest
 import sys
 import time
 import math
@@ -173,6 +174,8 @@ BTC_IS_ETH        = {"BTC-USDC", "ETH-USDC"}  # exempt from vol restriction
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(msg: str):
+    if suite_digest.capture(msg):
+        return
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:

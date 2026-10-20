@@ -78,6 +78,7 @@ Usage:
 """
 
 import os
+import suite_digest
 import sys
 import time
 import secrets
@@ -148,6 +149,8 @@ WARMUP_BARS = 11   # scan_for_entry needs 11 bars (10-bar lookback + current)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(msg: str):
+    if suite_digest.capture(msg):
+        return
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info(f"[ALERT] {msg}")
         return

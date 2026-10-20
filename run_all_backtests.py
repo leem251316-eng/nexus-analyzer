@@ -40,6 +40,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import backtest_safety
+import suite_digest
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -87,15 +88,18 @@ def run_script(script: str, label: str, extra_args: list) -> tuple:
     except subprocess.TimeoutExpired:
         elapsed = round(time.time() - t0)
         print(f"[ORCHESTRATOR] ⏱ {label} TIMED OUT after {elapsed}s", flush=True)
+        send_alert(f"⏱ NEXUS BACKTEST STAGE TIMED OUT: {label} after {elapsed}s")
         return False, elapsed
     except subprocess.CalledProcessError as e:
         elapsed = round(time.time() - t0)
         print(f"[ORCHESTRATOR] ❌ {label} FAILED (exit {e.returncode}) after {elapsed}s",
               flush=True)
+        send_alert(f"❌ NEXUS BACKTEST STAGE FAILED: {label} (exit {e.returncode}) after {elapsed}s")
         return False, elapsed
     except Exception as e:
         elapsed = round(time.time() - t0)
         print(f"[ORCHESTRATOR] ❌ {label} ERROR: {e}", flush=True)
+        send_alert(f"❌ NEXUS BACKTEST STAGE ERROR: {label}: {e}")
         return False, elapsed
 
 
@@ -110,14 +114,14 @@ def main():
         flush=True,
     )
 
-    send_alert(
-        f"{backtest_safety.banner(writing)}"
-        f"🚀 NEXUS BACKTESTER SUITE STARTING\n"
-        f"4 systems: Berserker → Phase4 → Crypto → Scanner\n"
-        f"Database writes: {'ON' if writing else 'OFF'}\n"
-        f"ETA: indicator path is pure Python; 3h per-stage backstop\n"
-        f"{now.strftime('%H:%M CDT')}"
-    )
+    # One Telegram per run: children buffer COMPLETE blocks here and drop
+    # STARTING messages; failures still alert on their own.
+    digest_path = f"/tmp/nexus_suite_digest_{os.getpid()}.txt"
+    try:
+        os.remove(digest_path)
+    except FileNotFoundError:
+        pass
+    os.environ[suite_digest.ENV] = digest_path
 
     wall_start = time.time()
     results    = {}
@@ -140,23 +144,10 @@ def main():
 
     # Final summary
     wall_elapsed = round(time.time() - wall_start)
-    lines = [
-        backtest_safety.banner(writing).rstrip(),
-        "📊 NEXUS BACKTEST SUITE COMPLETE",
-        "──────────────────",
-    ]
-    lines = [ln for ln in lines if ln]
-    for name, r in results.items():
-        status = "✅" if r["ok"] else "❌"
-        lines.append(f"{status} {name}: {r['elapsed']}s")
-    lines.append("──────────────────")
-    lines.append(f"Total: {wall_elapsed}s ({round(wall_elapsed/60)}min)")
-    if writing:
-        lines.append("Writes: ON (BACKTEST_WRITE_DB). Closed bt_% rows were replaced.")
-    else:
-        lines.append("Writes: OFF. No fingerprint rows were deleted or inserted.")
-
-    send_alert("\n".join(lines))
+    blocks = suite_digest.read_blocks(digest_path)
+    os.environ.pop(suite_digest.ENV, None)
+    send_alert(suite_digest.build_summary(
+        backtest_safety.banner(writing), blocks, results, wall_elapsed, writing))
     print(f"\n[ORCHESTRATOR] All backtests complete. Total: {wall_elapsed}s", flush=True)
 
 
